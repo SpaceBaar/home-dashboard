@@ -84,13 +84,12 @@ class WeatherService extends BaseService {
     const mainLoc = (process.env.MAIN_LOCATION || '').trim();
     const addLocs = (process.env.ADDITIONAL_LOCATIONS || '').split(';').map(l => l.trim()).filter(Boolean);
     const locInputs = mainLoc ? [mainLoc, ...addLocs] : [];
-
+  
     if (locInputs.length === 0) throw new Error('MAIN_LOCATION not configured');
-
-    // All requests as metric for Celsius (C), mm, m/s
-    const units = 'metric';
-
-    // Resolve locations
+  
+    // Use WEATHER_UNITS env, default to 'metric'
+    const units = (process.env.WEATHER_UNITS === 'imperial') ? 'imperial' : 'metric';
+  
     const resolvedLocs = [];
     for (const input of locInputs) {
       try {
@@ -101,26 +100,33 @@ class WeatherService extends BaseService {
       }
     }
     if (resolvedLocs.length === 0) throw new Error('No valid locations found');
-
-    // Fetch data
+  
     const fetchPromises = resolvedLocs.map(loc => this.fetchLocationWeather(loc, units, logger));
     const rawResults = await Promise.all(fetchPromises);
     const results = rawResults.filter(Boolean);
     if (results.length === 0) throw new Error('No weather data could be fetched');
     return results;
   }
-
+  
   mapToDashboard(apiResults, config) {
     if (!Array.isArray(apiResults) || apiResults.length === 0) throw new Error('No weather data available');
     const getWeekday = (dt, tz) =>
       new Date(dt * 1000).toLocaleDateString('en-US', { weekday: 'short', timeZone: tz || 'UTC' });
     const toISODate = dt => new Date(dt * 1000).toISOString().slice(0, 10);
-
+  
+    const isMetric = (process.env.WEATHER_UNITS === 'metric');
+  
+    const convertedWindSpeed = (speed) => {
+      if (speed == null) return null;
+      // Wind speed from OpenWeatherMap is m/s (metric) or miles/hour (imperial)
+      // Convert to km/h when metric units
+      return isMetric ? Math.round(speed * 3.6) : Math.round(speed);
+    };
+  
     const processedLocations = apiResults.map(({ location, data }) => {
       const tz = data.timezone || 'UTC';
       const current = data.current || {};
-
-      // Daily forecast in metric
+  
       const forecastDays = (data.daily || []).map(day => ({
         date: toISODate(day.dt),
         day_of_week: getWeekday(day.dt, tz) || 'N/A',
@@ -130,12 +136,11 @@ class WeatherService extends BaseService {
         rain_chance: typeof day.pop === 'number' ? Math.round(day.pop * 100) : 0,
         precip_mm: day.rain ? parseFloat(day.rain.toFixed(2)) : 0,
         avghumidity: day.humidity,
-        hour: [] // filled below
+        hour: [] // filled later
       }));
-
-      // Hourly per forecast day (next 3 days, 24 per day)
+  
       if (Array.isArray(data.hourly)) {
-        const dayHourBuckets = forecastDays.map(fd => []);
+        const dayHourBuckets = forecastDays.map(() => []);
         for (const hr of data.hourly) {
           const dateIdx = forecastDays.findIndex(fd => toISODate(hr.dt) === fd.date);
           if (dateIdx >= 0 && dayHourBuckets[dateIdx].length < 24) {
@@ -145,17 +150,16 @@ class WeatherService extends BaseService {
               temp: typeof hr.temp === "number" ? Math.round(hr.temp) : null,
               condition: (hr.weather?.[0]?.description || '').toLowerCase(),
               rain_chance: typeof hr.pop === "number" ? Math.round(hr.pop * 100) : 0,
-              wind_speed: typeof hr.wind_speed === "number" ? Math.round(hr.wind_speed) : null,
+              wind_speed: convertedWindSpeed(hr.wind_speed),
             });
           }
         }
         forecastDays.forEach((fd, idx) => fd.hour = dayHourBuckets[idx] || []);
       }
-
-      // Today's sunrise/sunset
+  
       const todaySunrise = (data.daily?.[0]?.sunrise ? new Date(data.daily[0].sunrise * 1000) : null);
       const todaySunset = (data.daily?.[0]?.sunset ? new Date(data.daily[0].sunset * 1000) : null);
-
+  
       return {
         location: {
           name: location.name,
@@ -168,7 +172,7 @@ class WeatherService extends BaseService {
           feels_like: typeof current.feels_like === "number" ? Math.round(current.feels_like) : null,
           humidity: current.humidity,
           pressure: typeof current.pressure === "number" ? Math.round(current.pressure) : null,
-          wind_speed: typeof current.wind_speed === "number" ? Math.round(current.wind_speed) : null,
+          wind_speed: convertedWindSpeed(current.wind_speed),
           wind_dir: current.wind_deg,
           condition: (current.weather?.[0]?.description || '').toLowerCase()
         },
