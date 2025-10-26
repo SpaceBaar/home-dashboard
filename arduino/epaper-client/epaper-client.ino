@@ -46,19 +46,19 @@
 // ==================== CONFIGURATION ====================
 
 // WiFi configuration
-const char* WIFI_SSID = "{{WIFI_NAME}}";
-const char* WIFI_PASSWORD = "{{WIFI_PASSWORD}}";
+const char* WIFI_SSID = "Airtel_SpaceBaar";
+const char* WIFI_PASSWORD = "21072410";
 
 // Server configuration
-const char* SERVER_IP = "{{LOCAL_SERVER_ADDRESS}}";
+const char* SERVER_IP = "raspberrypi.local";
 const int SERVER_PORT = 7272;
 
 // Main dashboard image path
 const char* IMAGE_PATH = "/dashboard/image";
 
 // Time configuration (used for deep sleep scheduling)
-const long GMT_OFFSET_SEC = -28800;      // PST (UTC-8). Adjust for your timezone
-const int DAYLIGHT_OFFSET_SEC = 3600;    // Add 1 hour if DST active, 0 otherwise
+const long GMT_OFFSET_SEC = 19800;      // PST (UTC-8). Adjust for your timezone
+const int DAYLIGHT_OFFSET_SEC = 0;    // Add 1 hour if DST active, 0 otherwise
 const int DEEP_SLEEP_START_HOUR = 0;     // Enter deep sleep at midnight
 const int DEEP_SLEEP_END_HOUR = 5;       // Wake from deep sleep at 5am
 const char* NTP_SERVER = "pool.ntp.org";

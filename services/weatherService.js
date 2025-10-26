@@ -3,14 +3,10 @@ const { BaseService } = require('../lib/BaseService');
 const { mapIconAndDescription } = require('../lib/weatherUtils');
 const zipcodes = require('zipcodes');
 
-/**
- * Weather API Service (Visual Crossing) - PRIMARY WEATHER DATA SOURCE
- * This is the only required service - all others are optional
- */
 class WeatherService extends BaseService {
   constructor(cacheTTLMinutes = 30) {
     super({
-      name: 'Visual Crossing Weather',
+      name: 'OpenWeatherMap Weather',
       cacheKey: 'weather',
       cacheTTL: cacheTTLMinutes * 60 * 1000,
       retryAttempts: 3,
@@ -19,53 +15,60 @@ class WeatherService extends BaseService {
   }
 
   isEnabled() {
-    const apiKey = process.env.VISUAL_CROSSING_API_KEY;
+    const apiKey = process.env.OPENWEATHER_API_KEY;
     return !!apiKey;
   }
 
-  buildForecastUrl(apiKey, zip, days = 7) {
-    // Visual Crossing uses location/next{days}days format for forecast
-    const url = new URL(`https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/${encodeURIComponent(zip)}/next${days}days`);
-    url.searchParams.set('key', apiKey);
-    url.searchParams.set('unitGroup', 'us'); // Use US units (Fahrenheit, mph, inches)
-    url.searchParams.set('include', 'days,hours,current,alerts');
-    // Include air quality elements: aqius (US EPA AQI) and pm2p5 (PM2.5)
-    url.searchParams.set('elements', 'datetime,tempmax,tempmin,temp,feelslike,feelslikemax,feelslikemin,humidity,precip,precipprob,preciptype,snow,snowdepth,windspeed,winddir,pressure,cloudcover,visibility,solarradiation,solarenergy,uvindex,sunrise,sunset,moonphase,conditions,description,icon,severerisk,aqius,pm2p5');
-    return url.toString();
+  async geocodeZip(zip) {
+    const apiKey = process.env.OPENWEATHER_API_KEY;
+    const url = `https://api.openweathermap.org/geo/1.0/zip?zip=${encodeURIComponent(zip)},IN&appid=${apiKey}`;
+    const resp = await axios.get(url, { timeout: 10000 });
+    if (resp.data && resp.data.lat != null && resp.data.lon != null) {
+      return {
+        latitude: resp.data.lat,
+        longitude: resp.data.lon,
+        name: resp.data.name || zip,
+        country: resp.data.country || 'IN'
+      };
+    }
+    throw new Error(`Geocoding failed for PIN: ${zip}`);
+  }
+
+  async fetchLocationData(apiKey, zip, units, logger) {
+    try {
+      const geo = await this.geocodeZip(zip);
+      const owmUrl = `https://api.openweathermap.org/data/3.0/onecall?lat=${geo.latitude}&lon=${geo.longitude}&units=${units}&exclude=minutely&appid=${apiKey}`;
+      const resp = await axios.get(owmUrl, { timeout: 20000 });
+      if (resp.status !== 200 || !resp.data) throw new Error(`OpenWeatherMap returned status ${resp.status}`);
+      return { zip, geo, data: resp.data };
+    } catch (error) {
+      logger?.error?.(`Weather fetch error for ${zip}: ${error.message}`);
+      return null;
+    }
   }
 
   async fetchData(config, logger) {
-    const apiKey = process.env.VISUAL_CROSSING_API_KEY;
-    if (!apiKey) throw new Error('VISUAL_CROSSING_API_KEY not configured');
+    const apiKey = process.env.OPENWEATHER_API_KEY;
+    if (!apiKey) throw new Error('OPENWEATHER_API_KEY not configured');
 
-    // Read location ZIPs from env
     const mainZip = (process.env.MAIN_LOCATION_ZIP || '').trim();
-    const additionalZips = process.env.ADDITIONAL_LOCATION_ZIPS || '';
-    const additionalArray = additionalZips.split(',').map(z => z.trim()).filter(z => z).slice(0, 3);
-    const locationZips = mainZip ? [mainZip, ...additionalArray] : [];
-    
-    if (locationZips.length === 0) throw new Error('MAIN_LOCATION_ZIP not configured');
+    const additionalZips = (process.env.ADDITIONAL_LOCATION_ZIPS || '');
+    const locationZips = mainZip
+      ? [mainZip, ...additionalZips.split(',').map(z => z.trim()).filter(z => z).slice(0, 3)]
+      : [];
 
-    const days = 7;
-    
-    // Fetch all locations in parallel
-    const promises = locationZips.map(zip => 
-      this.fetchLocationData(apiKey, zip, days, logger)
+    if (locationZips.length === 0)
+      throw new Error('MAIN_LOCATION_ZIP not configured');
+    const units = (process.env.WEATHER_UNITS || 'metric').toLowerCase();
+
+    const promises = locationZips.map(zip =>
+      this.fetchLocationData(apiKey, zip, units, logger)
     );
-    
-    const results = await Promise.all(promises);
+    const rawResults = await Promise.all(promises);
+    const results = rawResults.filter(Boolean);
+    if (results.length === 0)
+      throw new Error('No weather data could be fetched');
     return results;
-  }
-
-  async fetchLocationData(apiKey, zip, days, logger) {
-    const url = this.buildForecastUrl(apiKey, zip, days);
-    const resp = await axios.get(url, { timeout: 10000 });
-    
-    if (resp.status !== 200) {
-      throw new Error(`Weather API returned status ${resp.status}`);
-    }
-    
-    return { zip, data: resp.data };
   }
 
   mapToDashboard(apiResults, config) {
@@ -73,311 +76,208 @@ class WeatherService extends BaseService {
       throw new Error('No weather data available');
     }
 
-    // Extract timezone from first location for date parsing
-    const locationTimezone = apiResults[0]?.data?.timezone || 'America/Los_Angeles';
+    // Helper for weekday name
+    const getWeekday = (dt, tz) =>
+      new Date(dt * 1000).toLocaleDateString('en-US', { weekday: 'short', timeZone: tz || 'Asia/Kolkata' });
 
-    /**
-     * Get day of week for a date string in the location's timezone
-     * @param {string} dateStr - Date string in YYYY-MM-DD format
-     * @returns {string} Day of week (e.g., 'Mon', 'Tue')
-     */
-    const getDayOfWeek = (dateStr) => {
-      // Parse at noon to avoid timezone issues with midnight
-      const date = new Date(dateStr + 'T12:00:00');
-      return date.toLocaleDateString('en-US', { 
-        weekday: 'short',
-        timeZone: locationTimezone  // Use the location's timezone from Visual Crossing
-      });
-    };
+    // Helper: ISO date string
+    const toISODate = dt => new Date(dt * 1000).toISOString().slice(0, 10);
 
-    // Extract and transform data from raw API response
-    const processedLocations = apiResults.map(({ zip, data }) => {
-      const forecastDays = data?.days || [];
-      const current = data?.currentConditions || {};
-      
-      // Parse location from resolvedAddress
-      // Visual Crossing returns "ZIP, Country" for ZIP queries, not city names
-      const resolvedAddress = data?.resolvedAddress || '';
-      
-      let location;
-      if (resolvedAddress.startsWith(zip)) {
-        // Visual Crossing didn't resolve the ZIP to a city name
-        // Use zipcodes package to lookup city/state from ZIP
-        const zipInfo = zipcodes.lookup(zip);
-        location = {
-          name: zipInfo?.city || zip, // Use city name or fall back to ZIP
-          region: zipInfo?.state || '',
-          country: 'US',
-          tz_id: data?.timezone || locationTimezone,
-        };
-      } else {
-        // resolvedAddress has actual city/state info
-        const addressParts = resolvedAddress.split(',').map(s => s.trim());
-        location = {
-          name: addressParts[0] || zip,
-          region: addressParts[1] || '',
-          country: addressParts[2] || 'US',
-          tz_id: data?.timezone || locationTimezone,
-        };
+    const processedLocations = apiResults.map(({ zip, geo, data }) => {
+      const tz = data.timezone || 'Asia/Kolkata';
+      const current = data.current || {};
+      const zipInfo = zipcodes.lookup(zip);
+      const location = {
+        name: zipInfo?.city || geo.name || zip,
+        region: zipInfo?.state || '',
+        country: geo.country || 'IN',
+        tz_id: tz
+      };
+
+      // "daily" list to "days"
+      const forecastDays = (data.daily || []).map((day, i) => ({
+        date: toISODate(day.dt),
+        day_of_week: getWeekday(day.dt, tz) || 'N/A',
+        high_f: typeof day.temp?.max === 'number' ? Math.round(day.temp.max * 9 / 5 + 32) : null,
+        low_f: typeof day.temp?.min === 'number' ? Math.round(day.temp.min * 9 / 5 + 32) : null,
+        condition: (day.weather?.[0]?.description || '').toLowerCase(),
+        rain_chance: typeof day.pop === 'number' ? Math.round(day.pop * 100) : 0,
+        precip_in: day.rain ? parseFloat((day.rain * 0.0393701).toFixed(2)) : 0,
+        avghumidity: day.humidity,
+        hour: [] // filled below
+      }));
+
+      // Fill per-day hours (next 3 days max)
+      if (Array.isArray(data.hourly)) {
+        const dayHourBuckets = forecastDays.map(fd => []);
+        for (const hr of data.hourly) {
+          const dateIdx = forecastDays.findIndex(fd => toISODate(hr.dt) === fd.date);
+          if (dateIdx >= 0 && dayHourBuckets[dateIdx].length < 24) {
+            const hourStr = new Date(hr.dt * 1000).toISOString().substr(11, 8); // "HH:MM:SS"
+            dayHourBuckets[dateIdx].push({
+              time: hourStr,
+              temp_f: typeof hr.temp === 'number' ? Math.round(hr.temp * 9 / 5 + 32) : null,
+              condition: (hr.weather?.[0]?.description || '').toLowerCase(),
+              rain_chance: typeof hr.pop === 'number' ? Math.round(hr.pop * 100) : 0,
+              wind_mph: typeof hr.wind_speed === 'number' ? Math.round(hr.wind_speed * 2.23694) : null
+            });
+          }
+        }
+        forecastDays.forEach((fd, idx) => fd.hour = dayHourBuckets[idx] || []);
       }
-      
-      const today = forecastDays[0];
+
+      // Today's forecast
+      const todayDaily = forecastDays[0] || {};
+      const todaySunrise = (data.daily?.[0]?.sunrise ? new Date(data.daily[0].sunrise * 1000) : null);
+      const todaySunset  = (data.daily?.[0]?.sunset  ? new Date(data.daily[0].sunset * 1000) : null);
 
       return {
         zip,
         location,
         current: {
-          temp_f: current.temp,
-          feels_like_f: current.feelslike,
+          temp_f: typeof current.temp === 'number' ? Math.round(current.temp * 9 / 5 + 32) : null,
+          feels_like_f: typeof current.feels_like === 'number' ? Math.round(current.feels_like * 9 / 5 + 32) : null,
           humidity: current.humidity,
-          pressure_in: current.pressure,
-          wind_mph: current.windspeed,
-          wind_dir: current.winddir,
-          condition: current.conditions,
-          pm2_5: current.pm2p5, // PM2.5 particulate matter
-          aqi: current.aqius, // US EPA Air Quality Index
+          pressure_in: typeof current.pressure === 'number' ? Math.round(current.pressure * 0.02953 * 100) / 100 : null,
+          wind_mph: typeof current.wind_speed === 'number' ? Math.round(current.wind_speed * 2.23694 * 10) / 10 : null,
+          wind_dir: current.wind_deg,
+          condition: (current.weather?.[0]?.description || '').toLowerCase(),
+          pm2_5: null,
+          aqi: null
         },
-        forecast: forecastDays.map(day => {
-          return {
-            date: day.datetime,
-            day_of_week: getDayOfWeek(day.datetime),
-            high_f: day.tempmax,
-            low_f: day.tempmin,
-            condition: day.conditions,
-            rain_chance: day.precipprob,
-            precip_in: day.precip,
-            avghumidity: day.humidity,
-            hour: (day.hours || []).map(h => ({
-              time: h.datetime,
-              temp_f: h.temp,
-              condition: h.conditions,
-              rain_chance: h.precipprob,
-              wind_mph: h.windspeed,
-            })),
-          };
-        }),
+        forecast: forecastDays,
         astro: {
-          sunrise: this.formatTime12Hour(today?.sunrise),
-          sunset: this.formatTime12Hour(today?.sunset),
-          moon_phase: this.convertMoonPhase(today?.moonphase),
-          moon_illumination: this.calculateMoonIllumination(today?.moonphase),
-        },
+          sunrise: todaySunrise ? this.formatTime12Hour(`${todaySunrise.getHours()}:${todaySunrise.getMinutes()}`) : '',
+          sunset: todaySunset  ? this.formatTime12Hour(`${todaySunset.getHours()}:${todaySunset.getMinutes()}`) : '',
+          moon_phase: (typeof data.daily?.[0]?.moon_phase === 'number')
+            ? this.convertMoonPhaseString(data.daily[0].moon_phase)
+            : 'New Moon',
+          moon_direction: (typeof data.daily?.[0]?.moon_phase === 'number')
+            ? this.convertMoonPhaseDirection(data.daily[0].moon_phase)
+            : 'waxing',
+          moon_illumination: (typeof data.daily?.[0]?.moon_phase === 'number')
+            ? this.calculateMoonIllumination(data.daily[0].moon_phase)
+            : null,
+        }
       };
     });
 
     const mainLocation = processedLocations[0];
 
-    // Map locations for dashboard
+    // Dashboard summary for today
     const locations = processedLocations.map(loc => {
-      const today = loc.forecast[0];
-      // Use current actual conditions, not forecast
-      const { icon } = mapIconAndDescription(loc.current.condition || '');
+      const today = loc.forecast[0] || {};
+      const icon = mapIconAndDescription(loc.current.condition || '').icon;
       const condition = loc.current.condition || 'Clear';
-      
       return {
         name: loc.location.name,
         region: loc.location.region,
         country: loc.location.country,
         zip_code: loc.zip,
-        current_temp: Math.round(Number(loc.current.temp_f || 0)),
-        high: Math.round(Number(today?.high_f || 0)),
-        low: Math.round(Number(today?.low_f || 0)),
+        current_temp: Math.round(loc.current.temp_f || 0),
+        high: Math.round(today.high_f || 0),
+        low: Math.round(today.low_f || 0),
         icon,
         condition,
-        rain_chance: Number(today?.rain_chance || 0),
-        // Current conditions data (used as fallback if Ambient Weather unavailable)
-        humidity: Math.round(Number(loc.current.humidity || 0)),
+        rain_chance: Number(today.rain_chance || 0),
+        humidity: Math.round(loc.current.humidity || 0),
         pressure: Math.round(Number(loc.current.pressure_in || 0) * 100) / 100,
         wind_mph: Math.round(Number(loc.current.wind_mph || 0) * 10) / 10,
-        wind_dir: loc.current.wind_dir || 0,
+        wind_dir: loc.current.wind_dir || 0
       };
     });
 
-    // Build 5-day forecast (skip today, show next 5 days)
+    // 5-day forecast
     const allForecast = mainLocation.forecast.map(day => {
       const { icon } = mapIconAndDescription(day.condition || '');
       return {
         date: day.date,
-        day: day.day_of_week,
-        high: Math.round(Number(day.high_f || 0)),
-        low: Math.round(Number(day.low_f || 0)),
+        day: day.day_of_week || 'N/A',
+        high: Math.round(day.high_f || 0),
+        low: Math.round(day.low_f || 0),
         icon,
-        rain_chance: Number(day.rain_chance || 0),
+        rain_chance: Number(day.rain_chance || 0)
       };
     });
-
-    // Skip today and show next 5 days (use actual date comparison)
-    // Use local date, not UTC (important for timezone-aware comparison)
     const now = new Date();
-    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
     const todayIndex = allForecast.findIndex(d => d.date === todayStr);
     const startIndex = todayIndex >= 0 ? todayIndex + 1 : 1;
     const forecast = allForecast.slice(startIndex, startIndex + 5);
 
-    // Build hourly forecast (next 24 hours)
-    const hourlyForecast = this.getNext24Hours(mainLocation.forecast);
-
-    // Use AQI from Visual Crossing if available, otherwise calculate from PM2.5
-    let aqi = mainLocation.current.aqi;
-    if (aqi == null && mainLocation.current.pm2_5 != null) {
-      aqi = this.calculateAQI(mainLocation.current.pm2_5);
+    // Hourly forecast (next 24, from mainLocation.forecast[0].hour)
+    const hourlyForecast = [];
+    if (mainLocation.forecast[0] && Array.isArray(mainLocation.forecast[0].hour)) {
+      const hours = mainLocation.forecast[0].hour;
+      const nowHour = now.getHours();
+      for (let i = 0; i < hours.length && hourlyForecast.length < 24; i++) {
+        const [hStr] = (hours[i].time || '00:00:00').split(':');
+        const hourInt = parseInt(hStr, 10);
+        if (i === 0 && hourInt < nowHour) continue;
+        const { icon } = mapIconAndDescription(hours[i].condition || '');
+        const hourNum = hourInt % 12 || 12;
+        const ampm = hourInt < 12 ? 'AM' : 'PM';
+        hourlyForecast.push({
+          time: `${hourNum} ${ampm}`,
+          temp_f: Math.round(Number(hours[i].temp_f || 0)),
+          condition: hours[i].condition || 'Unknown',
+          icon,
+          rain_chance: Number(hours[i].rain_chance || 0),
+          wind_mph: Math.round(Number(hours[i].wind_mph || 0))
+        });
+      }
     }
-    const aqiCategory = this.mapAqiCategory(aqi);
-
-    // Moon phase mapping
-    const { phase, direction } = this.mapMoonPhase(mainLocation.astro.moon_phase);
 
     // Precipitation totals
     const total24h = mainLocation.forecast[0]?.precip_in || 0;
     const weekTotal = mainLocation.forecast.slice(0, 7).reduce(
       (sum, d) => sum + Number(d.precip_in || 0), 0
     );
+    const aqi = null;
+    const aqiCategory = 'Unknown';
+
+    // Reliable moon phase (string + direction)
+    const moonPhase = mainLocation.astro?.moon_phase || 'New Moon';
+    const moonDirection = mainLocation.astro?.moon_direction || 'waxing';
 
     return {
       locations,
       forecast,
       hourlyForecast,
-      timezone: locationTimezone,
+      timezone: mainLocation.location.tz_id,
       sun: {
         sunrise: mainLocation.astro.sunrise,
-        sunset: mainLocation.astro.sunset,
+        sunset: mainLocation.astro.sunset
       },
       moon: {
-        phase,
-        direction,
-        illumination: mainLocation.astro.moon_illumination ? Number(mainLocation.astro.moon_illumination) : null,
+        phase: moonPhase,
+        direction: moonDirection,
+        illumination: mainLocation.astro.moon_illumination ? Number(mainLocation.astro.moon_illumination) : null
       },
       air_quality: aqi != null ? { aqi, category: aqiCategory } : { aqi: null, category: 'Unknown' },
       precipitation: {
         last_24h_in: Number(total24h.toFixed(2)),
         week_total_in: Number(weekTotal.toFixed(2)),
-        year_total_in: null,
-      },
+        year_total_in: null
+      }
     };
   }
 
-  getNext24Hours(forecastDays) {
-    const now = new Date();
-    const currentHour = now.getHours();
-    const hourlyData = [];
-
-    for (let dayIndex = 0; dayIndex < Math.min(3, forecastDays.length) && hourlyData.length < 24; dayIndex++) {
-      const day = forecastDays[dayIndex];
-      const hours = day.hour || [];
-
-      for (const hourData of hours) {
-        if (hourlyData.length >= 24) break;
-
-        // Visual Crossing uses HH:MM:SS format for hour time
-        const [hourStr] = (hourData.time || '00:00:00').split(':');
-        const hour = parseInt(hourStr, 10);
-
-        if (dayIndex === 0 && hour < currentHour) continue;
-
-        const { icon } = mapIconAndDescription(hourData.condition || '');
-        
-        // Format time display
-        const hourNum = hour % 12 || 12;
-        const ampm = hour < 12 ? 'AM' : 'PM';
-        
-        hourlyData.push({
-          time: `${hourNum} ${ampm}`,
-          temp_f: Math.round(Number(hourData.temp_f || 0)),
-          condition: hourData.condition || 'Unknown',
-          icon,
-          rain_chance: Number(hourData.rain_chance || 0),
-          wind_mph: Math.round(Number(hourData.wind_mph || 0)),
-        });
-      }
-    }
-
-    return hourlyData;
-  }
-
-  calculateAQI(pm25) {
-    if (pm25 == null || pm25 < 0) return null;
-
-    const breakpoints = [
-      { cLow: 0.0, cHigh: 12.0, aqiLow: 0, aqiHigh: 50 },
-      { cLow: 12.1, cHigh: 35.4, aqiLow: 51, aqiHigh: 100 },
-      { cLow: 35.5, cHigh: 55.4, aqiLow: 101, aqiHigh: 150 },
-      { cLow: 55.5, cHigh: 150.4, aqiLow: 151, aqiHigh: 200 },
-      { cLow: 150.5, cHigh: 250.4, aqiLow: 201, aqiHigh: 300 },
-      { cLow: 250.5, cHigh: 500.4, aqiLow: 301, aqiHigh: 500 },
-    ];
-
-    let bp = breakpoints[breakpoints.length - 1];
-    for (const breakpoint of breakpoints) {
-      if (pm25 >= breakpoint.cLow && pm25 <= breakpoint.cHigh) {
-        bp = breakpoint;
-        break;
-      }
-    }
-
-    const { cLow, cHigh, aqiLow, aqiHigh } = bp;
-    const aqi = ((aqiHigh - aqiLow) / (cHigh - cLow)) * (pm25 - cLow) + aqiLow;
-    return Math.round(aqi);
-  }
-
-  mapAqiCategory(aqi) {
-    if (aqi == null) return 'Unknown';
-    if (aqi <= 50) return 'Good';
-    if (aqi <= 100) return 'Moderate';
-    if (aqi <= 150) return 'Unhealthy for Sensitive Groups';
-    if (aqi <= 200) return 'Unhealthy';
-    if (aqi <= 300) return 'Very Unhealthy';
-    return 'Hazardous';
-  }
-
-  /**
-   * Calculate moon illumination percentage from moon phase value
-   * @param {number} moonphase - Moon phase value from 0 (new) to 1 (next new)
-   * @returns {number} Illumination percentage (0-100)
-   */
-  calculateMoonIllumination(moonphase) {
-    if (moonphase == null) return 0;
-    const phase = Number(moonphase);
-    
-    // Phase cycle: 0 (new) -> 0.5 (full) -> 1 (new)
-    // Illumination: 0% -> 100% -> 0%
-    if (phase <= 0.5) {
-      // Waxing: 0 to 0.5 maps to 0% to 100%
-      return Math.round(phase * 2 * 100);
-    } else {
-      // Waning: 0.5 to 1 maps to 100% to 0%
-      return Math.round((1 - phase) * 2 * 100);
-    }
-  }
-
-  /**
-   * Format time from 24-hour "HH:MM:SS" to 12-hour "H:MM AM/PM"
-   * @param {string} timeStr - Time string in "HH:MM:SS" format
-   * @returns {string} Formatted time in 12-hour format
-   */
+  // Visual Crossing compatible utilities — all as strings
   formatTime12Hour(timeStr) {
     if (!timeStr) return '';
-    
-    // Parse time string (format: "07:08:18")
     const [hoursStr, minutesStr] = timeStr.split(':');
     const hours24 = parseInt(hoursStr, 10);
     const minutes = minutesStr.padStart(2, '0');
-    
-    // Convert to 12-hour format
     const period = hours24 >= 12 ? 'PM' : 'AM';
     const hours12 = hours24 % 12 || 12;
-    
     return `${hours12}:${minutes} ${period}`;
   }
 
-  /**
-   * Convert Visual Crossing moon phase (0-1) to text description
-   * @param {number} moonphase - Moon phase value from 0 (new) to 1 (next new)
-   * @returns {string} Moon phase text description
-   */
-  convertMoonPhase(moonphase) {
+  // OpenWeatherMap moon phase to Visual Crossing-style label
+  convertMoonPhaseString(moonphase) {
     if (moonphase == null) return 'New Moon';
     const phase = Number(moonphase);
-    
     if (phase === 0) return 'New Moon';
     if (phase < 0.25) return 'Waxing Crescent';
     if (phase === 0.25) return 'First Quarter';
@@ -388,18 +288,21 @@ class WeatherService extends BaseService {
     if (phase < 1) return 'Waning Crescent';
     return 'New Moon';
   }
+  convertMoonPhaseDirection(moonphase) {
+    if (moonphase == null) return 'waxing';
+    const phase = Number(moonphase);
+    if (phase <= 0.5) return 'waxing';
+    return 'waning';
+  }
 
-  mapMoonPhase(phaseText) {
-    const t = String(phaseText || '').toLowerCase();
-    if (t.includes('new')) return { phase: 'new', direction: 'waxing' };
-    if (t.includes('first')) return { phase: 'first_quarter', direction: 'waxing' };
-    if (t.includes('full')) return { phase: 'full', direction: 'waning' };
-    if (t.includes('last') || t.includes('third')) return { phase: 'last_quarter', direction: 'waning' };
-    if (t.includes('waxing') && t.includes('crescent')) return { phase: 'waxing_crescent', direction: 'waxing' };
-    if (t.includes('waning') && t.includes('crescent')) return { phase: 'waning_crescent', direction: 'waning' };
-    if (t.includes('waxing') && t.includes('gibbous')) return { phase: 'waxing_gibbous', direction: 'waxing' };
-    if (t.includes('waning') && t.includes('gibbous')) return { phase: 'waning_gibbous', direction: 'waning' };
-    return { phase: 'new', direction: 'waxing' };
+  calculateMoonIllumination(moonphase) {
+    if (moonphase == null) return 0;
+    const phase = Number(moonphase);
+    if (phase <= 0.5) {
+      return Math.round(phase * 2 * 100);
+    } else {
+      return Math.round((1 - phase) * 2 * 100);
+    }
   }
 }
 

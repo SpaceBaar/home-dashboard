@@ -50,7 +50,7 @@ Views are located in `views/` directory, built using EJS templates. Relevant sty
 
 ```bash
 # Test individual services
-npm run test-service weather   # Visual Crossing Weather API
+npm run test-service weather   # Open Weather Map Weather API
 npm run test-service ambient   # Ambient Weather Station
 npm run test-service calendar  # Google Calendar
 npm run test-service vehicle   # Smartcar vehicle data

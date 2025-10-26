@@ -262,7 +262,7 @@
               <i class="ph-bold icon-sm"></i>
               <span class="temp-value"></span>
             </div>
-            <div class="text-label"><%= day.day.toUpperCase() %></div>
+            <div class="text-label"><%= (day.day || 'N/A').toUpperCase() %></div>
           </div>
         <% }); %>
         
