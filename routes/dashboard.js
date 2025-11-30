@@ -73,9 +73,16 @@ router.get('/dashboard/image', async (req, res) => {
       ? `${baseUrl}/dashboard?battery=${encodeURIComponent(batteryParam)}`
       : `${baseUrl}/dashboard`;
     
-    // Check for system Chrome/Chromium
-    const systemChromePath = '/usr/bin/chromium';  // For Raspberry Pi/Linux
-    const useSystemChrome = fs.existsSync(systemChromePath);
+    // Check for system Chrome/Chromium (try multiple common paths)
+    const chromePaths = ['/usr/bin/chromium-browser', '/usr/bin/chromium', '/usr/lib/bin/chromium-browser'];
+    let systemChromePath = null;
+    for (const path of chromePaths) {
+      if (fs.existsSync(path)) {
+        systemChromePath = path;
+        break;
+      }
+    }
+    const useSystemChrome = systemChromePath !== null;
     
     browser = await puppeteer.launch({
       headless: true,
@@ -87,8 +94,15 @@ router.get('/dashboard/image', async (req, res) => {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor',
+        '--no-first-run',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
         '--font-render-hinting=none',
-        '--force-color-profile=srgb'
+        '--force-color-profile=srgb',
+        '--memory-pressure-off'
       ]
     });
     
@@ -98,6 +112,9 @@ router.get('/dashboard/image', async (req, res) => {
     page.on('console', msg => console.log('PAGE LOG:', msg.text()));
     page.on('pageerror', err => console.log('PAGE ERROR:', err.message));
 
+    // Handle target crashes
+    page.on('error', err => console.log('PAGE TARGET ERROR:', err.message));
+
     await page.setViewport({ 
       width: displayWidth, 
       height: displayHeight,
@@ -106,12 +123,16 @@ router.get('/dashboard/image', async (req, res) => {
 
     await page.goto(displayUrl, { 
       waitUntil: 'networkidle2',
-      timeout: 30000
+      timeout: 60000
     });
+
+    // Verify page loaded
+    const title = await page.title();
+    console.log('Page title:', title);
     
     // Wait for fonts and icons to load
     await page.evaluateHandle('document.fonts.ready');
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await page.waitForTimeout(1000);  // Increased wait time
     
     const screenshot = await page.screenshot({
       type: 'png',
