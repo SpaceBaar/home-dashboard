@@ -149,7 +149,7 @@ router.get('/dashboard/image', async (req, res) => {
     
     // Wait for fonts and icons to load
     await page.evaluateHandle('document.fonts.ready');
-    await page.waitForTimeout(1000);  // Increased wait time
+    await new Promise(resolve => setTimeout(resolve, 1000));  // Increased wait time
     
     const screenshot = await page.screenshot({
       type: 'png',
