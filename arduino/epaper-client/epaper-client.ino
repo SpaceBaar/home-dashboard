@@ -39,7 +39,6 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <PNGdec.h>
-#include <TFT_eSPI.h>
 #include <GxEPD2_BW.h>
 #include <GxEPD2_7C.h>
 #include <time.h>
@@ -252,10 +251,10 @@ void initializeHardware() {
 
   // Initialize SPI
   hspi.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, -1);
-  display.epd2.selectSPI(hspi, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  display.epd2.selectSPI(hspi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
 
   // Initialize display
-  display.init(0);
+  display.init(115200);
 }
 
 /**
@@ -549,10 +548,10 @@ int pngDrawCallback(PNGDRAW* pDraw) {
 
       // Calculate luminosity - brightness > 127 = white, else black
       uint8_t brightness = (r * 299 + g * 587 + b * 114) / 1000;
-      color = (brightness > 127) ? TFT_WHITE : TFT_BLACK;
+      color = (brightness > 127) ? GxEPD_WHITE : GxEPD_BLACK;
     } else {
       // Invalid palette - default to white
-      color = TFT_WHITE;
+      color = GxEPD_WHITE;
     }
 
     // Draw pixel to ePaper buffer
@@ -762,7 +761,7 @@ void showBootStatus(const char* message, bool success, bool isError) {
   const int LINE_HEIGHT = 30;
 
   // Set text properties
-  display.setTextColor(TFT_BLACK);
+  display.setTextColor(GxEPD_BLACK);
   display.setTextSize(2);  // Larger text for readability
   display.setCursor(MSG_X, statusLineY);
 
