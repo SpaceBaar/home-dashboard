@@ -82,7 +82,8 @@ router.get('/dashboard/image', async (req, res) => {
         break;
       }
     }
-    const useSystemChrome = systemChromePath !== null;
+    // const useSystemChrome = systemChromePath !== null;
+    const useSystemChrome = false;
     
     browser = await puppeteer.launch({
       headless: true,
