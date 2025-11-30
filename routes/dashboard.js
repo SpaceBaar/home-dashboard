@@ -83,11 +83,11 @@ router.get('/dashboard/image', async (req, res) => {
       }
     }
     // const useSystemChrome = systemChromePath !== null;
-    const useSystemChrome = false;
+    const useSystemChrome = true;
     
     browser = await puppeteer.launch({
       headless: true,
-      pipe: true,
+      pipe: false,  // Changed from pipe: true
       timeout: 60000,
       executablePath: useSystemChrome ? systemChromePath : undefined,
       args: [
@@ -103,7 +103,23 @@ router.get('/dashboard/image', async (req, res) => {
         '--disable-renderer-backgrounding',
         '--font-render-hinting=none',
         '--force-color-profile=srgb',
-        '--memory-pressure-off'
+        '--memory-pressure-off',
+        '--max_old_space_size=512',  // Limit memory usage
+        '--disable-extensions',
+        '--disable-plugins',
+        '--single-process',  // Run in single process
+        '--disable-software-rasterizer',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--hide-scrollbars',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--no-default-browser-check',
+        '--no-first-run',
+        '--safebrowsing-disable-auto-update',
+        '--user-data-dir=/tmp/puppeteer_user_data'
       ]
     });
     
