@@ -262,12 +262,7 @@ void initializeHardware() {
  * Only runs on bootCount == 1
  */
 void prepareFirstBoot() {
-  display.setFullWindow();
-  display.firstPage();
-  if (bootCount == 1) {
-    display.fillScreen(GxEPD_WHITE);
-    showBootStatus("Initializing...", true);
-  }
+  // Display initialization is handled in showBootStatus for first boot
 }
 
 /**
@@ -433,34 +428,26 @@ void updateDisplay(bool usePartialRefresh) {
 
   if (usePartialRefresh) {
     DEBUG_PRINTLN("Updating display (partial refresh)...");
+    display.setPartialWindow(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
   } else {
     DEBUG_PRINTLN("Updating display (full refresh)...");
+    display.setFullWindow();
   }
 
-  display.refresh();
-
-  // Decode PNG into display buffer
-  // Don't clear screen on first boot - preserve boot status messages
-  if (bootCount != 1) {
-    display.fillScreen(TFT_WHITE);
-  }
-  decodePNG();
+  display.firstPage();
+  do {
+    if (bootCount != 1) {
+      display.fillScreen(GxEPD_WHITE);
+    }
+    decodePNG();
+  } while (display.nextPage());
 
   // Free PNG buffer - we're done with it
   free(pngBuffer);
   pngBuffer = nullptr;
   pngBufferSize = 0;
 
-  // Refresh the display
-  if (usePartialRefresh) {
-    // Fast partial refresh - less flashing, good for frequent updates
-    // updatePartial(&epaper);
-    DEBUG_PRINTLN("Display partially refreshed successfully");
-  } else {
-    // Full refresh - better quality, clears ghosting
-    display.refresh();
-    DEBUG_PRINTLN("Display fully refreshed successfully");
-  }
+  DEBUG_PRINTLN("Display updated successfully");
 }
 
 /**
@@ -754,30 +741,32 @@ void showBootStatus(const char* message, bool success, bool isError) {
   static bool firstCall = true;
   if (firstCall) {
     statusLineY = 20;
-    firstCall = false;
+    display.setFullWindow();
+    display.firstPage();
+    do {
+      display.fillScreen(GxEPD_WHITE);
+      firstCall = false;
+    } while (display.nextPage());
   }
 
   const int MSG_X = 20;
   const int LINE_HEIGHT = 30;
 
-  // Set text properties
-  display.setTextColor(GxEPD_BLACK);
-  display.setTextSize(2);  // Larger text for readability
-  display.setCursor(MSG_X, statusLineY);
-
-  // Draw the message to buffer (no refresh yet)
-  display.print(message);
-
-  // Add checkmark or X
-  display.print(" ");
-  if (success) {
-    display.print("✓");  // Unicode checkmark
-  } else {
-    display.print("✕");  // Unicode X mark
-  }
-
-  // Update the display
-  // updatePartial(&epaper);
+  // Set text properties and draw
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.setTextColor(GxEPD_BLACK);
+    display.setTextSize(2);  // Larger text for readability
+    display.setCursor(MSG_X, statusLineY);
+    display.print(message);
+    display.print(" ");
+    if (success) {
+      display.print("✓");  // Unicode checkmark
+    } else {
+      display.print("✕");  // Unicode X mark
+    }
+  } while (display.nextPage());
 
   // Move to next line for next status message
   statusLineY += LINE_HEIGHT;
