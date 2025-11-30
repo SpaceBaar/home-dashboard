@@ -73,8 +73,8 @@ router.get('/dashboard/image', async (req, res) => {
       ? `${baseUrl}/dashboard?battery=${encodeURIComponent(batteryParam)}`
       : `${baseUrl}/dashboard`;
     
-    // Check for system Chrome
-    const systemChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    // Check for system Chrome/Chromium
+    const systemChromePath = '/usr/bin/chromium';  // For Raspberry Pi/Linux
     const useSystemChrome = fs.existsSync(systemChromePath);
     
     browser = await puppeteer.launch({
