@@ -143,7 +143,7 @@ class LLMService extends BaseService {
 
   buildPrompt({ current, forecast, hourlyForecast, location, timezone, sun, moon, air_quality }) {
     const timeContext = this.getTimeContext();
-    const tz = timezone || 'America/Los_Angeles';
+    const tz = timezone || 'Asia/Kolkata';
 
     // Determine scope
     // Note: forecast[0] is always the "next full day"

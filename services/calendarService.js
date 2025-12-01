@@ -79,7 +79,7 @@ class CalendarService extends BaseService {
     // Read selected calendars from auth.json
     const authData = this.loadTokens();
     const calendarIds = authData.google?.selectedCalendars || [];
-    const timezone = config.timezone || 'America/Los_Angeles';
+    const timezone = config.timezone || 'Asia/Kolkata';
 
     if (calendarIds.length === 0) {
       throw new Error('No calendars selected');
@@ -134,7 +134,7 @@ class CalendarService extends BaseService {
 
   mapToDashboard(apiData, config) {
     const now = new Date();
-    const timezone = apiData.timezone || 'America/Los_Angeles';
+    const timezone = apiData.timezone || 'Asia/Kolkata';
 
     return apiData.events.map(ev => ({
       title: ev.title,
