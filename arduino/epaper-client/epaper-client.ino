@@ -119,6 +119,10 @@ const int HTTP_TIMEOUT = 45000;                 // HTTP request timeout (ms)
 #define BATTERY_ADC_PIN 1      // GPIO1 - Battery voltage ADC
 #define BATTERY_ENABLE_PIN 21  // GPIO21 - Battery monitoring enable
 
+// Button pins (reTerminal E1002 specific)
+#define REFRESH_BUTTON_PIN 0   // GPIO0 - Refresh button (active low)
+#define SLIDE_BUTTON_PIN 47    // GPIO47 - Slide change button (active low)
+
 // ==================== DEBUG CONFIGURATION ====================
 // Set to 1 to enable serial debugging, 0 for production (saves power)
 #define DEBUG_ENABLED 1
@@ -141,6 +145,10 @@ RTC_DATA_ATTR int bootCount = 0;                // Total number of boots/wakes
 RTC_DATA_ATTR bool timeInitialized = false;     // Whether NTP time has been synced
 RTC_DATA_ATTR unsigned long lastWakeTime = 0;   // Unix timestamp of last wake
 RTC_DATA_ATTR bool displayInitialized = false;  // Track if display hardware is initialized (persists through light sleep)
+
+// Button state tracking
+bool refreshButtonPressed = false;
+bool slideButtonPressed = false;
 
 // ==================== GLOBAL VARIABLES ====================
 
@@ -182,6 +190,8 @@ bool isDeepSleepTime(int hour);
 unsigned long getSecondsUntil5AM(int currentHour, int currentMinute);
 void shutdownWiFi();
 int getBatteryPercentage();
+bool checkButtonPress();
+void handleButtonPress();
 
 // ==================== SETUP ====================
 
@@ -200,6 +210,14 @@ void setup() {
   DEBUG_PRINTF("Boot #%d | Free Memory: %d bytes\n", bootCount, ESP.getFreeHeap());
   DEBUG_PRINTF("CPU Frequency: %d MHz\n", getCpuFrequencyMhz());
 
+  // Check wake reason
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  bool wokeFromButton = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) || (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1_BITMASK);
+
+  if (wokeFromButton) {
+    DEBUG_PRINTLN("Woke from deep sleep due to button press");
+  }
+
   initializeHardware();
   prepareFirstBoot();
   ensureTimeSync();
@@ -211,6 +229,17 @@ void setup() {
 
 void loop() {
   DEBUG_PRINTLN("--- Refresh Cycle Start ---");
+
+  // Small delay after wake to allow buttons to stabilize
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1_BITMASK) {
+    delay(500); // Allow button to stabilize
+  }
+
+  // Check for button presses first
+  if (checkButtonPress()) {
+    handleButtonPress();
+  }
 
   // Check if we should enter deep sleep (night time)
   if (shouldEnterDeepSleep()) {
@@ -248,6 +277,10 @@ void initializeHardware() {
   pinMode(EPD_RES_PIN, OUTPUT);
   pinMode(EPD_DC_PIN, OUTPUT);
   pinMode(EPD_CS_PIN, OUTPUT);
+
+  // Initialize button pins with internal pull-up
+  pinMode(REFRESH_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(SLIDE_BUTTON_PIN, INPUT_PULLUP);
 
   // Initialize SPI
   hspi.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, -1);
@@ -323,6 +356,16 @@ void enterDeepSleep(unsigned long seconds) {
   displayInitialized = false;
   timeInitialized = false;
 
+  // Configure wake sources
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+  // Enable timer wakeup
+  esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
+
+  // Enable external wakeup on button press (active low)
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON_PIN, 0); // Wake on LOW
+  esp_sleep_enable_ext1_wakeup_bitmask(((uint64_t)1) << SLIDE_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
+
   // Enter deep sleep (ultra-low power ~10-20µA)
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   esp_deep_sleep_start();
@@ -343,8 +386,10 @@ void enterLightSleep() {
   Serial.flush();
 #endif
 
-  // Configure timer and enter light sleep
+  // Configure wake sources
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+  // Enable timer wakeup
   esp_err_t timer_err = esp_sleep_enable_timer_wakeup(REFRESH_INTERVAL * 1000ULL);
 
   if (timer_err != ESP_OK) {
@@ -357,6 +402,10 @@ void enterLightSleep() {
     ESP.restart();
   }
 
+  // Enable external wakeup on button press (active low)
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON_PIN, 0); // Wake on LOW
+  esp_sleep_enable_ext1_wakeup_bitmask(((uint64_t)1) << SLIDE_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
+
   // Enter light sleep
   esp_err_t sleep_result = esp_light_sleep_start();
 
@@ -366,7 +415,9 @@ void enterLightSleep() {
     DEBUG_PRINTLN("Woke from light sleep");
 
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
-    if (wakeup_cause != ESP_SLEEP_WAKEUP_TIMER) {
+    if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0 || wakeup_cause == ESP_SLEEP_WAKEUP_EXT1_BITMASK) {
+      DEBUG_PRINTLN("Woke due to button press");
+    } else if (wakeup_cause != ESP_SLEEP_WAKEUP_TIMER) {
       DEBUG_PRINTF("WARNING: Unexpected wake source: %d\n", wakeup_cause);
     }
 
@@ -786,10 +837,80 @@ void shutdownWiFi() {
 }
 
 /**
- * Read battery percentage from ESP32-S3 ADC
- * Based on reTerminal E Series battery management system
- * @return Battery percentage (0-100), or -1 if not supported/not detected
+ * Check for button presses with debouncing
+ * @return true if a button was pressed
  */
+bool checkButtonPress() {
+  static unsigned long lastCheckTime = 0;
+  static bool lastRefreshState = HIGH;
+  static bool lastSlideState = HIGH;
+  const unsigned long DEBOUNCE_DELAY = 200; // 200ms debounce
+
+  unsigned long currentTime = millis();
+
+  // Only check every 50ms to avoid excessive polling
+  if (currentTime - lastCheckTime < 50) {
+    return false;
+  }
+  lastCheckTime = currentTime;
+
+  // Read button states (active low)
+  bool refreshState = digitalRead(REFRESH_BUTTON_PIN);
+  bool slideState = digitalRead(SLIDE_BUTTON_PIN);
+
+  // Check for refresh button press (HIGH to LOW transition)
+  if (lastRefreshState == HIGH && refreshState == LOW) {
+    refreshButtonPressed = true;
+    DEBUG_PRINTLN("Refresh button pressed");
+    delay(DEBOUNCE_DELAY); // Simple debounce
+    return true;
+  }
+
+  // Check for slide button press (HIGH to LOW transition)
+  if (lastSlideState == HIGH && slideState == LOW) {
+    slideButtonPressed = true;
+    DEBUG_PRINTLN("Slide button pressed");
+    delay(DEBOUNCE_DELAY); // Simple debounce
+    return true;
+  }
+
+  // Update last states
+  lastRefreshState = refreshState;
+  lastSlideState = slideState;
+
+  return false;
+}
+
+/**
+ * Handle button press events
+ */
+void handleButtonPress() {
+  if (refreshButtonPressed) {
+    DEBUG_PRINTLN("Handling refresh button press");
+    showBootStatus("Manual refresh...", true);
+
+    // Force a full refresh of the dashboard
+    bool success = refreshDashboard();
+
+    if (success) {
+      DEBUG_PRINTLN("Manual refresh completed successfully");
+    } else {
+      DEBUG_PRINTLN("Manual refresh failed");
+      showBootStatus("Manual refresh...", false, true);
+      delay(3000); // Show error for 3 seconds
+    }
+
+    refreshButtonPressed = false;
+  }
+
+  if (slideButtonPressed) {
+    DEBUG_PRINTLN("Handling slide button press");
+    // For now, just log it. Could implement slide changing functionality later
+    showBootStatus("Slide change...", true);
+    delay(1000);
+    slideButtonPressed = false;
+  }
+}
 int getBatteryPercentage() {
   // LiPo battery voltage range
   const float MIN_VOLTAGE = 3.0;  // Empty battery
