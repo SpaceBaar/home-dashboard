@@ -120,8 +120,8 @@ const int HTTP_TIMEOUT = 45000;                 // HTTP request timeout (ms)
 #define BATTERY_ENABLE_PIN 21  // GPIO21 - Battery monitoring enable
 
 // Button pins (reTerminal E1002 specific)
-#define REFRESH_BUTTON_PIN 0  // GPIO0 - Refresh button (active low)
-#define SLIDE_BUTTON_PIN 47   // GPIO47 - Slide change button (active low)
+#define REFRESH_BUTTON_PIN 47   // GPIO47 - Refresh button (active low)
+#define SLIDE_BUTTON_PIN 0     // GPIO0 - Slide change button (active low)
 
 // ==================== DEBUG CONFIGURATION ====================
 // Set to 1 to enable serial debugging, 0 for production (saves power)
@@ -170,7 +170,7 @@ void ensureTimeSync();
 bool shouldEnterDeepSleep();
 void enterDeepSleep(unsigned long seconds);
 void enterLightSleep();
-bool refreshDashboard();
+bool refreshDashboard(bool showLoading = false);
 
 // Network & Data
 bool connectWiFi();
@@ -222,6 +222,11 @@ void setup() {
   prepareFirstBoot();
   ensureTimeSync();
 
+  // Test button functionality
+  DEBUG_PRINTLN("Testing button pins...");
+  DEBUG_PRINTF("Refresh button (GPIO%d): %d\n", REFRESH_BUTTON_PIN, digitalRead(REFRESH_BUTTON_PIN));
+  DEBUG_PRINTF("Slide button (GPIO%d): %d\n", SLIDE_BUTTON_PIN, digitalRead(SLIDE_BUTTON_PIN));
+
   DEBUG_PRINTLN("Initialization complete\n");
 }
 
@@ -252,7 +257,7 @@ void loop() {
   }
 
   // Refresh dashboard
-  bool success = refreshDashboard();
+  bool success = refreshDashboard(false);
 
   if (!success && bootCount == 1) {
     delay(5000);  // Show error message on first boot
@@ -439,11 +444,13 @@ void enterLightSleep() {
 /**
  * Download and display dashboard image
  * Handles WiFi connection, download, and display update
+ * @param showLoading If true, shows loading status messages on display
  * @return true if successful, false on error
  */
-bool refreshDashboard() {
-  bool usePartial = displayInitialized;  // Use partial refresh for light sleep wakes
-  showBootStatus("Loading dashboard...", true);
+bool refreshDashboard(bool showLoading) {
+  if (showLoading) {
+    showBootStatus("Loading dashboard...", true);
+  }
 
   // Try downloading with retry logic
   for (int attempt = 1; attempt <= 2; attempt++) {
@@ -861,6 +868,8 @@ bool checkButtonPress() {
   bool refreshState = digitalRead(REFRESH_BUTTON_PIN);
   bool slideState = digitalRead(SLIDE_BUTTON_PIN);
 
+  DEBUG_PRINTF("Button states - Refresh: %d, Slide: %d\n", refreshState, slideState);
+
   // Check for refresh button press (HIGH to LOW transition)
   if (lastRefreshState == HIGH && refreshState == LOW) {
     refreshButtonPressed = true;
@@ -890,17 +899,14 @@ bool checkButtonPress() {
 void handleButtonPress() {
   if (refreshButtonPressed) {
     DEBUG_PRINTLN("Handling refresh button press");
-    showBootStatus("Manual refresh...", true);
 
     // Force a full refresh of the dashboard
-    bool success = refreshDashboard();
+    bool success = refreshDashboard(true);
 
     if (success) {
       DEBUG_PRINTLN("Manual refresh completed successfully");
     } else {
       DEBUG_PRINTLN("Manual refresh failed");
-      showBootStatus("Manual refresh...", false, true);
-      delay(3000);  // Show error for 3 seconds
     }
 
     refreshButtonPressed = false;
@@ -909,8 +915,6 @@ void handleButtonPress() {
   if (slideButtonPressed) {
     DEBUG_PRINTLN("Handling slide button press");
     // Note: Slide button only works during normal operation, not for waking from sleep
-    showBootStatus("Slide change...", true);
-    delay(1000);
     slideButtonPressed = false;
   }
 }
