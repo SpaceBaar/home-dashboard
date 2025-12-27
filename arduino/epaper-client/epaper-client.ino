@@ -120,8 +120,8 @@ const int HTTP_TIMEOUT = 45000;                 // HTTP request timeout (ms)
 #define BATTERY_ENABLE_PIN 21  // GPIO21 - Battery monitoring enable
 
 // Button pins (reTerminal E1002 specific)
-#define REFRESH_BUTTON_PIN 0   // GPIO0 - Refresh button (active low)
-#define SLIDE_BUTTON_PIN 47    // GPIO47 - Slide change button (active low)
+#define REFRESH_BUTTON_PIN 0  // GPIO0 - Refresh button (active low)
+#define SLIDE_BUTTON_PIN 47   // GPIO47 - Slide change button (active low)
 
 // ==================== DEBUG CONFIGURATION ====================
 // Set to 1 to enable serial debugging, 0 for production (saves power)
@@ -233,7 +233,7 @@ void loop() {
   // Small delay after wake to allow buttons to stabilize
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1_BITMASK) {
-    delay(500); // Allow button to stabilize
+    delay(500);  // Allow button to stabilize
   }
 
   // Check for button presses first
@@ -363,7 +363,7 @@ void enterDeepSleep(unsigned long seconds) {
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
 
   // Enable external wakeup on button press (active low)
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON_PIN, 0); // Wake on LOW
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON_PIN, 0);  // Wake on LOW
   esp_sleep_enable_ext1_wakeup_bitmask(((uint64_t)1) << SLIDE_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
 
   // Enter deep sleep (ultra-low power ~10-20µA)
@@ -403,7 +403,7 @@ void enterLightSleep() {
   }
 
   // Enable external wakeup on button press (active low)
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON_PIN, 0); // Wake on LOW
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON_PIN, 0);  // Wake on LOW
   esp_sleep_enable_ext1_wakeup_bitmask(((uint64_t)1) << SLIDE_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
 
   // Enter light sleep
@@ -844,7 +844,7 @@ bool checkButtonPress() {
   static unsigned long lastCheckTime = 0;
   static bool lastRefreshState = HIGH;
   static bool lastSlideState = HIGH;
-  const unsigned long DEBOUNCE_DELAY = 200; // 200ms debounce
+  const unsigned long DEBOUNCE_DELAY = 200;  // 200ms debounce
 
   unsigned long currentTime = millis();
 
@@ -862,7 +862,7 @@ bool checkButtonPress() {
   if (lastRefreshState == HIGH && refreshState == LOW) {
     refreshButtonPressed = true;
     DEBUG_PRINTLN("Refresh button pressed");
-    delay(DEBOUNCE_DELAY); // Simple debounce
+    delay(DEBOUNCE_DELAY);  // Simple debounce
     return true;
   }
 
@@ -870,7 +870,7 @@ bool checkButtonPress() {
   if (lastSlideState == HIGH && slideState == LOW) {
     slideButtonPressed = true;
     DEBUG_PRINTLN("Slide button pressed");
-    delay(DEBOUNCE_DELAY); // Simple debounce
+    delay(DEBOUNCE_DELAY);  // Simple debounce
     return true;
   }
 
@@ -897,7 +897,7 @@ void handleButtonPress() {
     } else {
       DEBUG_PRINTLN("Manual refresh failed");
       showBootStatus("Manual refresh...", false, true);
-      delay(3000); // Show error for 3 seconds
+      delay(3000);  // Show error for 3 seconds
     }
 
     refreshButtonPressed = false;
