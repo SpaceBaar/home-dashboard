@@ -463,7 +463,7 @@ bool refreshDashboard(bool showLoading) {
     bool wifiConnected = (WiFi.status() == WL_CONNECTED) || connectWiFi();
 
     if (wifiConnected && downloadPNG()) {
-      updateDisplay(usePartial);
+      updateDisplay(false);  // Use full refresh for better quality
       return true;
     }
   }
