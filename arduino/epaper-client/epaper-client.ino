@@ -212,7 +212,7 @@ void setup() {
 
   // Check wake reason
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  bool wokeFromButton = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) || (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1);
+  bool wokeFromButton = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0);
 
   if (wokeFromButton) {
     DEBUG_PRINTLN("Woke from deep sleep due to button press");
@@ -232,7 +232,7 @@ void loop() {
 
   // Small delay after wake to allow buttons to stabilize
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
     delay(500);  // Allow button to stabilize
   }
 
@@ -364,7 +364,9 @@ void enterDeepSleep(unsigned long seconds) {
 
   // Enable external wakeup on button press (active low)
   esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON_PIN, 0);  // Wake on LOW
-  esp_sleep_enable_ext1_wakeup_bitmask(((uint64_t)1) << SLIDE_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
+
+  // Note: EXT1 wakeup for slide button removed due to compatibility issues
+  // Only refresh button (EXT0) will wake from deep sleep
 
   // Enter deep sleep (ultra-low power ~10-20µA)
   esp_deep_sleep_start();
@@ -403,7 +405,9 @@ void enterLightSleep() {
 
   // Enable external wakeup on button press (active low)
   esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON_PIN, 0);  // Wake on LOW
-  esp_sleep_enable_ext1_wakeup_bitmask(((uint64_t)1) << SLIDE_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
+
+  // Note: EXT1 wakeup for slide button removed due to compatibility issues
+  // Only refresh button (EXT0) will wake from light sleep
 
   // Enter light sleep
   esp_err_t sleep_result = esp_light_sleep_start();
@@ -414,7 +418,7 @@ void enterLightSleep() {
     DEBUG_PRINTLN("Woke from light sleep");
 
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
-    if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0 || wakeup_cause == ESP_SLEEP_WAKEUP_EXT1) {
+    if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0) {
       DEBUG_PRINTLN("Woke due to button press");
     } else if (wakeup_cause != ESP_SLEEP_WAKEUP_TIMER) {
       DEBUG_PRINTF("WARNING: Unexpected wake source: %d\n", wakeup_cause);
@@ -904,7 +908,7 @@ void handleButtonPress() {
 
   if (slideButtonPressed) {
     DEBUG_PRINTLN("Handling slide button press");
-    // For now, just log it. Could implement slide changing functionality later
+    // Note: Slide button only works during normal operation, not for waking from sleep
     showBootStatus("Slide change...", true);
     delay(1000);
     slideButtonPressed = false;
