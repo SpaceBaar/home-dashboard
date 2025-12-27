@@ -86,7 +86,7 @@ const char* WIFI_SSID = "Airtel_SpaceBaar";
 const char* WIFI_PASSWORD = "21072410";
 
 // Server configuration
-const char* SERVER_IP = "raspberrypi.local";
+const char* SERVER_IP = "192.168.1.13";
 const int SERVER_PORT = 7272;
 
 // Main dashboard image path
