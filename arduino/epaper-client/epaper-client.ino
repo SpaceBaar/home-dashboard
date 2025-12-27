@@ -212,7 +212,7 @@ void setup() {
 
   // Check wake reason
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  bool wokeFromButton = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) || (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1_BITMASK);
+  bool wokeFromButton = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) || (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1);
 
   if (wokeFromButton) {
     DEBUG_PRINTLN("Woke from deep sleep due to button press");
@@ -232,7 +232,7 @@ void loop() {
 
   // Small delay after wake to allow buttons to stabilize
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1_BITMASK) {
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
     delay(500);  // Allow button to stabilize
   }
 
@@ -367,7 +367,6 @@ void enterDeepSleep(unsigned long seconds) {
   esp_sleep_enable_ext1_wakeup_bitmask(((uint64_t)1) << SLIDE_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
 
   // Enter deep sleep (ultra-low power ~10-20µA)
-  esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   esp_deep_sleep_start();
   // Device resets on wake - execution never continues past this point
 }
@@ -415,7 +414,7 @@ void enterLightSleep() {
     DEBUG_PRINTLN("Woke from light sleep");
 
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
-    if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0 || wakeup_cause == ESP_SLEEP_WAKEUP_EXT1_BITMASK) {
+    if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0 || wakeup_cause == ESP_SLEEP_WAKEUP_EXT1) {
       DEBUG_PRINTLN("Woke due to button press");
     } else if (wakeup_cause != ESP_SLEEP_WAKEUP_TIMER) {
       DEBUG_PRINTF("WARNING: Unexpected wake source: %d\n", wakeup_cause);
