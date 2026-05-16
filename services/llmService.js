@@ -199,7 +199,7 @@ Remember:
 
     const userMessage = `Today is ${month} ${day}. It is ${timeContext.period.toUpperCase()}, ${time}. Planning for ${timeContext.planningFocus}
 
-CURRENT WEATHER: ${current?.temp_f}°F, ${current?.description}
+CURRENT WEATHER: ${current?.temp_f}°C, ${current?.description}
 ${weatherContext.dailyInfo}
 
 HOURLY FORECAST:
