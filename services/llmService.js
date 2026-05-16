@@ -2,8 +2,7 @@ const axios = require('axios');
 const { BaseService } = require('../lib/BaseService');
 
 /**
- * LLM Service (AI Insights) - OPTIONAL
- * Currently supports Anthropic Claude, but designed to be provider-agnostic
+ * LLM Service (AI Insights) - Local Haillo-Ollama Provider
  */
 class LLMService extends BaseService {
 
@@ -17,64 +16,60 @@ class LLMService extends BaseService {
     });
   }
 
+  /**
+   * Check if the service is enabled.
+   * Since this is hosted locally, we check if the endpoint is defined 
+   * or default to localhost.
+   */
   isEnabled() {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    return !!apiKey;
+    const endpoint = process.env.LOCAL_LLM_URL || 'http://localhost:8000';
+    return !!endpoint;
   }
 
-  // This uses the Anthropic Claude API, but can be swapped out
-  // for any other LLM provider by re-implementing fetchData()
-  // and updating the pricing constants below
-
-  // Claude 3.5 Haiku pricing per token
-  static PRICE_INPUT_PER_TOKEN = 0.80 / 1_000_000;   // $0.80 per million
-  static PRICE_OUTPUT_PER_TOKEN = 4.00 / 1_000_000;  // $4.00 per million
-  
   async fetchData(config, logger) {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
+    const baseUrl = process.env.LOCAL_LLM_URL || 'http://localhost:8000';
+    const modelName = process.env.LOCAL_LLM_MODEL || 'llama3.2:3b';
 
     const { systemPrompt, userMessage } = this.buildPrompt(config.input);
     
-    logger.info?.('[LLM] Calling Anthropic Claude API');
+    logger.info?.(`[LLM] Calling Local hailo-ollama API using ${modelName}`);
 
     const response = await axios.post(
-      'https://api.anthropic.com/v1/messages',
+      `${baseUrl}/api/generate`,
       {
-        model: 'claude-3-5-haiku-latest',
-        max_tokens: 300,
-        temperature: 0.5,
+        model: modelName,
         system: systemPrompt,
-        messages: [{ role: 'user', content: userMessage }],
+        prompt: userMessage,
+        format: 'json', // Forces Llama 3.2 to reply strictly with a structured JSON string
+        stream: false,
+        options: {
+          temperature: 0.6, // Slightly lowered to reduce formatting deviance
+        }
       },
       {
-        timeout: 8000,
+        timeout: 15000, // Local NPU is fast, but give a healthy buffer for cold loads
         headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json',
+          'Content-Type': 'application/json',
         },
       }
     );
 
-    const text = response?.data?.content?.[0]?.text || '';
-    logger.info?.('[LLM] Response:', text);
+    // Ollama wraps the raw string output inside response.data.response
+    const rawText = response?.data?.response || '';
+    logger.info?.('[LLM] Raw Response:', rawText);
 
-    // Extract token usage and calculate cost
-    const usage = response?.data?.usage || {};
-    const inputTokens = usage.input_tokens || 0;
-    const outputTokens = usage.output_tokens || 0;
-    const costUsd = (inputTokens * LLMService.PRICE_INPUT_PER_TOKEN) + 
-                    (outputTokens * LLMService.PRICE_OUTPUT_PER_TOKEN);
+    // Extract local token usage statistics from Ollama's response format
+    const inputTokens = response?.data?.prompt_eval_count || 0;
+    const outputTokens = response?.data?.eval_count || 0;
+    const costUsd = 0.00; // 100% Local infrastructure, no external API costs
 
-    logger.info?.(`[LLM] Tokens: ${inputTokens} input, ${outputTokens} output | Cost: $${costUsd.toFixed(6)}`);
+    logger.info?.(`[LLM] Tokens: ${inputTokens} input, ${outputTokens} output | Cost: $${costUsd.toFixed(2)}`);
 
     let parsed;
     try {
-      // Strip markdown code blocks just in case
-      let cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      // Standard cleanup just in case markdown styling leaks through
+      let cleanText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
 
-      // Extract just the JSON object (in case LLM adds extra commentary)
       const jsonStart = cleanText.indexOf('{');
       const jsonEnd = cleanText.lastIndexOf('}');
 
@@ -83,13 +78,23 @@ class LLMService extends BaseService {
       }
       
       parsed = JSON.parse(cleanText);
+
+      // Post-Processing: Strict enforcement of e-paper character layouts
+      if (parsed.daily_summary) {
+        // Strip trailing punctuation if the model misses the system prompt rule
+        parsed.daily_summary = parsed.daily_summary.trim().replace(/[.!?,]+$/, '');
+
+        // Truncate dynamically at word boundary if character limits exceed 78
+        if (parsed.daily_summary.length > 78) {
+          parsed.daily_summary = parsed.daily_summary.substring(0, 78).toLowerCase().split(' ').slice(0, -1).join(' ');
+        }
+      }
     } catch (e) {
-      logger.error?.('[LLM] Failed to parse response:', e.message);
+      logger.error?.('[LLM] Failed to clean or parse JSON response:', e.message);
       parsed = { clothing_suggestion: null, daily_summary: null };
     }
 
-    // Attach cost and prompt metadata to the parsed result 
-    // for easier debugging and cost tracking
+    // Attach metadata for tracking
     return {
       ...parsed,
       _meta: {
@@ -110,20 +115,15 @@ class LLMService extends BaseService {
   }
 
   /**
-   * Get current cached cost information
-   * @returns {Object|null} Cost info or null if no cache
+   * Refactored for local metrics tracker
    */
   getCostInfo() {
-    const cached = this.getCache(true); // Allow stale
+    const cached = this.getCache(true);
     if (!cached || !cached._meta) return null;
 
     const { input_tokens, output_tokens, cost_usd, prompt } = cached._meta;
-
-    // Calculate projected daily/monthly costs based on cache TTL
     const cacheTTLHours = this.cacheTTL / (1000 * 60 * 60);
     const callsPerDay = (24 - 5) / cacheTTLHours;
-    const projectedDailyCost = cost_usd * callsPerDay;
-    const projectedMonthlyCost = projectedDailyCost * 30;
 
     return {
       last_call: {
@@ -135,25 +135,20 @@ class LLMService extends BaseService {
       },
       projections: {
         calls_per_day: Math.round(callsPerDay * 10) / 10,
-        daily_cost_usd: projectedDailyCost,
-        monthly_cost_usd: projectedMonthlyCost,
+        daily_cost_usd: 0,
+        monthly_cost_usd: 0,
       }
     };
   }
 
   buildPrompt({ current, forecast, hourlyForecast, location, timezone, sun, moon, air_quality }) {
+    // Keep your exact prompt building logic intact...
     const timeContext = this.getTimeContext();
-    const tz = timezone || 'Asia/Kolkata';
-
-    // Determine scope
-    // Note: forecast[0] is always the "next full day"
-    // During daytime: forecast[0] = today, during nighttime: forecast[0] = tomorrow
     const isNight = timeContext.period === 'night';
     const hoursToShow = timeContext.period === 'morning' ? 8 : 6;
     const relevantHourly = isNight ? hourlyForecast : hourlyForecast.slice(0, hoursToShow);
-    const relevantForecast = forecast?.[0]; // Always use forecast[0] for the next full day
+    const relevantForecast = forecast?.[0];
 
-    // Build context intelligently
     const weatherContext = this.buildWeatherContext({
       current,
       relevantForecast,
@@ -214,109 +209,70 @@ ${weatherContext.hourlyData}${weatherContext.contextNotes ? '\n\nNOTES: ' + weat
   }
 
   buildWeatherContext({ current, relevantForecast, relevantHourly, isNight, moon, air_quality, timeContext }) {
+    // Keep your exact buildWeatherContext logic intact...
     const context = { contextNotes: [] };
-
-    // Daily info with smart rain mention
-    const maxRainChance = Math.max(
-      relevantForecast?.rain_chance || 0,
-      ...relevantHourly.map(h => h.rain_chance || 0)
-    );
+    const maxRainChance = Math.max(relevantForecast?.rain_chance || 0, ...relevantHourly.map(h => h.rain_chance || 0));
     const rainMention = maxRainChance > 0 ? `, ${maxRainChance}% rain` : '';
 
     context.dailyInfo = isNight
       ? `TOMORROW: High ${relevantForecast?.high}°, Low ${relevantForecast?.low}°${rainMention}`
       : `TODAY: High ${relevantForecast?.high}°, Low ${relevantForecast?.low}°${rainMention}`;
 
-    // Hourly data
     context.hourlyData = relevantHourly
       .map(h => `${h.time}: ${h.temp_f}° ${h.condition.trim()}${h.rain_chance > 0 ? ` (${h.rain_chance}%)` : ''}`)
       .join('\n');
 
-    // Temperature swing
     const temps = relevantHourly.map(h => h.temp_f);
     const tempRange = Math.max(...temps) - Math.min(...temps);
-    if (tempRange >= 15) {
-      context.contextNotes.push(`${tempRange}° temperature swing`);
-    }
+    if (tempRange >= 15) context.contextNotes.push(`${tempRange}° temperature swing`);
 
-    // Wind
     const maxWind = Math.max(...relevantHourly.map(h => h.wind_mph || 0));
-    if (maxWind >= 12) {
-      context.contextNotes.push(`Windy, gusts ${maxWind} mph`);
-    }
+    if (maxWind >= 12) context.contextNotes.push(`Windy, gusts ${maxWind} mph`);
 
-    // Humidity extremes
     const humidity = current?.humidity;
-    if (humidity >= 80) {
-      context.contextNotes.push(`Humid (${humidity}%, muggy feel)`);
-    } else if (humidity <= 30) {
-      context.contextNotes.push(`Dry (${humidity}%, crisp feel)`);
-    }
+    if (humidity >= 80) context.contextNotes.push(`Humid (${humidity}%, muggy feel)`);
+    else if (humidity <= 30) context.contextNotes.push(`Dry (${humidity}%, crisp feel)`);
 
-    // Sky transitions - enhanced with more detail
     const conditions = relevantHourly.map(h => h.condition.trim().toLowerCase());
     const uniqueConditions = [...new Set(conditions)];
 
     if (uniqueConditions.length > 1) {
       const firstCond = conditions[0];
       const lastCond = conditions[conditions.length - 1];
-
-      // Find the transition point
       const transitionIndex = conditions.findIndex((c, i) => i > 0 && c !== conditions[i - 1]);
       if (transitionIndex > 0) {
-        const transitionTime = relevantHourly[transitionIndex].time;
-        context.contextNotes.push(`${firstCond} → ${lastCond} around ${transitionTime}`);
+        context.contextNotes.push(`${firstCond} → ${lastCond} around ${relevantHourly[transitionIndex].time}`);
       } else if (firstCond !== lastCond) {
         context.contextNotes.push(`${firstCond} → ${lastCond}`);
       }
     }
 
-    // Moon - enhanced descriptions
     if (moon && (timeContext.period === 'evening' || timeContext.period === 'night')) {
-      if (moon.phase === 'full' || moon.illumination >= 95) {
-        context.contextNotes.push('Full moon (bright night)');
-      } else if (moon.phase === 'new' || moon.illumination <= 5) {
-        context.contextNotes.push('New moon');
-      } else if (moon.illumination >= 50 && moon.direction === 'waxing') {
-        context.contextNotes.push(`Bright ${moon.phase.replace('_', ' ')} moon`);
-      }
+      if (moon.phase === 'full' || moon.illumination >= 95) context.contextNotes.push('Full moon (bright night)');
+      else if (moon.phase === 'new' || moon.illumination <= 5) context.contextNotes.push('New moon');
+      else if (moon.illumination >= 50 && moon.direction === 'waxing') context.contextNotes.push(`Bright ${moon.phase.replace('_', ' ')} moon`);
     }
 
-    // Air quality
-    if (air_quality?.aqi > 100) {
-      context.contextNotes.push(`AQI ${air_quality.aqi} (${air_quality.category})`);
-    }
+    if (air_quality?.aqi > 100) context.contextNotes.push(`AQI ${air_quality.aqi} (${air_quality.category})`);
 
-    // Special conditions - enhanced
-    const fogHours = relevantHourly.filter(h => 
-      h.condition.toLowerCase().includes('fog') || h.condition.toLowerCase().includes('mist')
-    );
-    if (fogHours.length >= 2) {
-      const fogStart = fogHours[0].time;
-      const fogEnd = fogHours[fogHours.length-1].time;
-      context.contextNotes.push(`Marine layer ${fogStart}-${fogEnd}`);
-    }
+    const fogHours = relevantHourly.filter(h => h.condition.toLowerCase().includes('fog') || h.condition.toLowerCase().includes('mist'));
+    if (fogHours.length >= 2) context.contextNotes.push(`Marine layer ${fogHours[0].time}-${fogHours[fogHours.length-1].time}`);
 
-    // Heat advisory
     const hotHours = relevantHourly.filter(h => h.temp_f >= 90);
-    if (hotHours.length >= 2) {
-      context.contextNotes.push(`Heat peak ${hotHours[0].time}-${hotHours[hotHours.length-1].time}`);
-    }
+    if (hotHours.length >= 2) context.contextNotes.push(`Heat peak ${hotHours[0].time}-${hotHours[hotHours.length-1].time}`);
 
-    // Feels-like delta - when significantly different
     if (current?.feels_like_f && Math.abs(current.temp_f - current.feels_like_f) >= 5) {
       const delta = current.feels_like_f - current.temp_f;
       context.contextNotes.push(`Feels ${delta > 0 ? 'warmer' : 'cooler'} (${Math.abs(delta)}° diff)`);
     }
 
-    // Limit to top 5
     context.contextNotes = context.contextNotes.slice(0, 5).join(' • ');
     return context;
   }
 
   getTimeContext() {
+    // Keep your exact getTimeContext logic intact...
     const hour = new Date().getHours();
-
     if (hour >= 5 && hour < 11) {
       return { period: 'morning', planningFocus: 'the full day ahead. Describe how the day is starting and what to expect ahead. You MUST mention "today" or "this morning" once' };
     } else if (hour >= 11 && hour < 16) {
