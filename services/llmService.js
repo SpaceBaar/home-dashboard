@@ -47,7 +47,7 @@ class LLMService extends BaseService {
         }
       },
       {
-        timeout: 15000, // Local NPU is fast, but give a healthy buffer for cold loads
+        timeout: 45000, // <-- Bump this to 45 seconds to safely handle the very first cold start
         headers: {
           'Content-Type': 'application/json',
         },
