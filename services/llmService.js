@@ -28,68 +28,53 @@ class LLMService extends BaseService {
 
   async fetchData(config, logger) {
     const baseUrl = process.env.LOCAL_LLM_URL || 'http://localhost:8000';
-    // Configure to use the lightweight model footprint (qwen2:1.5b or llama3.2:1b)
     const modelName = process.env.LOCAL_LLM_MODEL || 'qwen2:1.5b';
 
     const { systemPrompt, userMessage } = this.buildPrompt(config.input);
     
-    logger.info?.(`[LLM] Calling Local hailo-ollama API using ${modelName}`);
+    logger.info?.(`[LLM] Calling Local hailo-ollama Chat API using ${modelName}`);
 
     try {
       const response = await axios.post(
-        `${baseUrl}/api/generate`,
+        `${baseUrl}/api/chat`, // 1. Use chat endpoint for explicit template adherence
         {
           model: modelName,
-          system: systemPrompt,
-          prompt: userMessage,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage }
+          ],
           stream: false,
           options: {
-            temperature: 0.1, // Drastically lowered to lock down formatting variance
+            temperature: 0.1, // Near-zero temperature minimizes wandering behavior
             keep_alive: -1
           }
         },
         {
-          timeout: 30000, // 30 seconds is plenty for a warm small model
+          timeout: 30000,
           headers: { 'Content-Type': 'application/json' },
         }
       );
 
-      const rawText = response?.data?.response || '';
+      const rawText = response?.data?.message?.content || '';
       logger.info?.('[LLM] Raw Response:', rawText);
 
-      let parsed = { clothing_suggestion: null, daily_summary: null };
+      let parsed = { clothing_suggestion: "Layers recommended", daily_summary: "Weather dashboard active" };
 
-      // ROBUST MULTI-TIER PARSER FOR SMALL MODELS
-      try {
-        // Tier 1: Try parsing direct JSON
-        let cleanText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-        const jsonStart = cleanText.indexOf('{');
-        const jsonEnd = cleanText.lastIndexOf('}');
-        if (jsonStart !== -1 && jsonEnd !== -1) {
-          parsed = JSON.parse(cleanText.substring(jsonStart, jsonEnd + 1));
-        } else {
-          throw new Error("No clean JSON block found, attempting Regex fallback...");
+      // 2. LINE-BY-LINE SCRAPER (Highly reliable for small models)
+      const lines = rawText.split('\n');
+      for (let line of lines) {
+        const cleanLine = line.trim();
+        if (cleanLine.toUpperCase().startsWith('CLOTHING:')) {
+          parsed.clothing_suggestion = cleanLine.replace(/^CLOTHING:\s*/i, '').trim();
         }
-      } catch (jsonErr) {
-        // Tier 2: Regex fallback to scrape text if the small model output free-text paragraphs
-        logger.warn?.('[LLM] Standard JSON parse failed. Running fallback string scraper.');
-        
-        const summaryMatch = rawText.match(/"daily_summary"\s*:\s*"([^"]+)"/) || rawText.match(/daily_summary\s*:\s*([^\n]+)/);
-        const clothingMatch = rawText.match(/"clothing_suggestion"\s*:\s*"([^"]+)"/) || rawText.match(/clothing_suggestion\s*:\s*([^\n]+)/);
-
-        parsed.daily_summary = summaryMatch ? summaryMatch[1] : null;
-        parsed.clothing_suggestion = clothingMatch ? clothingMatch[1] : null;
-
-        // Tier 3: absolute emergency backup if the model completely ignored the schema structure
-        if (!parsed.daily_summary) {
-          parsed.daily_summary = rawText.split('.')[0]; // Grab the first sentence
-          parsed.clothing_suggestion = "Layers recommended";
+        if (cleanLine.toUpperCase().startsWith('SUMMARY:')) {
+          parsed.daily_summary = cleanLine.replace(/^SUMMARY:\s*/i, '').trim();
         }
       }
 
-      // Strict post-processing clean up for e-paper character matrix
+      // Strict post-processing clean up for the e-paper matrix layout
       if (parsed.daily_summary) {
-        parsed.daily_summary = parsed.daily_summary.trim().replace(/[.!?,]+$/, '');
+        parsed.daily_summary = parsed.daily_summary.replace(/[.!?,]+$/, '').trim();
         if (parsed.daily_summary.length > 78) {
           parsed.daily_summary = parsed.daily_summary.substring(0, 78).split(' ').slice(0, -1).join(' ');
         }
@@ -109,7 +94,7 @@ class LLMService extends BaseService {
       logger.error?.('[LLM] Critical Transport/Inference Failure:', e.message);
       return {
         clothing_suggestion: "Check display text",
-        daily_summary: "Local inference engine connection timeout pending retry",
+        daily_summary: "Local inference connection error pending retry loop",
         _meta: { input_tokens: 0, output_tokens: 0, cost_usd: 0, prompt: "" }
       };
     }
@@ -167,30 +152,23 @@ class LLMService extends BaseService {
       timeContext
     });
 
-    // RESTRUCTURED SYSTEM PROMPT FOR SUB-2B MODELS USING XML SEPARATORS
-    const systemPrompt = `<instructions>
-You are an automated backend weather reporter compiling an insight block for an e-ink display.
-Your response MUST be formatted strictly using raw JSON layout keys. Do not write introductory prose.
+    // A SIMPLIFIED, NON-JSON PROMPT DESIGNED FOR <2B CHAT MODELS
+    const systemPrompt = `You are an automated assistant providing weather text for an e-ink kitchen display dashboard. 
+The dashboard shows numerical values, so describe the FEEL and STORY of the weather.
 
-CRITICAL RULES:
-1. Do NOT mention specific temperatures or degrees. Use descriptive indicators like "cool", "warm", "hot", "chilly", or "mild".
-2. Do NOT mention specific months, dates, or days of the week. Describe seasons instead if needed.
-3. Keep daily_summary content between 60 and 78 total characters long.
-4. Remove all periods or trailing punctuation from the end of daily_summary.
-</instructions>
+You MUST format your output exactly as two lines:
+CLOTHING: <practical advice, max 6 words>
+SUMMARY: <vivid weather description between 60 and 78 characters total, with NO trailing punctuation>
 
-<output_format>
-{
-  "clothing_suggestion": "practical clothing advice, max 6 words",
-  "daily_summary": "vivid weather narrative between 60 and 78 characters with no ending punctuation"
-}
-</output_format>
+Rules:
+- DO NOT mention specific temperatures or degrees. Use words like "cool", "warm", "hot", "chilly", "mild".
+- DO NOT mention specific months, dates, or weekdays.
+- Do not write introductory prose or conversation. Start immediately with CLOTHING:
 
-<examples>
-{"clothing_suggestion": "Warm layers and rain gear", "daily_summary": "Dreary and rainy most of the day. Rain not letting up, stay cozy and dry"}
-{"clothing_suggestion": "Layers you can shed", "daily_summary": "Cool start warming up fast, sunny and pleasant by afternoon"}
-</examples>`
-;
+Example Output:
+CLOTHING: Warm layers and rain gear
+SUMMARY: Dreary and rainy most of the day with a cold evening breeze ahead
+`;
 
     const now = new Date();
     const month = now.toLocaleString('default', { month: 'long' });
