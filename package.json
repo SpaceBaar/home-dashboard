@@ -35,7 +35,7 @@
     "test-service": "node scripts/test-service.js"
   },
   "dependencies": {
-    "axios": "^1.7.7",
+    "axios": "^1.16.0",
     "dotenv": "^16.4.5",
     "ejs": "^3.1.9",
     "express": "^4.18.2",
@@ -44,11 +44,11 @@
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
     "phosphor-icons": "^1.4.2",
-    "pm2": "^6.0.13",
+    "pm2": "^7.0.1",
     "puppeteer": "^24.23.0",
     "sharp": "^0.34.4",
     "smartcar": "^10.1.0",
-    "uuid": "^9.0.1",
+    "uuid": "^14.0.0",
     "zipcodes": "^8.0.0"
   }
 }
