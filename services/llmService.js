@@ -28,8 +28,8 @@ class LLMService extends BaseService {
 
   async fetchData(config, logger) {
     const baseUrl = process.env.LOCAL_LLM_URL || 'http://localhost:8000';
-    // 1. Correct fallback model identifier
-    const modelName = process.env.LOCAL_LLM_MODEL || 'qwen2:1.5b'; 
+    // Configure to use the lightweight model footprint (qwen2:1.5b or llama3.2:1b)
+    const modelName = process.env.LOCAL_LLM_MODEL || 'qwen2:1.5b';
 
     const { systemPrompt, userMessage } = this.buildPrompt(config.input);
     
@@ -42,44 +42,54 @@ class LLMService extends BaseService {
           model: modelName,
           system: systemPrompt,
           prompt: userMessage,
-          format: 'json', 
           stream: false,
           options: {
-            temperature: 0.5, // Slightly lower temperature improves structural adherence
+            temperature: 0.1, // Drastically lowered to lock down formatting variance
+            keep_alive: -1
           }
         },
         {
-          timeout: 90000, // 2. Robust 90-second safety window for heavy initial processing loops
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          timeout: 30000, // 30 seconds is plenty for a warm small model
+          headers: { 'Content-Type': 'application/json' },
         }
       );
 
       const rawText = response?.data?.response || '';
       logger.info?.('[LLM] Raw Response:', rawText);
 
-      const inputTokens = response?.data?.prompt_eval_count || 0;
-      const outputTokens = response?.data?.eval_count || 0;
-      const costUsd = 0.00; 
+      let parsed = { clothing_suggestion: null, daily_summary: null };
 
-      logger.info?.(`[LLM] Tokens: ${inputTokens} input, ${outputTokens} output | Cost: $${costUsd.toFixed(2)}`);
+      // ROBUST MULTI-TIER PARSER FOR SMALL MODELS
+      try {
+        // Tier 1: Try parsing direct JSON
+        let cleanText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        const jsonStart = cleanText.indexOf('{');
+        const jsonEnd = cleanText.lastIndexOf('}');
+        if (jsonStart !== -1 && jsonEnd !== -1) {
+          parsed = JSON.parse(cleanText.substring(jsonStart, jsonEnd + 1));
+        } else {
+          throw new Error("No clean JSON block found, attempting Regex fallback...");
+        }
+      } catch (jsonErr) {
+        // Tier 2: Regex fallback to scrape text if the small model output free-text paragraphs
+        logger.warn?.('[LLM] Standard JSON parse failed. Running fallback string scraper.');
+        
+        const summaryMatch = rawText.match(/"daily_summary"\s*:\s*"([^"]+)"/) || rawText.match(/daily_summary\s*:\s*([^\n]+)/);
+        const clothingMatch = rawText.match(/"clothing_suggestion"\s*:\s*"([^"]+)"/) || rawText.match(/clothing_suggestion\s*:\s*([^\n]+)/);
 
-      let parsed;
-      // Standard structural validation cleaner
-      let cleanText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      const jsonStart = cleanText.indexOf('{');
-      const jsonEnd = cleanText.lastIndexOf('}');
+        parsed.daily_summary = summaryMatch ? summaryMatch[1] : null;
+        parsed.clothing_suggestion = clothingMatch ? clothingMatch[1] : null;
 
-      if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
-        cleanText = cleanText.substring(jsonStart, jsonEnd + 1);
+        // Tier 3: absolute emergency backup if the model completely ignored the schema structure
+        if (!parsed.daily_summary) {
+          parsed.daily_summary = rawText.split('.')[0]; // Grab the first sentence
+          parsed.clothing_suggestion = "Layers recommended";
+        }
       }
-      
-      parsed = JSON.parse(cleanText);
 
+      // Strict post-processing clean up for e-paper character matrix
       if (parsed.daily_summary) {
         parsed.daily_summary = parsed.daily_summary.trim().replace(/[.!?,]+$/, '');
-
         if (parsed.daily_summary.length > 78) {
           parsed.daily_summary = parsed.daily_summary.substring(0, 78).split(' ').slice(0, -1).join(' ');
         }
@@ -88,19 +98,18 @@ class LLMService extends BaseService {
       return {
         ...parsed,
         _meta: {
-          input_tokens: inputTokens,
-          output_tokens: outputTokens,
-          cost_usd: costUsd,
+          input_tokens: response?.data?.prompt_eval_count || 0,
+          output_tokens: response?.data?.eval_count || 0,
+          cost_usd: 0.00,
           prompt: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userMessage}`,
         }
       };
 
     } catch (e) {
-      // Catch network errors explicitly to differentiate from structural JSON parsing bugs
       logger.error?.('[LLM] Critical Transport/Inference Failure:', e.message);
       return {
-        clothing_suggestion: "Check dashboard text",
-        daily_summary: "Local inference engine connection error pending retry loops",
+        clothing_suggestion: "Check display text",
+        daily_summary: "Local inference engine connection timeout pending retry",
         _meta: { input_tokens: 0, output_tokens: 0, cost_usd: 0, prompt: "" }
       };
     }
@@ -142,11 +151,9 @@ class LLMService extends BaseService {
   }
 
   buildPrompt({ current, forecast, hourlyForecast, location, timezone, sun, moon, air_quality }) {
-    // Keep your exact prompt building logic intact...
     const timeContext = this.getTimeContext();
     const isNight = timeContext.period === 'night';
     const hoursToShow = timeContext.period === 'morning' ? 8 : 6;
-    console.log(hourlyForecast);
     const relevantHourly = isNight ? hourlyForecast : hourlyForecast.slice(0, hoursToShow);
     const relevantForecast = forecast?.[0];
 
@@ -160,38 +167,30 @@ class LLMService extends BaseService {
       timeContext
     });
 
-    console.log(weatherContext);
+    // RESTRUCTURED SYSTEM PROMPT FOR SUB-2B MODELS USING XML SEPARATORS
+    const systemPrompt = `<instructions>
+You are an automated backend weather reporter compiling an insight block for an e-ink display.
+Your response MUST be formatted strictly using raw JSON layout keys. Do not write introductory prose.
 
-    const systemPrompt = `You generate accurate and helpful weather insights for a kitchen e-ink display. The dashboard shows temps/numbers, so describe the FEEL and STORY of the weather to help the user plan their day.
+CRITICAL RULES:
+1. Do NOT mention specific temperatures or degrees. Use descriptive indicators like "cool", "warm", "hot", "chilly", or "mild".
+2. Do NOT mention specific months, dates, or days of the week. Describe seasons instead if needed.
+3. Keep daily_summary content between 60 and 78 total characters long.
+4. Remove all periods or trailing punctuation from the end of daily_summary.
+</instructions>
 
-Return JSON:
+<output_format>
 {
-  "clothing_suggestion": "practical clothingadvice, max 6 words",
-  "daily_summary": "vivid weather narrative, 60-78 chars total (including spaces and punctuation), no ending punctuation"
+  "clothing_suggestion": "practical clothing advice, max 6 words",
+  "daily_summary": "vivid weather narrative between 60 and 78 characters with no ending punctuation"
 }
+</output_format>
 
-Style:
-- Comment specifically on things that are normal or out of the ordinary, help the user plan their day
-- Write like a friendly late night weather reporter providing informative updates
-- Keep observations factual and helpful
-- Describe changes: "warming up", "heating up fast", "cooling down", "drying out", "getting wetter", "clearing up", "getting cloudy"
-
-Rules:
-- DO NOT mention specific temps (dashboard shows these) - use "cool", "warm", "hot", "chilly", "mild"
-- DO NOT mention specific month or date, but you can describe the season (e.g. Summer, Spring, Fall, Winter)
-
-Examples:
+<examples>
 {"clothing_suggestion": "Warm layers and rain gear", "daily_summary": "Dreary and rainy most of the day. Rain not letting up, stay cozy and dry"}
 {"clothing_suggestion": "Layers you can shed", "daily_summary": "Cool start warming up fast, sunny and pleasant by afternoon"}
-{"clothing_suggestion": "Sweater for the day", "daily_summary": "Chilly and misty this morning, staying fairly cool throughout the day"}
-{"clothing_suggestion": "Jacket for tonight", "daily_summary": "Breezy and mild now, cooling down with clear skies come evening"}
-{"clothing_suggestion": "Light layers, potentially shorts weather", "daily_summary": "Tomorrow foggy and cool early, clearing to sunny skies and warm temperatures"}
-{"clothing_suggestion": "Warm jacket and layers", "daily_summary": "Misty morning transforming into a gorgeous mild but sunny afternoon"}
-
-Remember:
-- Daily summary must be at least 60 characters and CANNOT be more than 78 total characters (including spaces and punctuation)
-- You MUST return valid JSON ONLY
-`;
+</examples>`
+;
 
     const now = new Date();
     const month = now.toLocaleString('default', { month: 'long' });
@@ -202,7 +201,7 @@ Remember:
 
     const userMessage = `Today is ${month} ${day}. It is ${timeContext.period.toUpperCase()}, ${time}. Planning for ${timeContext.planningFocus}
 
-CURRENT WEATHER: ${current?.temp_f}°C, ${current?.description}
+CURRENT WEATHER: ${current?.temp_f}°F, ${current?.description}
 ${weatherContext.dailyInfo}
 
 HOURLY FORECAST:
