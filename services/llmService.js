@@ -160,6 +160,8 @@ class LLMService extends BaseService {
       timeContext
     });
 
+    console.log(weatherContext);
+
     const systemPrompt = `You generate accurate and helpful weather insights for a kitchen e-ink display. The dashboard shows temps/numbers, so describe the FEEL and STORY of the weather to help the user plan their day.
 
 Return JSON:
@@ -211,6 +213,7 @@ ${weatherContext.hourlyData}${weatherContext.contextNotes ? '\n\nNOTES: ' + weat
 
   buildWeatherContext({ current, relevantForecast, relevantHourly, isNight, moon, air_quality, timeContext }) {
     // Keep your exact buildWeatherContext logic intact...
+    console.log(relevantHourly);
     const context = { contextNotes: [] };
     const maxRainChance = Math.max(relevantForecast?.rain_chance || 0, ...relevantHourly.map(h => h.rain_chance || 0));
     const rainMention = maxRainChance > 0 ? `, ${maxRainChance}% rain` : '';
