@@ -28,48 +28,46 @@ class LLMService extends BaseService {
 
   async fetchData(config, logger) {
     const baseUrl = process.env.LOCAL_LLM_URL || 'http://localhost:8000';
-    const modelName = process.env.LOCAL_LLM_MODEL || 'qwen2:1.5b';
+    // 1. Correct fallback model identifier
+    const modelName = process.env.LOCAL_LLM_MODEL || 'qwen2:1.5b'; 
 
     const { systemPrompt, userMessage } = this.buildPrompt(config.input);
     
     logger.info?.(`[LLM] Calling Local hailo-ollama API using ${modelName}`);
 
-    const response = await axios.post(
-      `${baseUrl}/api/generate`,
-      {
-        model: modelName,
-        system: systemPrompt,
-        prompt: userMessage,
-        format: 'json', // Forces Llama 3.2 to reply strictly with a structured JSON string
-        stream: false,
-        options: {
-          temperature: 0.6, // Slightly lowered to reduce formatting deviance
-        }
-      },
-      {
-        timeout: 15000, // Local NPU is fast, but give a healthy buffer for cold loads
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-
-    // Ollama wraps the raw string output inside response.data.response
-    const rawText = response?.data?.response || '';
-    logger.info?.('[LLM] Raw Response:', rawText);
-
-    // Extract local token usage statistics from Ollama's response format
-    const inputTokens = response?.data?.prompt_eval_count || 0;
-    const outputTokens = response?.data?.eval_count || 0;
-    const costUsd = 0.00; // 100% Local infrastructure, no external API costs
-
-    logger.info?.(`[LLM] Tokens: ${inputTokens} input, ${outputTokens} output | Cost: $${costUsd.toFixed(2)}`);
-
-    let parsed;
     try {
-      // Standard cleanup just in case markdown styling leaks through
-      let cleanText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const response = await axios.post(
+        `${baseUrl}/api/generate`,
+        {
+          model: modelName,
+          system: systemPrompt,
+          prompt: userMessage,
+          format: 'json', 
+          stream: false,
+          options: {
+            temperature: 0.5, // Slightly lower temperature improves structural adherence
+          }
+        },
+        {
+          timeout: 90000, // 2. Robust 90-second safety window for heavy initial processing loops
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        }
+      );
 
+      const rawText = response?.data?.response || '';
+      logger.info?.('[LLM] Raw Response:', rawText);
+
+      const inputTokens = response?.data?.prompt_eval_count || 0;
+      const outputTokens = response?.data?.eval_count || 0;
+      const costUsd = 0.00; 
+
+      logger.info?.(`[LLM] Tokens: ${inputTokens} input, ${outputTokens} output | Cost: $${costUsd.toFixed(2)}`);
+
+      let parsed;
+      // Standard structural validation cleaner
+      let cleanText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       const jsonStart = cleanText.indexOf('{');
       const jsonEnd = cleanText.lastIndexOf('}');
 
@@ -79,31 +77,33 @@ class LLMService extends BaseService {
       
       parsed = JSON.parse(cleanText);
 
-      // Post-Processing: Strict enforcement of e-paper character layouts
       if (parsed.daily_summary) {
-        // Strip trailing punctuation if the model misses the system prompt rule
         parsed.daily_summary = parsed.daily_summary.trim().replace(/[.!?,]+$/, '');
 
-        // Truncate dynamically at word boundary if character limits exceed 78
         if (parsed.daily_summary.length > 78) {
-          parsed.daily_summary = parsed.daily_summary.substring(0, 78).toLowerCase().split(' ').slice(0, -1).join(' ');
+          parsed.daily_summary = parsed.daily_summary.substring(0, 78).split(' ').slice(0, -1).join(' ');
         }
       }
-    } catch (e) {
-      logger.error?.('[LLM] Failed to clean or parse JSON response:', e.message);
-      parsed = { clothing_suggestion: null, daily_summary: null };
-    }
 
-    // Attach metadata for tracking
-    return {
-      ...parsed,
-      _meta: {
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        cost_usd: costUsd,
-        prompt: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userMessage}`,
-      }
-    };
+      return {
+        ...parsed,
+        _meta: {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          cost_usd: costUsd,
+          prompt: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userMessage}`,
+        }
+      };
+
+    } catch (e) {
+      // Catch network errors explicitly to differentiate from structural JSON parsing bugs
+      logger.error?.('[LLM] Critical Transport/Inference Failure:', e.message);
+      return {
+        clothing_suggestion: "Check dashboard text",
+        daily_summary: "Local inference engine connection error pending retry loops",
+        _meta: { input_tokens: 0, output_tokens: 0, cost_usd: 0, prompt: "" }
+      };
+    }
   }
 
   mapToDashboard(apiData, config) {
