@@ -223,10 +223,10 @@ ${weatherContext.hourlyData}${weatherContext.contextNotes ? '\n\nNOTES: ' + weat
       : `TODAY: High ${relevantForecast?.high}°, Low ${relevantForecast?.low}°${rainMention}`;
 
     context.hourlyData = relevantHourly
-      .map(h => `${h.time}: ${h.temp_f}° ${h.condition.trim()}${h.rain_chance > 0 ? ` (${h.rain_chance}%)` : ''}`)
+      .map(h => `${h.time}: ${h.temp}° ${h.condition.trim()}${h.rain_chance > 0 ? ` (${h.rain_chance}%)` : ''}`)
       .join('\n');
 
-    const temps = relevantHourly.map(h => h.temp_f);
+    const temps = relevantHourly.map(h => h.temp);
     const tempRange = Math.max(...temps) - Math.min(...temps);
     if (tempRange >= 15) context.contextNotes.push(`${tempRange}° temperature swing`);
 
@@ -262,7 +262,7 @@ ${weatherContext.hourlyData}${weatherContext.contextNotes ? '\n\nNOTES: ' + weat
     const fogHours = relevantHourly.filter(h => h.condition.toLowerCase().includes('fog') || h.condition.toLowerCase().includes('mist'));
     if (fogHours.length >= 2) context.contextNotes.push(`Marine layer ${fogHours[0].time}-${fogHours[fogHours.length-1].time}`);
 
-    const hotHours = relevantHourly.filter(h => h.temp_f >= 90);
+    const hotHours = relevantHourly.filter(h => h.temp >= 90);
     if (hotHours.length >= 2) context.contextNotes.push(`Heat peak ${hotHours[0].time}-${hotHours[hotHours.length-1].time}`);
 
     if (current?.feels_like_f && Math.abs(current.temp_f - current.feels_like_f) >= 5) {
