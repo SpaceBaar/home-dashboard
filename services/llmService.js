@@ -28,7 +28,7 @@ class LLMService extends BaseService {
 
   async fetchData(config, logger) {
     const baseUrl = process.env.LOCAL_LLM_URL || 'http://localhost:8000';
-    const modelName = process.env.LOCAL_LLM_MODEL || 'llama3.2:3b';
+    const modelName = process.env.LOCAL_LLM_MODEL || 'qwen2:1.5b';
 
     const { systemPrompt, userMessage } = this.buildPrompt(config.input);
     
