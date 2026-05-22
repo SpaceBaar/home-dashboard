@@ -146,6 +146,7 @@ class LLMService extends BaseService {
     const timeContext = this.getTimeContext();
     const isNight = timeContext.period === 'night';
     const hoursToShow = timeContext.period === 'morning' ? 8 : 6;
+    console.log(hourlyForecast);
     const relevantHourly = isNight ? hourlyForecast : hourlyForecast.slice(0, hoursToShow);
     const relevantForecast = forecast?.[0];
 
