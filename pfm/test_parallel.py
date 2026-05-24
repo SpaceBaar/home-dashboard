@@ -8,8 +8,11 @@ async def fetch_response(task_id, prompt):
     # Point the client to the hailo-ollama default port
     client = ollama.AsyncClient(host='http://127.0.0.1:8000')
     
+    keep_alive=-1
+    temperature=0.1
+
     # We use stream=False so it waits for the full response to finish
-    response = await client.generate(model='qwen2:1.5b', prompt=prompt, stream=False)
+    response = await client.generate(model='llama3.2:3b', prompt=prompt, options={keep_alive,temperature}, stream=False)
     
     print(f"Task {task_id} finished! Length: {len(response['response'])} characters.")
 

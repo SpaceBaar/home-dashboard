@@ -48,8 +48,12 @@
       "rss_url": "https://www.nseindia.com/static/rss-feed"
     },
     {
-      "name": "Investing.com",
-      "rss_url": "https://in.investing.com/webmaster-tools/rss"
+      "name": "Investing.com Company News",
+      "rss_url": "https://in.investing.com/rss/news_356.rss"
+    },
+    {
+      "name": "Investing.com Stock Market News",
+      "rss_url": "https://in.investing.com/rss/news_25.rss"
     }
   ]
 }

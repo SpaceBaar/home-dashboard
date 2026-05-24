@@ -22,6 +22,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 active_mcp_session = None
 last_update_id = 0
+keep_alive=-1
+temperature=0.1
 
 # ==========================================
 # TELEGRAM HELPER
@@ -116,7 +118,7 @@ async def analyze_with_ai_and_save(holdings_text, news_intelligence):
     
     full_response = ""
     print("📈 AI Analyst Integrated Report:\n" + "="*50)
-    async for chunk in await client.generate(model='qwen2:1.5b', prompt=prompt, stream=True):
+    async for chunk in await client.generate(model='llama3.2:3b', prompt=prompt, options={keep_alive,temperature}, stream=True):
         print(chunk['response'], end='', flush=True)
         full_response += chunk['response']
     print("\n" + "="*50)
@@ -218,7 +220,7 @@ async def fetch_and_score_news():
         REASON: [one short sentence explaining why]
         """
         try:
-            response = await client.generate(model='qwen2:1.5b', prompt=prompt, stream=False)
+            response = await client.generate(model='llama3.2:3b', prompt=prompt, options={keep_alive,temperature}, stream=False)
             ai_output = response['response'].strip()
             
             scored_news_summary.append(
