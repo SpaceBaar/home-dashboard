@@ -28,82 +28,76 @@ class LLMService extends BaseService {
 
   async fetchData(config, logger) {
     const baseUrl = process.env.LOCAL_LLM_URL || 'http://localhost:8000';
-    const modelName = process.env.LOCAL_LLM_MODEL || 'llama3.2:3b';
+    const modelName = process.env.LOCAL_LLM_MODEL || 'qwen2:1.5b';
 
     const { systemPrompt, userMessage } = this.buildPrompt(config.input);
     
-    logger.info?.(`[LLM] Calling Local hailo-ollama API using ${modelName}`);
+    logger.info?.(`[LLM] Calling Local hailo-ollama Chat API using ${modelName}`);
 
-    const response = await axios.post(
-      `${baseUrl}/api/generate`,
-      {
-        model: modelName,
-        system: systemPrompt,
-        prompt: userMessage,
-        format: 'json', // Forces Llama 3.2 to reply strictly with a structured JSON string
-        stream: false,
-        options: {
-          temperature: 0.6, // Slightly lowered to reduce formatting deviance
-        }
-      },
-      {
-        timeout: 15000, // Local NPU is fast, but give a healthy buffer for cold loads
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-
-    // Ollama wraps the raw string output inside response.data.response
-    const rawText = response?.data?.response || '';
-    logger.info?.('[LLM] Raw Response:', rawText);
-
-    // Extract local token usage statistics from Ollama's response format
-    const inputTokens = response?.data?.prompt_eval_count || 0;
-    const outputTokens = response?.data?.eval_count || 0;
-    const costUsd = 0.00; // 100% Local infrastructure, no external API costs
-
-    logger.info?.(`[LLM] Tokens: ${inputTokens} input, ${outputTokens} output | Cost: $${costUsd.toFixed(2)}`);
-
-    let parsed;
     try {
-      // Standard cleanup just in case markdown styling leaks through
-      let cleanText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const response = await axios.post(
+        `${baseUrl}/api/chat`, // 1. Use chat endpoint for explicit template adherence
+        {
+          model: modelName,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage }
+          ],
+          stream: false,
+          options: {
+            temperature: 0.1, // Near-zero temperature minimizes wandering behavior
+            keep_alive: -1
+          }
+        },
+        {
+          timeout: 30000,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
 
-      const jsonStart = cleanText.indexOf('{');
-      const jsonEnd = cleanText.lastIndexOf('}');
+      const rawText = response?.data?.message?.content || '';
+      logger.info?.('[LLM] Raw Response:', rawText);
 
-      if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
-        cleanText = cleanText.substring(jsonStart, jsonEnd + 1);
-      }
-      
-      parsed = JSON.parse(cleanText);
+      let parsed = { clothing_suggestion: "Layers recommended", daily_summary: "Weather dashboard active" };
 
-      // Post-Processing: Strict enforcement of e-paper character layouts
-      if (parsed.daily_summary) {
-        // Strip trailing punctuation if the model misses the system prompt rule
-        parsed.daily_summary = parsed.daily_summary.trim().replace(/[.!?,]+$/, '');
-
-        // Truncate dynamically at word boundary if character limits exceed 78
-        if (parsed.daily_summary.length > 78) {
-          parsed.daily_summary = parsed.daily_summary.substring(0, 78).toLowerCase().split(' ').slice(0, -1).join(' ');
+      // 2. LINE-BY-LINE SCRAPER (Highly reliable for small models)
+      const lines = rawText.split('\n');
+      for (let line of lines) {
+        const cleanLine = line.trim();
+        if (cleanLine.toUpperCase().startsWith('CLOTHING:')) {
+          parsed.clothing_suggestion = cleanLine.replace(/^CLOTHING:\s*/i, '').trim();
+        }
+        if (cleanLine.toUpperCase().startsWith('SUMMARY:')) {
+          parsed.daily_summary = cleanLine.replace(/^SUMMARY:\s*/i, '').trim();
         }
       }
-    } catch (e) {
-      logger.error?.('[LLM] Failed to clean or parse JSON response:', e.message);
-      parsed = { clothing_suggestion: null, daily_summary: null };
-    }
 
-    // Attach metadata for tracking
-    return {
-      ...parsed,
-      _meta: {
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        cost_usd: costUsd,
-        prompt: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userMessage}`,
+      // Strict post-processing clean up for the e-paper matrix layout
+      if (parsed.daily_summary) {
+        parsed.daily_summary = parsed.daily_summary.replace(/[.!?,]+$/, '').trim();
+        if (parsed.daily_summary.length > 78) {
+          parsed.daily_summary = parsed.daily_summary.substring(0, 78).split(' ').slice(0, -1).join(' ');
+        }
       }
-    };
+
+      return {
+        ...parsed,
+        _meta: {
+          input_tokens: response?.data?.prompt_eval_count || 0,
+          output_tokens: response?.data?.eval_count || 0,
+          cost_usd: 0.00,
+          prompt: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userMessage}`,
+        }
+      };
+
+    } catch (e) {
+      logger.error?.('[LLM] Critical Transport/Inference Failure:', e.message);
+      return {
+        clothing_suggestion: "Check display text",
+        daily_summary: "Local inference connection error pending retry loop",
+        _meta: { input_tokens: 0, output_tokens: 0, cost_usd: 0, prompt: "" }
+      };
+    }
   }
 
   mapToDashboard(apiData, config) {
@@ -142,7 +136,6 @@ class LLMService extends BaseService {
   }
 
   buildPrompt({ current, forecast, hourlyForecast, location, timezone, sun, moon, air_quality }) {
-    // Keep your exact prompt building logic intact...
     const timeContext = this.getTimeContext();
     const isNight = timeContext.period === 'night';
     const hoursToShow = timeContext.period === 'morning' ? 8 : 6;
@@ -159,35 +152,22 @@ class LLMService extends BaseService {
       timeContext
     });
 
-    const systemPrompt = `You generate accurate and helpful weather insights for a kitchen e-ink display. The dashboard shows temps/numbers, so describe the FEEL and STORY of the weather to help the user plan their day.
+    // A SIMPLIFIED, NON-JSON PROMPT DESIGNED FOR <2B CHAT MODELS
+    const systemPrompt = `You are an automated assistant providing weather text for an e-ink kitchen display dashboard. 
+The dashboard shows numerical values, so describe the FEEL and STORY of the weather.
 
-Return JSON:
-{
-  "clothing_suggestion": "practical clothingadvice, max 6 words",
-  "daily_summary": "vivid weather narrative, 60-78 chars total (including spaces and punctuation), no ending punctuation"
-}
-
-Style:
-- Comment specifically on things that are normal or out of the ordinary, help the user plan their day
-- Write like a friendly late night weather reporter providing informative updates
-- Keep observations factual and helpful
-- Describe changes: "warming up", "heating up fast", "cooling down", "drying out", "getting wetter", "clearing up", "getting cloudy"
+You MUST format your output exactly as two lines:
+CLOTHING: <practical advice, max 6 words>
+SUMMARY: <vivid weather description between 60 and 78 characters total, with NO trailing punctuation>
 
 Rules:
-- DO NOT mention specific temps (dashboard shows these) - use "cool", "warm", "hot", "chilly", "mild"
-- DO NOT mention specific month or date, but you can describe the season (e.g. Summer, Spring, Fall, Winter)
+- DO NOT mention specific temperatures or degrees. Use words like "cool", "warm", "hot", "chilly", "mild".
+- DO NOT mention specific months, dates, or weekdays.
+- Do not write introductory prose or conversation. Start immediately with CLOTHING:
 
-Examples:
-{"clothing_suggestion": "Warm layers and rain gear", "daily_summary": "Dreary and rainy most of the day. Rain not letting up, stay cozy and dry"}
-{"clothing_suggestion": "Layers you can shed", "daily_summary": "Cool start warming up fast, sunny and pleasant by afternoon"}
-{"clothing_suggestion": "Sweater for the day", "daily_summary": "Chilly and misty this morning, staying fairly cool throughout the day"}
-{"clothing_suggestion": "Jacket for tonight", "daily_summary": "Breezy and mild now, cooling down with clear skies come evening"}
-{"clothing_suggestion": "Light layers, potentially shorts weather", "daily_summary": "Tomorrow foggy and cool early, clearing to sunny skies and warm temperatures"}
-{"clothing_suggestion": "Warm jacket and layers", "daily_summary": "Misty morning transforming into a gorgeous mild but sunny afternoon"}
-
-Remember:
-- Daily summary must be at least 60 characters and CANNOT be more than 78 total characters (including spaces and punctuation)
-- You MUST return valid JSON ONLY
+Example Output:
+CLOTHING: Warm layers and rain gear
+SUMMARY: Dreary and rainy most of the day with a cold evening breeze ahead
 `;
 
     const now = new Date();
@@ -199,7 +179,7 @@ Remember:
 
     const userMessage = `Today is ${month} ${day}. It is ${timeContext.period.toUpperCase()}, ${time}. Planning for ${timeContext.planningFocus}
 
-CURRENT WEATHER: ${current?.temp_f}°C, ${current?.description}
+CURRENT WEATHER: ${current?.temp_f}°F, ${current?.description}
 ${weatherContext.dailyInfo}
 
 HOURLY FORECAST:
@@ -219,10 +199,10 @@ ${weatherContext.hourlyData}${weatherContext.contextNotes ? '\n\nNOTES: ' + weat
       : `TODAY: High ${relevantForecast?.high}°, Low ${relevantForecast?.low}°${rainMention}`;
 
     context.hourlyData = relevantHourly
-      .map(h => `${h.time}: ${h.temp_f}° ${h.condition.trim()}${h.rain_chance > 0 ? ` (${h.rain_chance}%)` : ''}`)
+      .map(h => `${h.time}: ${h.temp}° ${h.condition.trim()}${h.rain_chance > 0 ? ` (${h.rain_chance}%)` : ''}`)
       .join('\n');
 
-    const temps = relevantHourly.map(h => h.temp_f);
+    const temps = relevantHourly.map(h => h.temp);
     const tempRange = Math.max(...temps) - Math.min(...temps);
     if (tempRange >= 15) context.contextNotes.push(`${tempRange}° temperature swing`);
 
@@ -258,7 +238,7 @@ ${weatherContext.hourlyData}${weatherContext.contextNotes ? '\n\nNOTES: ' + weat
     const fogHours = relevantHourly.filter(h => h.condition.toLowerCase().includes('fog') || h.condition.toLowerCase().includes('mist'));
     if (fogHours.length >= 2) context.contextNotes.push(`Marine layer ${fogHours[0].time}-${fogHours[fogHours.length-1].time}`);
 
-    const hotHours = relevantHourly.filter(h => h.temp_f >= 90);
+    const hotHours = relevantHourly.filter(h => h.temp >= 90);
     if (hotHours.length >= 2) context.contextNotes.push(`Heat peak ${hotHours[0].time}-${hotHours[hotHours.length-1].time}`);
 
     if (current?.feels_like_f && Math.abs(current.temp_f - current.feels_like_f) >= 5) {
