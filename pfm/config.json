@@ -20,7 +20,10 @@
       {"symbol": "SPICEJET", "keywords": ["SPICEJET", "SPICE JET"]},
       {"symbol": "TATAPOWER", "keywords": ["TATA POWER"]},
       {"symbol": "TRIDENT", "keywords": ["TRIDENT"]},
-      {"symbol": "YESBANK", "keywords": ["YES BANK", "YESBANK"]}
+      {"symbol": "YESBANK", "keywords": ["YES BANK", "YESBANK"]},
+      {"symbol": "AAPL", "keywords": ["Apple Inc", "Apple"]},
+      {"symbol": "TSLA", "keywords": ["Tesla Inc", "Tesla"]},
+      {"symbol": "NVDA", "keywords": ["NVIDIA Corp", "NVIDIA"]}
     ]
   },
   "news_sources": [
@@ -29,12 +32,24 @@
       "rss_url": "https://www.moneycontrol.com/rss/business.xml"
     },
     {
-      "name": "Moneycontrol Markets",
-      "rss_url": "https://www.moneycontrol.com/rss/marketreports.xml"
-    },
-    {
       "name": "NDTV Profit",
       "rss_url": "https://feeds.feedburner.com/ndtvprofit-latest"
+    },
+    {
+      "name": "Livemint Companies",
+      "rss_url": "http://www.livemint.com/rss/companies"
+    },
+    {
+      "name": "Economic Times Markets",
+      "rss_url": "http://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"
+    },
+    {
+      "name": "NSE India",
+      "rss_url": "https://www.nseindia.com/static/rss-feed"
+    },
+    {
+      "name": "Investing.com",
+      "rss_url": "https://in.investing.com/webmaster-tools/rss"
     }
   ]
 }
