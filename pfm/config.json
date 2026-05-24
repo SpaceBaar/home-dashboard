@@ -10,27 +10,31 @@
   },
   "tracking": {
     "stocks": [
-      "RELIANCE",
-      "TCS",
-      "HDFCBANK",
-      "INFY",
-      "TATASTEEL"
-    ],
-    "indices": [
-      "NIFTY 50",
-      "SENSEX"
+      {"symbol": "ADANIPOWER", "keywords": ["ADANI POWER", "ADANIPOWER"]},
+      {"symbol": "COALINDIA", "keywords": ["COAL INDIA"]},
+      {"symbol": "IDEA", "keywords": ["VODAFONE IDEA", "VI "]},
+      {"symbol": "IRCTC", "keywords": ["IRCTC", "RAILWAY CATERING"]},
+      {"symbol": "LICI", "keywords": ["LIC", "LIFE INSURANCE CORPORATION"]},
+      {"symbol": "PAYTM", "keywords": ["PAYTM", "ONE97"]},
+      {"symbol": "SBIN", "keywords": ["SBI", "STATE BANK OF INDIA"]},
+      {"symbol": "SPICEJET", "keywords": ["SPICEJET", "SPICE JET"]},
+      {"symbol": "TATAPOWER", "keywords": ["TATA POWER"]},
+      {"symbol": "TRIDENT", "keywords": ["TRIDENT"]},
+      {"symbol": "YESBANK", "keywords": ["YES BANK", "YESBANK"]}
     ]
   },
   "news_sources": [
     {
-      "name": "Moneycontrol",
-      "rss_url": "https://www.moneycontrol.com/rss/business.xml",
-      "weight": 0.8
+      "name": "Moneycontrol Business",
+      "rss_url": "https://www.moneycontrol.com/rss/business.xml"
     },
     {
-      "name": "Reuters India",
-      "rss_url": "https://in.reuters.com/rssFeed/businessNews",
-      "weight": 0.9
+      "name": "Moneycontrol Markets",
+      "rss_url": "https://www.moneycontrol.com/rss/marketreports.xml"
+    },
+    {
+      "name": "NDTV Profit",
+      "rss_url": "https://feeds.feedburner.com/ndtvprofit-latest"
     }
   ]
 }
