@@ -7,6 +7,7 @@ import schedule
 import ollama
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -261,7 +262,8 @@ async def main_loop():
     global active_mcp_session
     
     print("Starting Zerodha Kite MCP bridge...")
-    server_params = StdioServerParameters(command="npx", args=["-y", "mcp-remote", "https://mcp.kite.trade/mcp"], env=dict(os.environ))
+    # NOTE: Ensure your absolute path to npx is still here!
+    server_params = StdioServerParameters(command="/home/spacebaar/.nvm/versions/node/v20.19.5/bin/npx", args=["-y", "mcp-remote", "https://mcp.kite.trade/mcp"], env=dict(os.environ))
     
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
@@ -269,19 +271,26 @@ async def main_loop():
             active_mcp_session = session
             print("✅ MCP Connection held open successfully.")
             
-            print("\n" + "="*50)
-            choice = input("Do you want to run an INTEGRATED ON-DEMAND TEST right now? (y/n): ").strip().lower()
-            if choice == 'y':
-                await generate_daily_login()
-                input("\nPress Enter HERE in the terminal AFTER you have clicked the Telegram link and logged in...")
-                await run_nightly_analysis()
-                print("\n✅ Integrated test execution successfully complete.")
-            print("="*50 + "\n")
+            # --- CHECK FOR DAEMON FLAG ---
+            is_daemon = '--daemon' in sys.argv
+            
+            if not is_daemon:
+                print("\n" + "="*50)
+                choice = input("Do you want to run an INTEGRATED ON-DEMAND TEST right now? (y/n): ").strip().lower()
+                if choice == 'y':
+                    await generate_daily_login()
+                    input("\nPress Enter HERE in the terminal AFTER you have clicked the Telegram link and logged in...")
+                    await run_nightly_analysis()
+                    print("\n✅ Integrated test execution successfully complete.")
+                print("="*50 + "\n")
+            else:
+                print("\n[DAEMON MODE] Bypassing interactive prompts.\n")
             
             print("🕒 Scheduling background jobs: Login @ 09:00 | Ingestion & Analysis @ 23:00")
             schedule.every().day.at("09:00").do(job_morning)
             schedule.every().day.at("23:00").do(job_night)
             
+            print("Agent is now running quietly in the background. Press Ctrl+C to exit.")
             while True:
                 schedule.run_pending()
                 await asyncio.sleep(1)
