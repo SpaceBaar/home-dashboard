@@ -4,7 +4,9 @@ import ollama
 
 async def fetch_response(task_id, prompt):
     print(f"Task {task_id} started...")
-    client = ollama.AsyncClient()
+    
+    # Point the client to the hailo-ollama default port
+    client = ollama.AsyncClient(host='http://127.0.0.1:8000')
     
     # We use stream=False so it waits for the full response to finish
     response = await client.generate(model='qwen2:1.5b', prompt=prompt, stream=False)
