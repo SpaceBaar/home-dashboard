@@ -12,7 +12,7 @@ async def fetch_response(task_id, prompt):
     temperature=0.1
 
     # We use stream=False so it waits for the full response to finish
-    response = await client.generate(model='llama3.2:3b', prompt=prompt, options={keep_alive,temperature}, stream=False)
+    response = await client.generate(model='llama3.2:3b', prompt=prompt, options={keep_alive: keep_alive,temperature: temperature}, stream=False)
     
     print(f"Task {task_id} finished! Length: {len(response['response'])} characters.")
 

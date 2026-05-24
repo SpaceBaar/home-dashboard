@@ -66,7 +66,7 @@ async def fetch_and_score_news(config_path='config.json'):
         try:
             keep_alive=-1
             temperature=0.1
-            response = await client.generate(model='llama3.2:3b', prompt=prompt, options={keep_alive,temperature}, stream=False)
+            response = await client.generate(model='llama3.2:3b', prompt=prompt, options={keep_alive: keep_alive,temperature: temperature}, stream=False)
             ai_output = response['response'].strip()
             
             scored_news_summary.append(
