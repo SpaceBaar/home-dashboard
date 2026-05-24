@@ -44,10 +44,6 @@
       "rss_url": "http://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"
     },
     {
-      "name": "NSE India",
-      "rss_url": "https://www.nseindia.com/static/rss-feed"
-    },
-    {
       "name": "Investing.com Company News",
       "rss_url": "https://in.investing.com/rss/news_356.rss"
     },
