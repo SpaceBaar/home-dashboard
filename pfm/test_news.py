@@ -76,7 +76,7 @@ async def test_news_pipeline():
         try:
             keep_alive=-1
             temperature=0.1
-            response = await client.generate(model='llama3.2:3b', prompt=prompt, options={keep_alive: keep_alive,temperature: temperature}, stream=False)
+            response = await client.generate(model='llama3.2:3b', prompt=prompt, keep_alive=-1, options={'temperature': temperature}, stream=False)
             print(f"\n{response['response'].strip()}\n")
         except Exception as e:
             print(f"\nFailed to score: {e}\n")
