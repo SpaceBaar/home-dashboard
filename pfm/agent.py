@@ -4,6 +4,7 @@ import json
 import time
 import requests
 import schedule
+import xml.etree.ElementTree as ET
 import ollama
 from datetime import datetime
 from mcp import ClientSession, StdioServerParameters
