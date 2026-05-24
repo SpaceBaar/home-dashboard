@@ -13,8 +13,8 @@ from mcp.client.stdio import stdio_client
 # ==========================================
 # CONFIGURATION
 # ==========================================
-TELEGRAM_TOKEN = "YOUR_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
+TELEGRAM_TOKEN = "8702448779:AAHC0WXrI8dsqbRkRNaYyjya3MLVifqmTSw"
+TELEGRAM_CHAT_ID = "1858329386"
 active_mcp_session = None
 
 # ==========================================
