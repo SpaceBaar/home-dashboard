@@ -47,12 +47,16 @@ async def generate_daily_login():
     print("✅ Login link sent to Telegram!")
 
 async def analyze_with_ai_and_save(holdings_text):
-    """Parses holdings, prompts Qwen2, saves to MD, and notifies Telegram"""
+    """Parses holdings flat list array, prompts Qwen2, saves to MD, and notifies Telegram"""
     print("\n🧠 Preparing data for local AI analysis...")
     
+    # 1. Parse the flat JSON array directly
     try:
-        holdings_data = json.loads(holdings_text)
-        holdings_list = holdings_data.get('data', []) 
+        holdings_list = json.loads(holdings_text)
+        if not isinstance(holdings_list, list):
+            # Fallback wrapper if schema changes unexpectedly
+            if isinstance(holdings_list, dict):
+                holdings_list = holdings_list.get('data', [])
     except json.JSONDecodeError:
         print("Could not parse JSON. Returning early.")
         return
@@ -61,25 +65,31 @@ async def analyze_with_ai_and_save(holdings_text):
     total_investment = 0
     total_current = 0
     
+    # 2. Iterate through the array using exact keys from payload
     for item in holdings_list:
         symbol = item.get('tradingsymbol', 'Unknown')
         qty = item.get('quantity', 0)
         avg_price = item.get('average_price', 0)
         ltp = item.get('last_price', 0)
+        pnl = item.get('pnl', 0)
+        day_change_pct = item.get('day_change_percentage', 0)
         
         invested = qty * avg_price
         current_val = qty * ltp
         total_investment += invested
         total_current += current_val
         
-        pnl = current_val - invested
-        summary.append(f"- {symbol}: Qty {qty}, Invested: ₹{invested:.2f}, Current: ₹{current_val:.2f}, P&L: ₹{pnl:.2f}")
+        summary.append(
+            f"- {symbol}: Qty {qty}, Invested: ₹{invested:.2f}, "
+            f"Current: ₹{current_val:.2f}, P&L: ₹{pnl:.2f} ({day_change_pct:.2f}% Today)"
+        )
 
     overall_pnl = total_current - total_investment
     
+    # 3. Build context-optimized prompt for Qwen2
     prompt = f"""
     You are an expert financial analyst. Review the following daily portfolio summary and provide a brief, professional 3-paragraph analysis. 
-    Highlight the overall health of the portfolio, point out any standout performers or underperformers, and maintain an objective tone.
+    Highlight the overall health of the portfolio, point out any standout performers or underperformers based on total P&L and today's percentage changes, and maintain an objective tone.
 
     Total Invested: ₹{total_investment:.2f}
     Total Current Value: ₹{total_current:.2f}
@@ -99,7 +109,7 @@ async def analyze_with_ai_and_save(holdings_text):
         full_response += chunk['response']
     print("\n" + "="*50)
 
-    # Save locally
+    # 4. Save locally to a Markdown file
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"portfolio_analysis_{date_str}.md"
     
@@ -116,8 +126,13 @@ async def analyze_with_ai_and_save(holdings_text):
         
     print(f"\n💾 Report successfully saved locally to: {filename}")
     
-    # Notify completion
-    status_msg = f"📉 Daily Analysis Complete!\nTotal Value: ₹{total_current:.2f}\nP&L: ₹{overall_pnl:.2f}\n\nCheck your Raspberry Pi for the full markdown report."
+    # 5. Notify completion via Telegram
+    status_msg = (
+        f"📉 Daily Analysis Complete!\n"
+        f"Total Value: ₹{total_current:.2f}\n"
+        f"P&L: ₹{overall_pnl:.2f}\n\n"
+        f"Check your Raspberry Pi for the full markdown report."
+    )
     send_telegram_message(status_msg)
 
 async def run_nightly_analysis():
