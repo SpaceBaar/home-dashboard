@@ -10,12 +10,16 @@ from datetime import datetime
 import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from dotenv import load_dotenv
+
+# Load environment variables from the .env file
+load_dotenv()
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-TELEGRAM_TOKEN = "8702448779:AAHC0WXrI8dsqbRkRNaYyjya3MLVifqmTSw"
-TELEGRAM_CHAT_ID = "1858329386"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 active_mcp_session = None
 last_update_id = 0
 
