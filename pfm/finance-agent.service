@@ -1,0 +1,14 @@
+[Unit]
+Description=Personal Finance AI Agent
+After=network.target hailo-ollama.service
+
+[Service]
+Environment="PATH=/home/spacebaar/Projects/pfm/.venv/bin:/home/spacebaar/.nvm/versions/node/v20.19.5/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/games:/usr/games"
+User=spacebaar
+WorkingDirectory=/home/spacebaar/Projects/home-dashboard/pfm
+ExecStart=/home/spacebaar/Projects/pfm/.venv/bin/python /home/spacebaar/Projects/home-dashboard/pfm/agent.py --daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -17,6 +17,7 @@ from mcp.client.stdio import stdio_client
 TELEGRAM_TOKEN = "8702448779:AAHC0WXrI8dsqbRkRNaYyjya3MLVifqmTSw"
 TELEGRAM_CHAT_ID = "1858329386"
 active_mcp_session = None
+last_update_id = 0
 
 # ==========================================
 # TELEGRAM HELPER
@@ -246,6 +247,43 @@ async def run_nightly_analysis():
         print(f"Execution failure: {e}")
         send_telegram_message("⚠️ Agent experienced an exception running the nightly analysis loop.")
         
+async def listen_for_expenses():
+    """Continuously polls Telegram for new text messages (expenses)"""
+    global last_update_id
+    print("📡 Expense listener active...")
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    
+    while True:
+        try:
+            # timeout=20 creates a 'long poll' so we don't spam the API unnecessarily
+            payload = {"offset": last_update_id + 1, "timeout": 20}
+            
+            # We use asyncio.to_thread so the synchronous requests library doesn't block the MCP bridge
+            response = await asyncio.to_thread(requests.post, url, json=payload, timeout=25)
+            data = response.json()
+            
+            if data.get("ok"):
+                for result in data.get("result", []):
+                    last_update_id = result["update_id"]
+                    msg_text = result.get("message", {}).get("text", "")
+                    
+                    if msg_text:
+                        # 1. Acknowledge receipt
+                        send_telegram_message(f"💸 Logged: {msg_text}")
+                        
+                        # 2. Append to a local CSV file
+                        with open("daily_expenses.csv", "a", encoding="utf-8") as f:
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            f.write(f"{timestamp},{msg_text}\n")
+                            
+        except Exception:
+            # Silently handle network timeouts and loop again
+            pass
+            
+        # Brief pause before checking again
+        await asyncio.sleep(1)
+
 # ==========================================
 # SCHEDULER WRAPPERS
 # ==========================================
@@ -289,6 +327,9 @@ async def main_loop():
             print("🕒 Scheduling background jobs: Login @ 09:00 | Ingestion & Analysis @ 23:00")
             schedule.every().day.at("09:00").do(job_morning)
             schedule.every().day.at("23:00").do(job_night)
+
+            # ACTIVATE THE EXPENSE LISTENER
+            asyncio.create_task(listen_for_expenses())
             
             print("Agent is now running quietly in the background. Press Ctrl+C to exit.")
             while True:
