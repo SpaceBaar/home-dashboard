@@ -226,7 +226,7 @@ async def fetch_and_score_news():
         REASON: [one short sentence explaining why]
         """
         try:
-            response = await client.generate(model='llama3.2:3b', prompt=prompt, keep_alive=-1, options={'temperature': temperature}, stream=False)
+            response = await client.generate(model='llama3.2:3b', prompt=prompt, options={'temperature': temperature}, stream=False)
             ai_output = response['response'].strip()
             
             scored_news_summary.append(
