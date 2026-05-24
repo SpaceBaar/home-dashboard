@@ -1,0 +1,36 @@
+{
+  "agent_settings": {
+    "run_schedule": "0 23 * * *",
+    "storage_backend": "postgres",
+    "cloud_api_endpoint": "https://api.yourpersonaldomain.com/data/ingest"
+  },
+  "portfolio": {
+    "india_broker": "zerodha",
+    "us_broker": "indmoney"
+  },
+  "tracking": {
+    "stocks": [
+      "RELIANCE",
+      "TCS",
+      "HDFCBANK",
+      "INFY",
+      "TATASTEEL"
+    ],
+    "indices": [
+      "NIFTY 50",
+      "SENSEX"
+    ]
+  },
+  "news_sources": [
+    {
+      "name": "Moneycontrol",
+      "rss_url": "https://www.moneycontrol.com/rss/business.xml",
+      "weight": 0.8
+    },
+    {
+      "name": "Reuters India",
+      "rss_url": "https://in.reuters.com/rssFeed/businessNews",
+      "weight": 0.9
+    }
+  ]
+}
