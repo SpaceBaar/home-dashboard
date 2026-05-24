@@ -1,69 +1,153 @@
 import asyncio
 import os
+import json
 import time
 import requests
 import schedule
+import ollama
+from datetime import datetime
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# Global variables to hold the active session
-active_mcp_session = None
-
-# Add your credentials here (or better yet, add them to config.json later)
+# ==========================================
+# CONFIGURATION
+# ==========================================
 TELEGRAM_TOKEN = "8702448779:AAHC0WXrI8dsqbRkRNaYyjya3MLVifqmTSw"
 TELEGRAM_CHAT_ID = "1858329386"
+active_mcp_session = None
 
+# ==========================================
+# TELEGRAM HELPER
+# ==========================================
 def send_telegram_message(message_text):
     """Sends a text message to your Telegram account"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_text
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message_text}
     try:
         requests.post(url, json=payload)
     except Exception as e:
         print(f"Failed to send Telegram message: {e}")
 
-# Inside your morning routine function...
+# ==========================================
+# CORE LOGIC: LOGIN & AI ANALYSIS
+# ==========================================
 async def generate_daily_login():
+    """Fetches the Zerodha login URL and pushes it to Telegram"""
     global active_mcp_session
     if active_mcp_session is None:
+        print("Error: MCP Session is not active.")
         return
         
-    print("\n[MORNING ROUTINE] Generating new login URL...")
+    print("\n[ROUTINE] Generating new login URL...")
     login_result = await active_mcp_session.call_tool("login", arguments={})
-    
     url = login_result.content[0].text
     
-    # Construct the message and push it to Telegram
     msg = f"🌅 Good morning! Here is your daily Zerodha login link for the AI Analyst:\n\n{url}"
     send_telegram_message(msg)
-    print("Login link sent to Telegram!")
+    print("✅ Login link sent to Telegram!")
+
+async def analyze_with_ai_and_save(holdings_text):
+    """Parses holdings, prompts Qwen2, saves to MD, and notifies Telegram"""
+    print("\n🧠 Preparing data for local AI analysis...")
+    
+    try:
+        holdings_data = json.loads(holdings_text)
+        holdings_list = holdings_data.get('data', []) 
+    except json.JSONDecodeError:
+        print("Could not parse JSON. Returning early.")
+        return
+
+    summary = []
+    total_investment = 0
+    total_current = 0
+    
+    for item in holdings_list:
+        symbol = item.get('tradingsymbol', 'Unknown')
+        qty = item.get('quantity', 0)
+        avg_price = item.get('average_price', 0)
+        ltp = item.get('last_price', 0)
+        
+        invested = qty * avg_price
+        current_val = qty * ltp
+        total_investment += invested
+        total_current += current_val
+        
+        pnl = current_val - invested
+        summary.append(f"- {symbol}: Qty {qty}, Invested: ₹{invested:.2f}, Current: ₹{current_val:.2f}, P&L: ₹{pnl:.2f}")
+
+    overall_pnl = total_current - total_investment
+    
+    prompt = f"""
+    You are an expert financial analyst. Review the following daily portfolio summary and provide a brief, professional 3-paragraph analysis. 
+    Highlight the overall health of the portfolio, point out any standout performers or underperformers, and maintain an objective tone.
+
+    Total Invested: ₹{total_investment:.2f}
+    Total Current Value: ₹{total_current:.2f}
+    Overall P&L: ₹{overall_pnl:.2f}
+
+    Holdings Breakdown:
+    {chr(10).join(summary)}
+    """
+    
+    print("Sending prompt to Qwen2 (Port 8000)...\n")
+    client = ollama.AsyncClient(host='http://127.0.0.1:8000')
+    
+    full_response = ""
+    print("📈 AI Analyst Report:\n" + "="*50)
+    async for chunk in await client.generate(model='qwen2:1.5b', prompt=prompt, stream=True):
+        print(chunk['response'], end='', flush=True)
+        full_response += chunk['response']
+    print("\n" + "="*50)
+
+    # Save locally
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    filename = f"portfolio_analysis_{date_str}.md"
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(f"# Portfolio Analysis - {date_str}\n\n")
+        f.write(f"**Total Invested:** ₹{total_investment:.2f}\n")
+        f.write(f"**Current Value:** ₹{total_current:.2f}\n")
+        f.write(f"**Overall P&L:** ₹{overall_pnl:.2f}\n\n")
+        f.write("## Holdings Breakdown\n")
+        for line in summary:
+            f.write(f"{line}\n")
+        f.write("\n## AI Insights\n\n")
+        f.write(full_response)
+        
+    print(f"\n💾 Report successfully saved locally to: {filename}")
+    
+    # Notify completion
+    status_msg = f"📉 Daily Analysis Complete!\nTotal Value: ₹{total_current:.2f}\nP&L: ₹{overall_pnl:.2f}\n\nCheck your Raspberry Pi for the full markdown report."
+    send_telegram_message(status_msg)
 
 async def run_nightly_analysis():
-    """Runs at night to fetch data and process it"""
+    """Fetches holdings and passes them to the AI"""
     global active_mcp_session
-    print("\n[NIGHT ROUTINE] Starting analysis...")
+    print("\n[ROUTINE] Starting portfolio fetch and analysis...")
     
     try:
         holdings_result = await active_mcp_session.call_tool("get_holdings", arguments={})
-        print("Successfully fetched holdings! Sending to Qwen2...")
-        # await analyze_with_ai(holdings_result.content[0].text)
+        await analyze_with_ai_and_save(holdings_result.content[0].text)
     except Exception as e:
         print(f"Failed to fetch holdings. Did you click the morning login link? Error: {e}")
+        send_telegram_message("⚠️ Agent failed to fetch holdings tonight. The session may have expired.")
 
-# Synchronous wrappers for the schedule library
+# ==========================================
+# SCHEDULER WRAPPERS
+# ==========================================
 def job_morning():
     asyncio.create_task(generate_daily_login())
 
 def job_night():
     asyncio.create_task(run_nightly_analysis())
 
+# ==========================================
+# MAIN EXECUTION LOOP
+# ==========================================
 async def main_loop():
     global active_mcp_session
     
-    print("Starting persistent MCP connection...")
+    print("Starting Zerodha Kite MCP bridge...")
     server_params = StdioServerParameters(command="npx", args=["-y", "mcp-remote", "https://mcp.kite.trade/mcp"], env=dict(os.environ))
     
     async with stdio_client(server_params) as (read, write):
@@ -72,19 +156,26 @@ async def main_loop():
             active_mcp_session = session
             print("✅ MCP Connection held open successfully.")
             
-            # Schedule the jobs (Times in 24hr format)
+            # --- ON-DEMAND TEST PROMPT ---
+            print("\n" + "="*50)
+            choice = input("Do you want to run an ON-DEMAND TEST right now? (y/n): ").strip().lower()
+            if choice == 'y':
+                await generate_daily_login()
+                input("\nPress Enter HERE in the terminal AFTER you have clicked the Telegram link and logged in...")
+                await run_nightly_analysis()
+                print("\n✅ Test complete! The agent will now enter background mode.")
+            print("="*50 + "\n")
+            
+            # --- BACKGROUND DAEMON MODE ---
+            print("🕒 Scheduling background jobs: Login @ 09:00 | Analysis @ 23:00")
             schedule.every().day.at("09:00").do(job_morning)
             schedule.every().day.at("23:00").do(job_night)
             
-            # For testing purposes right now, let's trigger the morning job immediately
-            job_morning()
-            
-            # Keep the script running forever
+            print("Agent is now running quietly in the background. Press Ctrl+C to exit.")
             while True:
                 schedule.run_pending()
                 await asyncio.sleep(1)
 
 if __name__ == "__main__":
-    # Using get_event_loop to allow create_task to work properly in the schedule wrappers
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main_loop())
