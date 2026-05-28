@@ -22,3 +22,10 @@ services:
     restart: unless-stopped
     # Host network is required for discovering Wi-Fi speakers and mDNS broadcasting
     network_mode: host
+  
+  po-token-server:
+    container_name: po-token-server
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+    ports:
+      - "4416:4416"
