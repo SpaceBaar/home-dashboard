@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  homeassistant:
+    container_name: homeassistant
+    image: "ghcr.io/home-assistant/home-assistant:stable"
+    volumes:
+      # Maps your HA configuration to a local folder so data persists across reboots
+      - ./ha_config:/config
+      # Syncs the container time with your Pi's system time (crucial for automations)
+      - /etc/localtime:/etc/localtime:ro
+      # Exposes the Pi's Bluetooth hardware to Home Assistant
+      - /run/dbus:/run/dbus:ro
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+
+  music-assistant:
+    container_name: music-assistant
+    image: "ghcr.io/music-assistant/server:latest"
+    volumes:
+      # Maps the Music Assistant database and settings
+      - ./ma_data:/data
+    restart: unless-stopped
+    # Host network is required for discovering Wi-Fi speakers and mDNS broadcasting
+    network_mode: host
