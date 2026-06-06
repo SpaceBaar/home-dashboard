@@ -15,11 +15,10 @@ void setup() {
   Serial.begin(9600);
   dht.begin();
 
-  // Configure hardware Timer 1 for 25kHz Phase Correct PWM on Pin 9
   pinMode(FAN_PWM_PIN, OUTPUT);
   
   // TCCR1A and TCCR1B configuration registers for Timer 1
-  TCCR1A = _BV(COM1A1) | _BV(WGM11);                  // Phase Correct PWM, non-inverting
+  TCCR1A = _BV(WGM11);                                // Phase Correct PWM (COM bits managed dynamically)
   TCCR1B = _BV(WGM13) | _BV(CS10);                    // Mode 10 (ICR1 defines TOP), Prescaler = 1
   ICR1 = 320;                                         // F_CPU / (2 * 25000) = 16000000 / 50000 = 320
   
@@ -44,14 +43,13 @@ void loop() {
 
   // Thermal Control Logic
   if (currentTemp < TEMP_MIN) {
-    fanDutyCycle = 0; // Box is cool, turn off fan to save solar power
+    fanDutyCycle = 0; // Box is cool, completely stop fan
   } 
   else if (currentTemp >= TEMP_MAX) {
     fanDutyCycle = 100; // Temperature limit exceeded, maximum cooling
   } 
   else {
     // Linearly map the temperature range (32C to 42C) to a safe fan speed range (30% to 100%)
-    // Noctua fans typically require at least a 20-30% duty cycle to reliably spin up.
     fanDutyCycle = map(currentTemp, TEMP_MIN, TEMP_MAX, 30, 100);
   }
 
@@ -65,11 +63,20 @@ void loop() {
   Serial.println("%");
 }
 
-// Function to translate 0-100% into the precise 0-320 Timer 1 registry window
+// Function to safely handle hardware PWM and true 0% logic
 void setFanSpeed(int dutyPercentage) {
-  if (dutyPercentage < 0) dutyPercentage = 0;
-  if (dutyPercentage > 100) dutyPercentage = 100;
-  
-  int registerValue = map(dutyPercentage, 0, 100, 0, 320);
-  OCR1A = registerValue; 
+  if (dutyPercentage <= 0) {
+    // Disconnect Pin 9 from Timer 1 and force a pure 0V digital LOW
+    TCCR1A &= ~_BV(COM1A1); 
+    digitalWrite(FAN_PWM_PIN, LOW);
+  } 
+  else {
+    // Reconnect Pin 9 to Timer 1 for 25kHz hardware PWM
+    TCCR1A |= _BV(COM1A1); 
+    
+    if (dutyPercentage > 100) dutyPercentage = 100;
+    
+    int registerValue = map(dutyPercentage, 0, 100, 0, 320);
+    OCR1A = registerValue; 
+  }
 }
