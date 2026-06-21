@@ -29,3 +29,17 @@ services:
     restart: unless-stopped
     ports:
       - "4416:4416"
+
+  mosquitto:
+    container_name: mosquitto
+    image: eclipse-mosquitto:latest
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ~/docker/mosquitto/config:/mosquitto/config
+      - ~/docker/mosquitto/data:/mosquitto/data
+      - ~/docker/mosquitto/log:/mosquitto/log
+    restart: unless-stopped
+    # Since HA is using 'host' network mode, exposing Mosquitto's ports 
+    # to the host allows HA to reach it via the host's IP address.
