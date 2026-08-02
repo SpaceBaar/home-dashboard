@@ -70,6 +70,80 @@ a { color: inherit; }
 .brand { font-weight: 600; font-size: 16px; text-decoration: none; }
 .brand-sub { color: var(--muted); font-size: 13px; }
 
+/* ---------- privacy mode ----------
+   No browser API can tell a page it is being screen-shared or screenshotted, so
+   this is a manual toggle plus focus/visibility/print heuristics. The blur is a
+   real CSS filter, which means a screenshot captures blurred pixels - the DOM
+   still holds the text, so this defends against shoulder-surfing and screen
+   sharing, not against someone with devtools on your machine. */
+
+.privacy-btn {
+  margin-left: auto;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.privacy-btn:hover { background: var(--flat-bg); }
+
+.privacy-btn[aria-pressed="true"] {
+  background: var(--down-bg);
+  color: var(--down);
+  border-color: var(--down);
+}
+
+/* 7px is enough that text of this size is not practically recoverable by
+   sharpening, and the reduced contrast removes the residual shape cue. */
+body.privacy-on .amt {
+  filter: blur(7px) contrast(0.55);
+  user-select: none;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+/* Peek: hold Shift, or press and hold a single figure. */
+body.privacy-on.privacy-peek .amt,
+body.privacy-on .amt.peek {
+  filter: none;
+  user-select: auto;
+  background: var(--up-bg);
+}
+
+/* Transition only on the way back to hidden, so revealing feels instant but
+   re-hiding never leaves a readable intermediate frame. */
+body.privacy-on .amt { transition: filter 0s; }
+
+.privacy-flash {
+  position: sticky;
+  top: 52px;
+  z-index: 9;
+  margin: 0 auto;
+  max-width: 1280px;
+  padding: 8px 24px;
+  font-size: 12px;
+  color: var(--down);
+  background: var(--down-bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.privacy-flash[hidden] { display: none; }
+
+/* Printing and print-to-PDF: always hidden, regardless of the toggle. This is
+   the one capture path a page can reliably intercept. */
+@media print {
+  .amt {
+    filter: blur(7px) contrast(0.55) !important;
+    user-select: none !important;
+  }
+  .privacy-btn, .privacy-flash, .sidebar { display: none !important; }
+}
+
 .layout {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr);

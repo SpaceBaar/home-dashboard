@@ -279,6 +279,45 @@ python web.py --once /        # render one route to stdout, for debugging
 | `/api/reports/<date>` | The full structured payload |
 | `/healthz` | Liveness probe |
 
+### Hiding amounts
+
+**Screen sharing and screenshots cannot be detected.** Every interface in the
+Screen Capture API — `getDisplayMedia`, `CaptureController`, `CropTarget`,
+`displaySurface`, `cursor` — exists for the page *doing* the capturing. There is
+no inverse, deliberately, because it would be a fingerprinting vector. There is
+no screenshot API at all. `FLAG_SECURE` on Android and `UIScreen.isCaptured` on
+iOS are native-app only. Any library claiming otherwise is guessing.
+
+So this is a privacy toggle with heuristic triggers, not detection:
+
+| Trigger | Reliability |
+| --- | --- |
+| The **Hide amounts** button, or pressing `p` | Reliable |
+| **Focus loss** — starting a screen share, alt-tabbing into a call, opening a snipping tool | Reliable, and the best available proxy |
+| **Tab hidden**, via `visibilitychange` | Reliable |
+| **Printing / print-to-PDF**, via `@media print` and `beforeprint` | Reliable, and always applied regardless of the toggle |
+| **Idle** for `idle_seconds` | Reliable |
+| **Screenshot keys** — `PrintScreen`, `Cmd+Shift+3/4/5`, `Win+Shift+S`, `Ctrl+P` | **Best effort only.** The OS usually swallows these before the page sees them |
+
+Behaviour:
+
+- Hold **Shift** to peek at everything, or press and hold a single figure.
+- Money only. Percentages, tickers, quantities and news stay readable, so the
+  page is still usable while blurred.
+- Your choice persists in `localStorage`; auto-triggers hide amounts without
+  overwriting that preference.
+- A figure the broker never supplied stays an em dash rather than a blurred
+  smudge — blurring it would imply a value exists.
+- The blur is a real CSS filter, so a screenshot captures blurred pixels. The
+  text is still in the DOM: this defends against shoulder-surfing, screen
+  sharing and screenshots, **not** against someone with devtools on your machine.
+- Chart tooltips are SVG `<title>` elements, which CSS cannot blur, so each point
+  carries an amount-free alternate that is swapped in.
+
+Configure under `web.privacy` in `config.json`. Set `blur_by_default` to `true`
+and amounts are hidden server-side on every load, so they never flash visible
+before the script runs.
+
 Notes:
 
 - The reports directory is read on **every request**, so a new report appears
@@ -336,6 +375,7 @@ portfolio. Root causes and fixes:
 | `SBI Cards` counted as SBIN | Substring matching, first-match-wins | Word-boundary matching, exclusion phrases, multi-symbol attribution |
 | AAPL/TSLA news scored despite not being held | News driven by `config.json` alone | Driven by live holdings; the watchlist is separate and labelled |
 | Feeds silently contributing nothing | Only `<item>` was parsed; failures were swallowed | Atom support, retries, and a feed-health line in the data-quality section |
+| Commentary published in Chinese | qwen2.5 is a Chinese-origin model and ignores an English instruction now and then | Non-Latin script is a validation failure like any other: retry with a stricter prompt, then fall back to the deterministic template. Score rationales get the same treatment — the number survives, the prose does not. The rejection notice names the script rather than quoting the characters, so the diagnostic cannot reintroduce them |
 | Bot token written to `journalctl` | Exception text contains the request URL | Redacted before logging |
 | Overlapping scheduled runs, swallowed exceptions | `asyncio.create_task` with no guard or error handling | Run lock, done-callbacks, Telegram alerts on failure |
 | Config read from the current working directory | Relative `open('config.json')` | All paths resolved from `__file__` |

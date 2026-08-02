@@ -211,6 +211,11 @@ class FakeLLM(LLMClient):
         if "Commentary:" in prompt:
             return self._narrative(prompt)
 
+        if self.behaviour in ("chinese", "chinese_always"):
+            # A valid score with a Chinese rationale: the number must survive,
+            # the prose must not.
+            return "SCORE: 7\nREASON: 该公司订单强劲，收入增长良好。"
+
         # Rotate through the malformed shapes a 1.5B model actually emits.
         shapes = [
             "SCORE: 8\nREASON: Contracted capacity additions support earnings.",
@@ -223,6 +228,16 @@ class FakeLLM(LLMClient):
         return shapes[len(self.calls) % len(shapes)]
 
     def _narrative(self, prompt: str) -> str:
+        if self.behaviour == "chinese":
+            # qwen2.5 is a Chinese-origin model and does this occasionally. If the
+            # retry prompt is in play, answer properly the second time.
+            if "not written in English" in prompt:
+                return ("The portfolio is showing a gain overall, led by the "
+                        "top-rated holdings.\n\nNews ratings were mixed today.")
+            return ("本投资组合价值为 700,485 卢比，较成本高出 72,473 卢比，"
+                    "表现最好的是 COALINDIA。\n\n今日新闻评级参差不齐。")
+        if self.behaviour == "chinese_always":
+            return "本投资组合价值为 700,485 卢比。\n\n今日新闻评级参差不齐。"
         if self.behaviour == "hallucinate":
             # Verbatim shape of the real 2026-08-02 failure.
             return ("The portfolio had a total return of +83.7% over the past year, driven by "
@@ -322,6 +337,78 @@ def test_validator(fs, scores):
 
 
 # ===========================================================================
+# 5b. Non-English output can never reach the report
+# ===========================================================================
+def test_language_guard(fs, grouped, tmp_dir: Path):
+    section("Chinese output is rejected before it can be published")
+
+    held = {h.symbol for h in fs.holdings}
+    chinese = ("本投资组合价值为 700,485 卢比，较成本高出 72,473 卢比。\n\n"
+               "今日新闻评级参差不齐。")
+
+    found = report_mod.non_latin_characters(chinese)
+    check(bool(found), f"Chinese characters are detected ({' '.join(found[:4])})")
+    check(not report_mod.is_english_only(chinese), "the text is not English-only")
+    check(report_mod.is_english_only("Portfolio worth Rs 700,485, up Rs 72,473 (+11.5%)."),
+          "an ordinary English sentence with rupee figures passes")
+    check(not report_mod.is_english_only("Portfolio 表现良好 overall"),
+          "a single Chinese word in otherwise English prose is caught")
+    for sample, script in (("Портфель вырос", "Cyrillic"),
+                           ("ポートフォリオ", "Japanese"),
+                           ("포트폴리오", "Korean"),
+                           ("पोर्टफोलियो", "Devanagari")):
+        check(not report_mod.is_english_only(sample), f"{script} is also rejected")
+
+    allowed_symbols, allowed_aliases = report_mod.build_allowed_names(fs, [], CFG.keyword_map)
+    result = report_mod.validate_narrative(
+        chinese, allowed_symbols=allowed_symbols, allowed_aliases=allowed_aliases,
+        allowed_numbers=report_mod.build_allowed_numbers(fs, []))
+    check(not result.ok, "the validator rejects it")
+    check("not in English" in result.violations[0],
+          f"and says why: {result.violations[0][:52]}")
+
+    # A model that recovers on the retry is allowed through.
+    recovers = FakeLLM(CFG, tmp_dir / "cn1", behaviour="chinese")
+    scores = asyncio.run(news_mod.score_all(grouped, recovers, held=held))
+    narrative, provenance, _ = asyncio.run(report_mod.build_narrative(
+        recovers, fs, scores, held, CFG.keyword_map, enabled=True, max_attempts=2))
+    check(report_mod.is_english_only(narrative), "the published narrative is English")
+    check("validated" in provenance,
+          f"a model that recovers on the retry is accepted ({provenance})")
+
+    # A model that never recovers falls back to the deterministic template.
+    stubborn = FakeLLM(CFG, tmp_dir / "cn2", behaviour="chinese_always")
+    scores2 = asyncio.run(news_mod.score_all(grouped, stubborn, held=held))
+    narrative2, provenance2, rejected = asyncio.run(report_mod.build_narrative(
+        stubborn, fs, scores2, held, CFG.keyword_map, enabled=True, max_attempts=2))
+    check(report_mod.is_english_only(narrative2),
+          "persistent Chinese output still yields an English report")
+    check("deterministic fallback" in provenance2,
+          f"because it falls back to the template ({provenance2})")
+    check(any("not in English" in r for r in rejected),
+          "and the reason is recorded for the data-quality section")
+
+    # Scores are numbers, so they survive; the rationale does not.
+    check(all(s.score == 7 for s in scores2),
+          "a Chinese-language answer still yields its numeric score")
+    check(all(report_mod.is_english_only(s.reason) for s in scores2),
+          "but no Chinese rationale reaches the news section")
+    check(any("non-english-reason-dropped" in s.method for s in scores2),
+          "the drop is recorded in the score's audit trail")
+
+    content = report_mod.render_report(
+        fs, news_mod.render_news_section(grouped, scores2, held=held),
+        narrative2, provenance2, scores=scores2, model="fake:1.5b", rejected=rejected)
+    check(report_mod.is_english_only(content),
+          "the entire rendered report contains no non-Latin script")
+
+    payload = report_mod.build_payload(fs, grouped, scores2, narrative2, provenance2,
+                                       held=held, model="fake:1.5b", rejected=rejected)
+    check(report_mod.is_english_only(json.dumps(payload, ensure_ascii=False)),
+          "and neither does the JSON sidecar the web view reads")
+
+
+# ===========================================================================
 # 6. End-to-end report
 # ===========================================================================
 def test_end_to_end(fs, grouped, tmp_dir: Path):
@@ -381,6 +468,7 @@ def test_all():
         grouped = test_news_attribution()
         scores = test_scoring(grouped, tmp / "cache")
         test_validator(fs, scores)
+        test_language_guard(fs, grouped, tmp / "lang")
         report_path = test_end_to_end(fs, grouped, tmp / "reports")
         preview = report_path.read_text(encoding="utf-8")
     assert not _failures, f"{len(_failures)} check(s) failed:\n" + "\n".join(_failures)

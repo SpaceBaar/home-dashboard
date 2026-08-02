@@ -41,7 +41,15 @@
   "web": {
     "host": "0.0.0.0",
     "port": 7373,
-    "_note": "Read-only report browser (pfm/web.py). Its own process and port, entirely separate from the Node home-dashboard app. Bind to 0.0.0.0 so it is reachable over the LAN and VPN; do not expose it to the public internet."
+    "_note": "Read-only report browser (pfm/web.py). Its own process and port, entirely separate from the Node home-dashboard app. Bind to 0.0.0.0 so it is reachable over the LAN and VPN; do not expose it to the public internet.",
+    "privacy": {
+      "blur_by_default": false,
+      "blur_on_focus_loss": true,
+      "blur_on_tab_hidden": true,
+      "blur_on_screenshot_keys": true,
+      "idle_seconds": 180,
+      "_note": "No browser API can tell a page it is being screen-shared or screenshotted, so amounts cannot be hidden automatically on capture. These are the signals a page can actually observe. Printing is always blurred regardless. blur_on_screenshot_keys is best effort only: the OS usually swallows PrintScreen and Cmd+Shift+4 before the page sees them. Press p to toggle, hold Shift to peek."
+    }
   },
 
   "portfolio": {

@@ -42,6 +42,16 @@ from pfm_config import BASE_DIR, REPORT_DIR, load_config, setup_logging
 log = logging.getLogger("pfm.web")
 
 STATIC_DIR = BASE_DIR / "static"
+
+# Privacy defaults, overridden from config.json in main(). Held module-level so
+# the request handler can reach them without a per-request config read.
+PRIVACY: Dict[str, object] = {
+    "blur_by_default": False,
+    "blur_on_focus_loss": True,
+    "blur_on_tab_hidden": True,
+    "blur_on_screenshot_keys": True,
+    "idle_seconds": 180,
+}
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _REPORT_NAME_RE = re.compile(r"^portfolio_analysis_(\d{4}-\d{2}-\d{2})\.(md|json)$")
 
@@ -244,7 +254,8 @@ def render_chart(index: List[dict], width: int = 720, height: int = 190) -> str:
     if len(points) == 1:
         only = points[0]
         return (f'<p class="empty">Only one report so far ({pretty_date(only["date"])}, '
-                f'{rupees(only["current"])}). The trend chart needs at least two.</p>')
+                f'{amt_text(rupees(only["current"]))}). '
+                f'The trend chart needs at least two.</p>')
 
     pad_l, pad_r, pad_t, pad_b = 8, 8, 14, 24
     plot_w = width - pad_l - pad_r
@@ -263,12 +274,25 @@ def render_chart(index: List[dict], width: int = 720, height: int = 190) -> str:
     line = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(values))
     area = f"{pad_l},{pad_t + plot_h} {line} {pad_l + plot_w},{pad_t + plot_h}"
 
-    dots = "".join(
-        f'<circle class="dot" cx="{x(i):.1f}" cy="{y(v):.1f}" r="3">'
-        f"<title>{pretty_date(points[i]['date'])}: {rupees(v)} "
-        f"({percent(points[i].get('pnl_pct'))})</title></circle>"
-        for i, v in enumerate(values)
-    )
+    # SVG <title> text cannot be blurred by CSS, so each point carries both a
+    # full tooltip and an amount-free one, and app.js swaps them as the toggle
+    # changes. The initial <title> matches the configured default so that no
+    # amount is exposed before the script runs - or at all, if JS is off.
+    hidden_by_default = bool(PRIVACY.get("blur_by_default"))
+    dot_parts: List[str] = []
+    for index, value in enumerate(values):
+        when = pretty_date(points[index]["date"])
+        pct = percent(points[index].get("pnl_pct"))
+        full = f"{when}: {rupees(value)} ({pct})"
+        safe = f"{when}: amount hidden ({pct})"
+        dot_parts.append(
+            f'<circle class="dot" cx="{x(index):.1f}" cy="{y(value):.1f}" r="3"'
+            f' data-full="{html.escape(full, quote=True)}"'
+            f' data-safe="{html.escape(safe, quote=True)}">'
+            f"<title>{html.escape(safe if hidden_by_default else full)}</title>"
+            f"</circle>"
+        )
+    dots = "".join(dot_parts)
 
     first, last = points[0], points[-1]
     delta = last["current"] - first["current"]
@@ -283,7 +307,7 @@ def render_chart(index: List[dict], width: int = 720, height: int = 190) -> str:
   </svg>
   <figcaption>
     <span>{pretty_date(first['date'])}</span>
-    <span class="chart-delta {tone(delta)}">{rupees(delta, signed=True)}
+    <span class="chart-delta {tone(delta)}">{amt_text(rupees(delta, signed=True))}
       ({percent(change_pct)}) over {len(points)} reports</span>
     <span>{pretty_date(last['date'])}</span>
   </figcaption>
@@ -293,7 +317,8 @@ def render_chart(index: List[dict], width: int = 720, height: int = 190) -> str:
 # ===========================================================================
 # Page rendering
 # ===========================================================================
-def page(title: str, body: str, *, active_date: Optional[str], index: List[dict]) -> str:
+def page(title: str, body: str, *, active_date: Optional[str], index: List[dict],
+         privacy: Optional[dict] = None) -> str:
     items = []
     for entry in index:
         classes = ["archive-item"]
@@ -301,7 +326,7 @@ def page(title: str, body: str, *, active_date: Optional[str], index: List[dict]
             classes.append("is-active")
         if not entry["has_data"]:
             classes.append("is-legacy")
-        meta = (f'<span class="archive-value">{rupees(entry["current"])}</span>'
+        meta = (f'<span class="archive-value">{amt_text(rupees(entry["current"]))}</span>'
                 f'<span class="pill {tone(entry["pnl"])}">{percent(entry["pnl_pct"])}</span>'
                 if entry["has_data"] else '<span class="pill none">legacy</span>')
         items.append(
@@ -310,6 +335,12 @@ def page(title: str, body: str, *, active_date: Optional[str], index: List[dict]
             f'<span class="archive-meta">{meta}</span></a></li>'
         )
     archive = "\n".join(items) or '<li class="empty">No reports found yet.</li>'
+
+    # Privacy settings are rendered as data attributes so the stylesheet can blur
+    # before any script runs - otherwise amounts would flash visible on load.
+    cfg = privacy or {}
+    default_on = "1" if cfg.get("blur_by_default") else "0"
+    body_class = "privacy-on" if cfg.get("blur_by_default") else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -320,11 +351,21 @@ def page(title: str, body: str, *, active_date: Optional[str], index: List[dict]
 <title>{html.escape(title)}</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body class="{body_class}"
+      data-privacy-default="{default_on}"
+      data-privacy-blur-on-blur="{1 if cfg.get('blur_on_focus_loss', True) else 0}"
+      data-privacy-blur-on-hidden="{1 if cfg.get('blur_on_tab_hidden', True) else 0}"
+      data-privacy-blur-on-keys="{1 if cfg.get('blur_on_screenshot_keys', True) else 0}"
+      data-privacy-idle-seconds="{int(cfg.get('idle_seconds', 0) or 0)}">
 <header class="topbar">
   <a class="brand" href="/">Portfolio reports</a>
   <span class="brand-sub">{len(index)} report{"s" if len(index) != 1 else ""} archived</span>
+  <button type="button" id="privacy-toggle" class="privacy-btn"
+          aria-pressed="false" title="Hide amounts (p). Hold Shift to peek.">
+    <span class="privacy-label">Hide amounts</span>
+  </button>
 </header>
+<div id="privacy-flash" class="privacy-flash" role="status" aria-live="polite" hidden></div>
 <div class="layout">
   <aside class="sidebar">
     <h2 class="sidebar-title">Archive</h2>
@@ -343,12 +384,28 @@ _BOOK_LABEL = {"IND": "India", "US": "US"}
 
 def money(value: Optional[float], currency: str = "INR", *,
           signed: bool = False, decimals: int = 0) -> str:
-    """Format in the holding's own currency. An em dash when the figure is absent."""
+    """Plain-text money. Use :func:`amt` for anything rendered into the page."""
     if value is None:
         return "—"
     unit = _CCY_SYMBOL.get(currency, currency + " ")
     sign = "+" if signed and value >= 0 else ("-" if signed and value < 0 else "")
     return f"{sign}{unit}{abs(value):,.{decimals}f}"
+
+
+def amt(value: Optional[float], currency: str = "INR", **kwargs) -> str:
+    """Money wrapped so privacy mode can blur it.
+
+    Every monetary figure in the page goes through here. An em dash for a missing
+    figure is left unwrapped - there is nothing to hide, and blurring it would
+    imply a value exists.
+    """
+    text = money(value, currency, **kwargs)
+    return text if text == "—" else f'<span class="amt">{text}</span>'
+
+
+def amt_text(text: str) -> str:
+    """Wrap pre-formatted money text (e.g. from :func:`rupees`)."""
+    return text if text in ("—", "") else f'<span class="amt">{text}</span>'
 
 
 def render_holdings_table(rows: List[dict], book: str, totals: Optional[dict],
@@ -368,27 +425,27 @@ def render_holdings_table(rows: List[dict], book: str, totals: Optional[dict],
         )
         # A holding with no cost basis shows an em dash, never a zero.
         inr_cell = (f'<td data-sort="{h.get("current_inr") or 0}">'
-                    f'{money(h.get("current_inr"), "INR")}</td>') if is_us else ""
+                    f'{amt(h.get("current_inr"), "INR")}</td>') if is_us else ""
         cells.append(f"""<tr>
 <td class="sym">{html.escape(h["symbol"])}{flags}</td>
 <td data-sort="{h["quantity"]}">{h["quantity"]:g}</td>
-<td data-sort="{h.get("avg_price") or 0}">{money(h.get("avg_price"), currency, decimals=2)}</td>
-<td data-sort="{h.get("ltp") or 0}">{money(h.get("ltp"), currency, decimals=2)}</td>
-<td data-sort="{h.get("invested") or 0}">{money(h.get("invested"), currency)}</td>
-<td data-sort="{h.get("current") or 0}">{money(h.get("current"), currency)}</td>
-<td data-sort="{h.get("pnl") or 0}" class="{tone(h.get("pnl"))}">{money(h.get("pnl"), currency, signed=True)}</td>
+<td data-sort="{h.get("avg_price") or 0}">{amt(h.get("avg_price"), currency, decimals=2)}</td>
+<td data-sort="{h.get("ltp") or 0}">{amt(h.get("ltp"), currency, decimals=2)}</td>
+<td data-sort="{h.get("invested") or 0}">{amt(h.get("invested"), currency)}</td>
+<td data-sort="{h.get("current") or 0}">{amt(h.get("current"), currency)}</td>
+<td data-sort="{h.get("pnl") or 0}" class="{tone(h.get("pnl"))}">{amt(h.get("pnl"), currency, signed=True)}</td>
 <td data-sort="{h.get("pnl_pct") or 0}" class="{tone(h.get("pnl_pct"))}">{percent(h.get("pnl_pct"))}</td>
 <td data-sort="{h.get("day_pct") or 0}" class="{tone(h.get("day_pct"))}">{percent(h.get("day_pct"), decimals=2)}</td>
 {inr_cell}</tr>""")
 
     foot = ""
     if totals:
-        foot_inr = f'<td>{money(totals.get("current_inr"), "INR")}</td>' if is_us else ""
+        foot_inr = f'<td>{amt(totals.get("current_inr"), "INR")}</td>' if is_us else ""
         foot = f"""<tfoot><tr>
 <td>Total</td><td></td><td></td><td></td>
-<td>{money(totals.get("invested"), currency)}</td>
-<td>{money(totals.get("current"), currency)}</td>
-<td class="{tone(totals.get("pnl"))}">{money(totals.get("pnl"), currency, signed=True)}</td>
+<td>{amt(totals.get("invested"), currency)}</td>
+<td>{amt(totals.get("current"), currency)}</td>
+<td class="{tone(totals.get("pnl"))}">{amt(totals.get("pnl"), currency, signed=True)}</td>
 <td class="{tone(totals.get("pnl_pct"))}">{percent(totals.get("pnl_pct"))}</td>
 <td></td>{foot_inr}</tr></tfoot>"""
 
@@ -418,7 +475,7 @@ def render_books_card(payload: dict) -> str:
         currency = totals.get("currency", "INR")
         extra = ""
         if key == "US" and totals.get("current_inr") is not None:
-            extra = f'<span class="book-inr">{money(totals["current_inr"], "INR")}</span>'
+            extra = f'<span class="book-inr">{amt(totals["current_inr"], "INR")}</span>'
         uncosted = totals.get("uncosted_count") or 0
         # Say plainly that invested and P&L cover a subset, so the three numbers
         # in this tile are not expected to subtract to each other.
@@ -429,10 +486,10 @@ def render_books_card(payload: dict) -> str:
         tiles.append(f"""<div class="book-tile">
 <div class="book-head"><h3>{_BOOK_LABEL.get(key, key)}</h3>
 <span class="pill {tone(totals.get("pnl"))}">{percent(totals.get("pnl_pct"))}</span></div>
-<p class="book-value">{money(totals.get("current"), currency)}{extra}</p>
+<p class="book-value">{amt(totals.get("current"), currency)}{extra}</p>
 <p class="book-meta">{totals.get("count", 0)} holdings ·
-invested {money(totals.get("invested"), currency)} ·
-P&amp;L {money(totals.get("pnl"), currency, signed=True)}</p>
+invested {amt(totals.get("invested"), currency)} ·
+P&amp;L {amt(totals.get("pnl"), currency, signed=True)}</p>
 {note}</div>""")
 
     us_currency = (books.get("US") or {}).get("currency", "INR")
@@ -462,17 +519,18 @@ def render_report_page(payload: dict) -> str:
                 f'<span class="stat-value {cls}">{value}</span></div>')
 
     stats = [
-        stat("Invested", rupees(totals.get("invested"))),
-        stat("Current value", rupees(totals.get("current"))),
+        stat("Invested", amt_text(rupees(totals.get("invested")))),
+        stat("Current value", amt_text(rupees(totals.get("current")))),
         stat("Overall P&amp;L",
-             f'{rupees(totals.get("pnl"), signed=True)} '
+             f'{amt_text(rupees(totals.get("pnl"), signed=True))} '
              f'<small>{percent(totals.get("pnl_pct"))}'
              + (" · costed only" if payload.get("uncosted") else "")
              + "</small>",
              tone(totals.get("pnl"))),
     ]
     if totals.get("day_pnl") is not None:
-        stats.append(stat("Change today", rupees(totals["day_pnl"], signed=True),
+        stats.append(stat("Change today",
+                          amt_text(rupees(totals["day_pnl"], signed=True)),
                           tone(totals["day_pnl"])))
     stats.append(stat("Holdings",
                       f'{totals.get("holdings_count", 0)} '
@@ -704,7 +762,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             index = build_index()
             body, active = render_home(index)
-            self._html(page("Portfolio reports", body, active_date=active, index=index))
+            self._html(page("Portfolio reports", body, active_date=active, index=index, privacy=PRIVACY))
             return
 
         if path == "/api/reports":
@@ -753,7 +811,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._not_found(f"No report for {date}.")
                     return
                 body = render_legacy_page(date, markdown)
-            self._html(page(f"Portfolio report {date}", body, active_date=date, index=index))
+            self._html(page(f"Portfolio report {date}", body, active_date=date, index=index, privacy=PRIVACY))
             return
 
         self._not_found(f"No route for {path}")
@@ -807,11 +865,21 @@ def main() -> int:
     host = args.host or web_cfg.get("host", "0.0.0.0")
     port = args.port or int(web_cfg.get("port", 7373))
 
+    configured_privacy = web_cfg.get("privacy") or {}
+    PRIVACY.update({k: v for k, v in configured_privacy.items()
+                    if not str(k).startswith("_")})
+    log.info("Privacy: amounts %s by default; auto-hide on "
+             "focus loss=%s, tab hidden=%s, screenshot keys=%s, idle=%ss. "
+             "Printing is always hidden.",
+             "hidden" if PRIVACY.get("blur_by_default") else "visible",
+             PRIVACY.get("blur_on_focus_loss"), PRIVACY.get("blur_on_tab_hidden"),
+             PRIVACY.get("blur_on_screenshot_keys"), PRIVACY.get("idle_seconds"))
+
     if args.once:
         index = build_index()
         if args.once in ("/", "/index.html"):
             body, active = render_home(index)
-            print(page("Portfolio reports", body, active_date=active, index=index))
+            print(page("Portfolio reports", body, active_date=active, index=index, privacy=PRIVACY))
         elif args.once == "/api/reports":
             print(json.dumps({"reports": index}, indent=2))
         else:
@@ -823,7 +891,7 @@ def main() -> int:
             body = (render_report_page(payload) if payload
                     else render_legacy_page(match.group(1),
                                             load_markdown(match.group(1)) or ""))
-            print(page("Portfolio report", body, active_date=match.group(1), index=index))
+            print(page("Portfolio report", body, active_date=match.group(1), index=index, privacy=PRIVACY))
         return 0
 
     reports = build_index()

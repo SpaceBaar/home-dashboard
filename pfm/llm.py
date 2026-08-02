@@ -36,6 +36,17 @@ log = logging.getLogger("pfm.llm")
 # Sentinel used everywhere instead of the old free-text "Score unavailable."
 UNSCORED = None
 
+# qwen2.5 is a Chinese-origin model and sometimes answers in Chinese regardless of
+# an English instruction. A score is a number and stays valid either way, but a
+# non-English rationale must never reach the report, so it is dropped.
+_NON_LATIN_RE = re.compile(
+    "[぀-ヿ㐀-䶿一-鿿豈-﫿･-ﾟ가-힯ᄀ-ᇿЀ-ӿ֐-׿؀-ۿऀ-ॿ฀-๿]"
+)
+
+
+def is_english_only(text: Optional[str]) -> bool:
+    return not _NON_LATIN_RE.search(text or "")
+
 
 class LLMUnavailable(RuntimeError):
     """Raised when the runtime is unreachable or the model is not installed."""
@@ -177,6 +188,10 @@ def parse_score(raw: str) -> tuple[Optional[int], Optional[str], str]:
         reason = chosen[:220].strip()
         if reason and not reason.endswith((".", "!", "?")):
             reason += "."
+        # The number survives a non-English answer; the prose does not.
+        if not is_english_only(reason):
+            reason = None
+            method = f"{method}+non-english-reason-dropped"
 
     return score, (reason or None), method
 
@@ -199,7 +214,8 @@ Rating scale:
 Rules:
 - Consider ALL of the headlines together and give ONE overall rating.
 - Base the rating only on the headlines given. Do not use outside knowledge.
-- Answer in English, in exactly two lines, using this format:
+- Write in ENGLISH ONLY, using only the Latin alphabet. No Chinese characters.
+- Answer in exactly two lines, using this format:
 SCORE: <single integer 1 to 10>
 REASON: <one short sentence>
 
@@ -487,7 +503,10 @@ class LLMClient:
             aggregate = min(10, max(1, aggregate))
             spread = max(chunk_scores) - min(chunk_scores)
             confidence = "high" if (len(chunk_scores) == len(chunks) and spread <= 2) else "low"
-            reason = reasons[0] if reasons else f"Aggregate of {len(chunk_scores)} rated headline group(s)."
+            usable = [r for r in reasons if is_english_only(r)]
+            reason = (usable[0] if usable
+                      else f"Aggregate of {len(chunk_scores)} rated headline group(s); "
+                           f"no usable English rationale was returned.")
             result = StockScore(
                 symbol, aggregate, reason, confidence,
                 "+".join(dict.fromkeys(methods)), len(headlines), chunk_scores,

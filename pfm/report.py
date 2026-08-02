@@ -68,6 +68,61 @@ _CAPS_ALLOWED: Set[str] = {
     "IT", "IS", "IN", "ON", "AT", "TO", "OF", "BY", "AS", "AN", "OR", "SO",
 }
 
+# Scripts that must never appear in the report. qwen2.5 is a Chinese-origin model
+# and will occasionally answer in Chinese regardless of an English instruction, so
+# this is enforced rather than merely requested.
+_NON_LATIN_RE = re.compile(
+    "["
+    "぀-ヿ"      # Hiragana, Katakana
+    "㐀-䶿"      # CJK Extension A
+    "一-鿿"      # CJK Unified Ideographs
+    "豈-﫿"      # CJK Compatibility Ideographs
+    "･-ﾟ"      # Halfwidth Katakana
+    "가-힯"      # Hangul syllables
+    "ᄀ-ᇿ"      # Hangul Jamo
+    "Ѐ-ӿ"      # Cyrillic
+    "֐-׿"      # Hebrew
+    "؀-ۿ"      # Arabic
+    "ऀ-ॿ"      # Devanagari
+    "฀-๿"      # Thai
+    "]"
+)
+
+
+_SCRIPT_RANGES = (
+    ("Chinese", 0x4E00, 0x9FFF), ("Chinese", 0x3400, 0x4DBF),
+    ("Chinese", 0xF900, 0xFAFF),
+    ("Japanese", 0x3040, 0x30FF), ("Japanese", 0xFF66, 0xFF9F),
+    ("Korean", 0xAC00, 0xD7AF), ("Korean", 0x1100, 0x11FF),
+    ("Cyrillic", 0x0400, 0x04FF), ("Hebrew", 0x0590, 0x05FF),
+    ("Arabic", 0x0600, 0x06FF), ("Devanagari", 0x0900, 0x097F),
+    ("Thai", 0x0E00, 0x0E7F),
+)
+
+
+def script_name(char: str) -> str:
+    code = ord(char)
+    for name, low, high in _SCRIPT_RANGES:
+        if low <= code <= high:
+            return name
+    return "non-Latin"
+
+
+def non_latin_characters(text: str, limit: int = 12) -> List[str]:
+    """Characters from a disallowed script, de-duplicated and order-preserving."""
+    seen: List[str] = []
+    for char in _NON_LATIN_RE.findall(text or ""):
+        if char not in seen:
+            seen.append(char)
+            if len(seen) >= limit:
+                break
+    return seen
+
+
+def is_english_only(text: str) -> bool:
+    return not non_latin_characters(text, limit=1)
+
+
 _NUMBER_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 _CAPS_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9&\.]{2,14}\b")
 _PORTFOLIO_PCT_RE = re.compile(
@@ -165,6 +220,21 @@ def validate_narrative(
     allowed_numbers: Set[float],
 ) -> ValidationResult:
     violations: List[str] = []
+
+    # 0. Language, checked before length so a short Chinese reply is diagnosed as
+    # non-English rather than merely truncated. Returns immediately: if the model
+    # answered in Chinese there is nothing useful to say about its figures.
+    foreign = non_latin_characters(text or "")
+    if foreign:
+        # Describe the script rather than quoting the characters. The violation
+        # text is published in the report's data-quality section, so echoing them
+        # would put the very characters we rejected back into the report.
+        scripts = sorted({script_name(c) for c in foreign})
+        return ValidationResult(False, [
+            f"narrative is not in English (model replied in "
+            f"{', '.join(scripts)}); the deterministic summary was used instead"
+        ])
+
     if not text or len(text.strip()) < 40:
         return ValidationResult(False, ["narrative is empty or too short"])
 
@@ -240,12 +310,15 @@ def build_narrative_prompt(fs: FactSheet, scores: Sequence[StockScore], held: Se
                            strict: bool = False) -> str:
     extra = ""
     if strict:
-        extra = ("\nYour previous answer contained names or numbers that were not in the DATA "
-                 "block. Copy names and numbers character-for-character from the DATA block "
-                 "this time, and mention no others.\n")
+        extra = ("\nYour previous answer was rejected. It either used names or numbers that "
+                 "are not in the DATA block, or it was not written in English. Write in "
+                 "English using only the Latin alphabet, and copy names and numbers "
+                 "character-for-character from the DATA block.\n")
     return f"""You are a financial writer. Write a short portfolio commentary in English.
 
 Hard rules:
+- Write in ENGLISH ONLY, using only the Latin alphabet. Do not use Chinese,
+  Japanese, Korean, Cyrillic, Devanagari or any other script.
 - Use ONLY the company names that appear in the DATA block. Never invent or alter a name.
 - Use ONLY the numbers that appear in the DATA block. Copy them exactly.
 - Do NOT add, subtract, average or otherwise calculate anything.
@@ -377,6 +450,11 @@ async def build_narrative(
 
         last_violations = problems
         log.warning("Narrative attempt %d rejected: %s", attempt, "; ".join(problems[:6]))
+        foreign = non_latin_characters(cleaned)
+        if foreign:
+            # Only the log gets the actual characters; useful in journalctl,
+            # never published.
+            log.warning("  offending characters: %s", " ".join(foreign))
 
     log.warning("All narrative attempts rejected; using the deterministic template.")
     return fallback, "deterministic fallback (model output failed validation)", last_violations

@@ -59,7 +59,17 @@ DEFAULTS: Dict[str, Any] = {
         "feed_attempts": 2,
         "duplicate_similarity_threshold": 0.9,
     },
-    "web": {"host": "0.0.0.0", "port": 7373},
+    "web": {
+        "host": "0.0.0.0",
+        "port": 7373,
+        "privacy": {
+            "blur_by_default": False,
+            "blur_on_focus_loss": True,
+            "blur_on_tab_hidden": True,
+            "blur_on_screenshot_keys": True,
+            "idle_seconds": 180,
+        },
+    },
     "narrative": {"enabled": True, "max_attempts": 2},
     "portfolio": {"pnl_mismatch_tolerance_pct": 1.0, "usd_inr_rate": None},
     "indmoney": {"enabled": True, "mcp_url": "https://mcp.indmoney.com/mcp"},

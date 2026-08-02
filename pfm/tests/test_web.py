@@ -295,6 +295,122 @@ def test_formatters() -> None:
     check(web.pretty_date("not-a-date") == "not-a-date", "an unparseable date passes through")
 
 
+def test_privacy_markup(dates: List[str]) -> None:
+    section("Privacy mode: amounts are marked up, non-amounts are not")
+
+    payload = web.load_payload(dates[0])
+    html_out = web.render_report_page(payload)
+
+    check('<span class="amt">' in html_out, "money figures are wrapped in .amt")
+
+    # Strip the wrappers, then look for anything left that looks like money.
+    # A lookbehind cannot do this correctly because signed values put + or -
+    # between the wrapper and the currency symbol.
+    import re as _re
+    stripped = _re.sub(r'<span class="amt">.*?</span>', "", html_out, flags=_re.S)
+    unwrapped = _re.findall(r"[₹$]\s?\d[\d,]*", stripped)
+    check(not unwrapped, f"no money figure escapes the wrapper ({unwrapped[:4]})")
+
+    wrapped = html_out.count('<span class="amt">')
+    check(wrapped > 20, f"all money cells are covered ({wrapped} wrapped)")
+    check('class="amt">—' not in html_out,
+          "a missing figure stays an unwrapped em dash — nothing to hide")
+
+    # Percentages and tickers stay readable: scope is money only.
+    for ticker in ("AAPL", "TATAPOWER"):
+        check(f'>{ticker}<' in html_out or ticker in html_out,
+              f"{ticker} is not blurred")
+    pct_wrapped = _re.search(r'<span class="amt">[-+]?[\d.]+%', html_out)
+    check(pct_wrapped is None, "percentages are not wrapped, per the money-only scope")
+
+    shell = web.page("t", html_out, active_date=dates[0], index=web.build_index(),
+                     privacy={"blur_by_default": False, "blur_on_focus_loss": True,
+                              "blur_on_tab_hidden": True,
+                              "blur_on_screenshot_keys": True, "idle_seconds": 90})
+    check('id="privacy-toggle"' in shell, "the toggle button is rendered")
+    check('data-privacy-blur-on-blur="1"' in shell
+          and 'data-privacy-idle-seconds="90"' in shell,
+          "the configured triggers reach the page as data attributes")
+    check('data-privacy-default="0"' in shell and 'class=""' in shell,
+          "visible by default renders without the privacy-on class")
+
+    blurred = web.page("t", html_out, active_date=None, index=[],
+                       privacy={"blur_by_default": True})
+    check('class="privacy-on"' in blurred,
+          "blur-by-default is applied server-side, so amounts never flash visible")
+
+    # Chart tooltips: SVG <title> cannot be blurred, so a safe variant is needed.
+    chart = web.render_chart(web.build_index())
+    check("data-safe=" in chart and "data-full=" in chart,
+          "chart points carry both a full and an amount-free tooltip")
+    check("amount hidden" in chart, "the safe tooltip omits the value")
+
+    # With amounts hidden by default the rendered <title> must already be safe,
+    # so nothing leaks before app.js runs, or at all without JavaScript.
+    saved = dict(web.PRIVACY)
+    try:
+        web.PRIVACY["blur_by_default"] = True
+        hidden_chart = web.render_chart(web.build_index())
+        titles = _re.findall(r"<title>(.*?)</title>", hidden_chart)
+        check(titles and all("hidden" in t for t in titles),
+              f"every tooltip is amount-free when hiding by default ({len(titles)} points)")
+        check(not any(_re.search(r"₹\s?\d", t) for t in titles),
+              "no rupee figure survives in a tooltip")
+    finally:
+        web.PRIVACY.clear()
+        web.PRIVACY.update(saved)
+
+    visible_titles = _re.findall(r"<title>(.*?)</title>", chart)
+    check(any("₹" in t for t in visible_titles),
+          "and the full tooltip is used when amounts are visible by default")
+
+    def sweep(markup: str) -> List[str]:
+        stripped_ = _re.sub(r'<span class="amt">.*?</span>', "", markup, flags=_re.S)
+        stripped_ = _re.sub(r'data-(?:full|safe)="[^"]*"', "", stripped_)
+        stripped_ = _re.sub(r"<title>.*?</title>", "", stripped_, flags=_re.S)
+        return _re.findall(r"[₹$]\s?\d[\d,]*", stripped_)
+
+    # Whole-page sweep for every entry point, not just the report body. The
+    # single-report chart message is its own branch and leaked a total until it
+    # was wrapped too.
+    index = web.build_index()
+    home_body, active = web.render_home(index)
+    pages = {
+        "report page": web.page("t", html_out, active_date=dates[0], index=index,
+                                privacy=dict(web.PRIVACY)),
+        "home page": web.page("t", home_body, active_date=active, index=index,
+                              privacy=dict(web.PRIVACY)),
+        "single-report chart": web.render_chart([e for e in index if e["has_data"]][:1]),
+        "empty chart": web.render_chart([]),
+    }
+    for name, markup in pages.items():
+        leaks = sweep(markup)
+        check(not leaks, f"no money escapes the wrapper in the {name} ({leaks[:3]})")
+
+
+def test_privacy_assets() -> None:
+    section("Privacy mode: stylesheet and script")
+
+    css = (web.STATIC_DIR / "style.css").read_text(encoding="utf-8")
+    check("body.privacy-on .amt" in css and "blur(" in css,
+          "a blur rule exists for wrapped amounts")
+    check("@media print" in css and "filter: blur" in css.split("@media print")[1],
+          "printing blurs amounts regardless of the toggle")
+    check(".privacy-peek .amt" in css, "a peek rule exists for holding Shift")
+
+    js = (web.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    for signal, why in (("visibilitychange", "tab hidden"),
+                        ("beforeprint", "printing"),
+                        ("PrintScreen", "screenshot key"),
+                        ("data-privacy-idle-seconds", "idle timer")):
+        check(signal in js, f"the {why} trigger is wired ({signal})")
+    check("localStorage" in js and "pfm.privacy" in js,
+          "the choice is persisted across visits")
+    check("data-safe" in js, "the script swaps chart tooltips in privacy mode")
+    check("No web API reports that a page is being screen-shared" in js,
+          "the script states plainly that capture cannot be detected")
+
+
 def test_http(dates: List[str], legacy_date: str) -> None:
     section("HTTP routes")
 
@@ -426,6 +542,8 @@ def test_all():
         test_chart(dates)
         test_markdown_renderer()
         test_formatters()
+        test_privacy_markup(dates)
+        test_privacy_assets()
         test_http(dates, legacy_date)
     finally:
         web.REPORT_DIR = original_report_dir
