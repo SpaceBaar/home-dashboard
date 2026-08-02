@@ -213,15 +213,20 @@ Ratings:"""
     # safely map them 1:1 in order.
     if len(parsed) < len(batch_data):
         scores_found = []
-        fallback_pattern = re.compile(r'(?:Score:\s*)?(\d+)(?:/10)?\s*[-\u2013,.]*\s*(?:Reason:)?\s*(.+)', re.IGNORECASE)
+        # MUST have either "Score: X", "Score X", or "X/10"
+        fallback_pattern = re.compile(r'(?:Score:?\s*(\d+)|(\d+)/10)(?:/10)?[\s\-\u2013,.:]*(?:Reason:?\s*)?([^\n]+)', re.IGNORECASE)
         for line in raw.split('\n'):
             line = line.strip()
             if not line: continue
+            
+            # Skip lines that don't look like they have a rating
             m = fallback_pattern.search(line)
             if m:
-                # Ensure it's matching near the beginning of a rating line, not random text
-                if line.find(m.group(0)) < 40:
-                    scores_found.append((m.group(1), m.group(2).strip()))
+                score = m.group(1) or m.group(2)
+                reason = m.group(3).strip()
+                # Clean up reason if it has leading dashes or '/10 -'
+                reason = re.sub(r'^(?:/10)?[\s\-\u2013,.:]*(?:Reason:\s*)?', '', reason, flags=re.IGNORECASE)
+                scores_found.append((score, reason))
                     
         # Safely map sequentially only if it evaluated every stock without skipping
         if len(scores_found) == len(batch_data):
