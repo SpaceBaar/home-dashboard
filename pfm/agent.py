@@ -1,6 +1,7 @@
 import asyncio
 import os
 import json
+import re
 import time
 import requests
 import schedule
@@ -225,50 +226,60 @@ async def fetch_and_score_news():
     if not relevant_articles:
         return "No significant news found for your holdings today."
 
-    # 2. Score Relevant Articles using local LLM
+    # 2. Score all relevant articles in a SINGLE batched LLM call.
+    # Batching is the key fix for Hailo: the model cold-loads exactly once,
+    # then the NPU generates all scores in one continuous inference pass
+    # instead of reloading for each article. Total latency drops from
+    # (N × cold-load time) to (1 cold-load + 1 inference).
+    articles_to_score = relevant_articles[:5]
+    print(f"Evaluating {len(articles_to_score)} article(s) via Hailo-Ollama (single batched call)...")
+
+    # Build a numbered list of headlines for the batch prompt
+    numbered_headlines = "\n".join(
+        f"{i+1}. [{a['symbol']}] \"{a['title']}\""
+        for i, a in enumerate(articles_to_score)
+    )
+
+    batch_prompt = f"""You are a financial analyst. Score the market sentiment of each headline below.
+
+For EACH headline respond on its own line in this exact format (no extra text):
+[N] SCORE: <1-10> REASON: <one short sentence>
+
+Where N is the headline number, 1 = deeply bearish, 10 = deeply bullish.
+
+Headlines:
+{numbered_headlines}
+"""
+
     scored_news_summary = []
-    print("Evaluating article sentiment via Hailo-Ollama...")
-
-    # Pre-warm: trigger model load before the loop so the cold-start penalty
-    # (which can be several minutes on the Hailo NPU) is paid once up front
-    # rather than eating into the per-article timeout.
-    print("  ⏳ Pre-warming model in Hailo VRAM (may take a few minutes on cold start)...")
     try:
-        await asyncio.wait_for(
-            client.generate(model='llama3.2:3b', prompt='Ready.', keep_alive=keep_alive, stream=False),
-            timeout=300  # Allow up to 5 minutes for the very first cold load
+        print("  ⏳ Waiting for Hailo model (cold-load may take a few minutes)...")
+        response = await asyncio.wait_for(
+            client.generate(
+                model='llama3.2:3b',
+                prompt=batch_prompt,
+                keep_alive=keep_alive,
+                options={'temperature': temperature},
+                stream=False
+            ),
+            timeout=300  # One generous deadline for the entire batch
         )
-        print("  ✅ Model warm.")
-    except asyncio.TimeoutError:
-        print("  ⚠️  Pre-warm timed out; proceeding anyway — first article may still be slow.")
-    except Exception as e:
-        print(f"  ⚠️  Pre-warm error: {e}; proceeding anyway.")
+        print("  ✅ Batch scoring complete.")
+        raw_output = response['response'].strip()
 
-    # Analyze a maximum of 5 articles to keep processing times crisp
-    for article in relevant_articles[:5]:
-        prompt = f"""
-        Analyze the market sentiment of this headline for the stock {article['symbol']}.
-        Headline: "{article['title']}"
-        
-        Respond strictly in this exact format:
-        SCORE: [integer from 1 to 10, where 1 is deeply bearish and 10 is deeply bullish]
-        REASON: [one short sentence explaining why]
-        """
-        try:
-            print(f"  → Scoring: {article['title'][:60]}...")
-            # Model should already be warm; 120s is generous for inference after load.
-            response = await asyncio.wait_for(
-                client.generate(
-                    model='llama3.2:3b',
-                    prompt=prompt,
-                    keep_alive=keep_alive,
-                    options={'temperature': temperature},
-                    stream=False
-                ),
-                timeout=120  # 120-second hard deadline per article (post-warm)
-            )
-            ai_output = response['response'].strip()
-            
+        # Parse "[N] SCORE: X REASON: ..." lines back into per-article results
+        line_pattern = re.compile(
+            r'\[(\d+)\]\s*SCORE:\s*(\d+)\s*REASON:\s*(.+)', re.IGNORECASE
+        )
+        parsed = {}
+        for line in raw_output.splitlines():
+            m = line_pattern.search(line)
+            if m:
+                idx, score, reason = int(m.group(1)) - 1, m.group(2), m.group(3).strip()
+                parsed[idx] = f"SCORE: {score}\nREASON: {reason}"
+
+        for i, article in enumerate(articles_to_score):
+            ai_output = parsed.get(i, "Could not parse score from model output.")
             scored_news_summary.append(
                 f"Stock: {article['symbol']} | Source: {article['source']}\n"
                 f"Headline: {article['title']}\n"
@@ -276,11 +287,12 @@ async def fetch_and_score_news():
                 f"Link: {article['link']}\n"
                 f"{'-'*40}"
             )
-        except asyncio.TimeoutError:
-            print(f"  → Timed out scoring headline for {article['symbol']}, skipping.")
-        except Exception as e:
-            print(f"Failed to evaluate headline: {e}")
-            
+
+    except asyncio.TimeoutError:
+        print("  ⚠️  Batch scoring timed out after 5 minutes. Proceeding without news scores.")
+    except Exception as e:
+        print(f"Batch scoring failed: {e}")
+
     return "\n".join(scored_news_summary)
 
 async def run_nightly_analysis(holdings_text=None):
