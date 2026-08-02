@@ -1,14 +1,23 @@
 [Unit]
 Description=Personal Finance AI Agent
-After=network.target hailo-ollama.service
+After=network-online.target hailo-ollama.service
+Wants=network-online.target
+# The agent degrades gracefully if the model is unavailable, but starting after
+# hailo-ollama avoids a pointless preflight failure on every boot.
 
 [Service]
-Environment="PATH=/home/spacebaar/Projects/pfm/.venv/bin:/home/spacebaar/.nvm/versions/node/v20.19.5/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/games:/usr/games"
+Type=simple
 User=spacebaar
 WorkingDirectory=/home/spacebaar/Projects/home-dashboard/pfm
+Environment="PATH=/home/spacebaar/Projects/pfm/.venv/bin:/home/spacebaar/.nvm/versions/node/v20.19.5/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+# npx is resolved from NPX_PATH so the absolute path lives in one place only.
+Environment="NPX_PATH=/home/spacebaar/.nvm/versions/node/v20.19.5/bin/npx"
 ExecStart=/home/spacebaar/Projects/pfm/.venv/bin/python /home/spacebaar/Projects/home-dashboard/pfm/agent.py --daemon
 Restart=always
-RestartSec=10
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

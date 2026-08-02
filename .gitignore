@@ -7,3 +7,12 @@ node_modules
 !/views/styles/fonts/.gitkeep
 /views/assets/vehicle-logo/*
 !/views/assets/vehicle-logo/.gitkeep
+
+# pfm (personal finance manager) runtime artefacts
+__pycache__/
+*.pyc
+/pfm/reports/
+/pfm/cache/
+/pfm/state/
+/pfm/daily_expenses.csv
+/pfm/portfolio_analysis_*.md

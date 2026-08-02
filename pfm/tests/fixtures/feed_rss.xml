@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Fixture Business Feed</title>
+    <item>
+      <title>Juniper Green Energy, Tata Power sign PPA for 85 MW hybrid project in Maharashtra</title>
+      <description>The companies signed a power purchase agreement.</description>
+      <link>https://example.com/news/tata-power-ppa_17531681.html</link>
+      <pubDate>Sun, 02 Aug 2026 09:15:00 +0530</pubDate>
+    </item>
+    <item>
+      <title>Juniper Green Energy, Tata Power sign PPA for 85 MW hybrid project in Maharashtra</title>
+      <description>Duplicate of the same wire story with a different article id.</description>
+      <link>https://example.com/news/tata-power-ppa_17531691.html</link>
+      <pubDate>Sun, 02 Aug 2026 09:20:00 +0530</pubDate>
+    </item>
+    <item>
+      <title>SBI Cards Q1 profit rises 12% on higher spends</title>
+      <description>SBI Cards and Payment Services reported results.</description>
+      <link>https://example.com/news/sbi-cards-q1</link>
+      <pubDate>Sun, 02 Aug 2026 08:00:00 +0530</pubDate>
+    </item>
+    <item>
+      <title>Q1 Results This Week: SBI, Airtel, LIC, Titan and 550 more companies to report earnings</title>
+      <description>State Bank of India and Life Insurance Corporation report this week.</description>
+      <link>https://example.com/news/q1-results-week</link>
+      <pubDate>Sun, 02 Aug 2026 07:30:00 +0530</pubDate>
+    </item>
+    <item>
+      <title>Publicis, the police and a public polyclinic were all named in the filing</title>
+      <description>Every occurrence of the insurer keyword here sits inside a longer word.</description>
+      <link>https://example.com/news/false-positive</link>
+      <pubDate>Sun, 02 Aug 2026 06:00:00 +0530</pubDate>
+    </item>
+    <item>
+      <title>Voda Idea receives &#8377;26.8 crore notice from DoT over spectrum rollout</title>
+      <description>Vodafone Idea says operations remain unaffected.</description>
+      <link>https://example.com/news/voda-idea-dot</link>
+      <pubDate>Sun, 02 Aug 2026 05:00:00 +0530</pubDate>
+    </item>
+    <item>
+      <title>F&amp;amp;O Talk: Nifty lacks direction on charts as Q1 season begins</title>
+      <description>Mentions no tracked company at all.</description>
+      <link>https://example.com/news/fo-talk</link>
+      <pubDate>Sun, 02 Aug 2026 04:00:00 +0530</pubDate>
+    </item>
+    <item>
+      <title>Yes Bank clears final tranche of stressed asset sale</title>
+      <description>YESBANK completes the transfer.</description>
+      <link>https://example.com/news/yes-bank-arc</link>
+      <pubDate>Sun, 02 Aug 2026 03:00:00 +0530</pubDate>
+    </item>
+  </channel>
+</rss>

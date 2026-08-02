@@ -1,31 +1,81 @@
 {
   "agent_settings": {
-    "run_schedule": "0 23 * * *",
-    "storage_backend": "postgres",
-    "cloud_api_endpoint": "https://api.yourpersonaldomain.com/data/ingest"
+    "login_time": "09:00",
+    "analysis_time": "23:00",
+    "storage_backend": "markdown",
+    "cloud_api_endpoint": null,
+    "_note": "Times are local to the Pi (set the Pi to Asia/Kolkata). Kite access tokens expire around 06:00 IST, so analysis_time must be before midnight for the token issued at login_time to still be valid."
   },
+
+  "llm": {
+    "host": "http://127.0.0.1:8000",
+    "model": "qwen2.5-instruct:1.5b",
+    "fallback_models": ["qwen2.5:1.5b-instruct", "llama3.2:3b", "llama3.2:1b"],
+    "temperature": 0.0,
+    "repeat_penalty": 1.05,
+    "keep_alive": -1,
+    "request_timeout_seconds": 240,
+    "max_attempts": 3,
+    "score_num_predict": 160,
+    "score_chunk_size": 6,
+    "narrative_num_predict": 420,
+    "cache_ttl_hours": 18,
+    "_note": "repeat_penalty must stay near 1.0. The previous value of 1.3 penalised the model for re-emitting the required 'SCORE:'/'REASON:' literals, which is a large part of why every stock came back unscored."
+  },
+
+  "news": {
+    "max_headlines_per_call": 6,
+    "max_headline_chars": 180,
+    "max_articles_per_stock": 12,
+    "feed_timeout_seconds": 12,
+    "feed_attempts": 2,
+    "duplicate_similarity_threshold": 0.9
+  },
+
+  "narrative": {
+    "enabled": true,
+    "max_attempts": 2,
+    "_note": "LLM prose is validated against the computed fact sheet. Any ticker or figure not present in the source data causes a retry, then a fall back to a deterministic template."
+  },
+
   "portfolio": {
     "india_broker": "zerodha",
-    "us_broker": "indmoney"
+    "us_broker": "indmoney",
+    "pnl_mismatch_tolerance_pct": 1.0
   },
+
   "tracking": {
-    "stocks": [
-      {"symbol": "ADANIPOWER", "keywords": ["ADANI POWER", "ADANIPOWER"]},
-      {"symbol": "COALINDIA", "keywords": ["COAL INDIA"]},
-      {"symbol": "IDEA", "keywords": ["VODAFONE IDEA", "VI "]},
-      {"symbol": "IRCTC", "keywords": ["IRCTC", "RAILWAY CATERING"]},
-      {"symbol": "LICI", "keywords": ["LIC", "LIFE INSURANCE CORPORATION"]},
-      {"symbol": "PAYTM", "keywords": ["PAYTM", "ONE97"]},
-      {"symbol": "SBIN", "keywords": ["SBI", "STATE BANK OF INDIA"]},
-      {"symbol": "SPICEJET", "keywords": ["SPICEJET", "SPICE JET"]},
-      {"symbol": "TATAPOWER", "keywords": ["TATA POWER"]},
-      {"symbol": "TRIDENT", "keywords": ["TRIDENT"]},
-      {"symbol": "YESBANK", "keywords": ["YES BANK", "YESBANK"]},
-      {"symbol": "AAPL", "keywords": ["Apple Inc", "Apple"]},
-      {"symbol": "TSLA", "keywords": ["Tesla Inc", "Tesla"]},
-      {"symbol": "NVDA", "keywords": ["NVIDIA Corp", "NVIDIA"]}
-    ]
+    "_note": "News is scored for every symbol actually held in Kite, plus the watchlist below. Held symbols with no explicit keywords fall back to matching the symbol itself, so newly bought stocks are picked up automatically.",
+    "keywords": {
+      "ADANIPOWER": ["ADANI POWER", "ADANIPOWER"],
+      "COALINDIA": ["COAL INDIA", "COALINDIA"],
+      "IDEA": ["VODAFONE IDEA", "VODA IDEA", "IDEA CELLULAR"],
+      "IRCTC": ["IRCTC", "INDIAN RAILWAY CATERING"],
+      "LICI": ["LIC", "LIFE INSURANCE CORPORATION"],
+      "PAYTM": ["PAYTM", "ONE 97", "ONE97"],
+      "SBIN": ["SBI", "STATE BANK OF INDIA"],
+      "SPICEJET": ["SPICEJET", "SPICE JET"],
+      "TATAPOWER": ["TATA POWER", "TATAPOWER"],
+      "TRIDENT": ["TRIDENT LTD", "TRIDENT LIMITED"],
+      "YESBANK": ["YES BANK", "YESBANK"],
+      "RBA": ["RESTAURANT BRANDS ASIA", "BURGER KING INDIA"],
+      "NIFTYBEES": ["NIFTYBEES", "NIFTY BEES"],
+      "LIQUIDBEES": ["LIQUIDBEES", "LIQUID BEES"],
+      "GOLDCASE": ["GOLDCASE", "GOLD CASE"],
+      "AAPL": ["APPLE INC", "APPLE"],
+      "TSLA": ["TESLA INC", "TESLA"],
+      "NVDA": ["NVIDIA CORP", "NVIDIA"]
+    },
+    "exclude_phrases": {
+      "_note": "Phrases removed from the article text before keyword matching, so sibling listed companies are not mis-attributed - e.g. an SBI Cards story must not count as SBIN news.",
+      "SBIN": ["SBI CARDS", "SBI CARD", "SBI LIFE", "SBI GENERAL", "SBI MUTUAL FUND", "SBI FUNDS", "SBI AMC", "SBI SECURITIES"],
+      "LICI": ["LIC HOUSING", "LIC HFL", "LIC MUTUAL FUND"],
+      "IDEA": ["IDEA OF", "THE IDEA", "BAD IDEA", "GOOD IDEA", "NO IDEA"],
+      "AAPL": ["APPLE CIDER", "BIG APPLE"]
+    },
+    "watchlist": ["AAPL", "TSLA", "NVDA"]
   },
+
   "news_sources": [
     {
       "name": "Moneycontrol Business",

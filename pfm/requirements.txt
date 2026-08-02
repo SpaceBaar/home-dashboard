@@ -1,0 +1,6 @@
+# Personal finance agent — Raspberry Pi 5 / hailo-ollama
+ollama>=0.3.0          # async client for the hailo-ollama HTTP API
+requests>=2.31.0       # RSS feeds, Telegram, /api/tags preflight
+python-dotenv>=1.0.0   # loads pfm/.env
+schedule>=1.2.0        # daily job timing
+mcp>=1.0.0             # Zerodha Kite MCP client (not needed for --dry-run)

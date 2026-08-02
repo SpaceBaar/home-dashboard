@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Fixture Atom Feed</title>
+  <entry>
+    <title>Apple warns iPhone and Mac sales face a supply crunch</title>
+    <summary>Apple Inc flagged constraints for the coming quarter.</summary>
+    <link href="https://example.com/news/apple-supply"/>
+    <updated>2026-08-02T10:00:00Z</updated>
+  </entry>
+  <entry>
+    <title>Apple set to lose nearly $500 billion in value after weak forecast</title>
+    <summary>Shares slid after guidance.</summary>
+    <link href="https://example.com/news/apple-forecast"/>
+    <updated>2026-08-02T09:00:00Z</updated>
+  </entry>
+  <entry>
+    <title>Elon Musk rejects report of Tesla China business split plans</title>
+    <summary>Tesla Inc denies the report.</summary>
+    <link href="https://example.com/news/tesla-china"/>
+    <updated>2026-08-02T08:00:00Z</updated>
+  </entry>
+  <entry>
+    <title>Coal India and Tata Power announce a joint pithead solar venture</title>
+    <summary>Both companies are named in the same story.</summary>
+    <link href="https://example.com/news/coalindia-tatapower"/>
+    <updated>2026-08-02T07:00:00Z</updated>
+  </entry>
+</feed>
