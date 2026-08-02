@@ -187,14 +187,19 @@ Ratings:"""
         print(f"  Batch {batch_label} failed: {e}")
         raw = ""
 
-    # Multi-pattern parser — extracts SYMBOL: Score: X/10 - Reason: Y
+    # Multi-pattern parser — hunts for the specific batch symbols anywhere in the line
+    symbols_pattern = "|".join(map(re.escape, batch_data.keys()))
     patterns = [
-        re.compile(r'^(?:Stock:\s*)?([A-Z0-9_&]+)[:\s]+(?:Score:\s*)?(\d+)(?:/10)?\s*[-\u2013]\s*(?:Reason:\s*)?(.+)', re.IGNORECASE | re.MULTILINE),
-        re.compile(r'^(?:Stock:\s*)?([A-Z0-9_&]+)[:\s]+(?:Score:\s*)?(\d+)(?:/10)?[,.\s]+(?:Reason:\s*)?(.+)', re.IGNORECASE | re.MULTILINE),
+        # Explicit dash separator (e.g. "Score: 8/10 - Reason: ...")
+        re.compile(rf'\b({symbols_pattern})\b[\s:\-\u2013]*(?:Score:\s*)?(\d+)(?:/10)?\s*[-\u2013]\s*(?:Reason:\s*)?([^\n]+)', re.IGNORECASE),
+        # Explicit Reason keyword without dash (e.g. "Score: 8/10 Reason: ...")
+        re.compile(rf'\b({symbols_pattern})\b[\s:\-\u2013]*(?:Score:\s*)?(\d+)(?:/10)?\s*Reason:\s*([^\n]+)', re.IGNORECASE),
+        # Fallback space/comma separator
+        re.compile(rf'\b({symbols_pattern})\b[\s:\-\u2013]*(?:Score:\s*)?(\d+)(?:/10)?[,.\s]+([^\n]+)', re.IGNORECASE),
     ]
     parsed = {}
     for pattern in patterns:
-        if parsed:
+        if len(parsed) == len(batch_data):
             break
         for m in pattern.finditer(raw):
             sym = m.group(1).upper()
