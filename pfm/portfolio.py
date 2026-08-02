@@ -1,14 +1,21 @@
 """Deterministic portfolio mathematics. No LLM is involved anywhere in here.
 
 Every number that reaches the report is computed once, in Python, from the
-broker payload - and the report's arithmetic is guaranteed to close, i.e.
-``sum(holding.pnl) == total_current - total_invested`` exactly.
+broker payloads.
 
-The previous implementation mixed two incompatible sources: the per-holding
-rupee P&L came from the broker while the percentage was derived from
-``qty * avg`` vs ``qty * ltp``. Those two disagree whenever quantity is
-pledged, in T+1, or partially realised, which is how a report ends up showing
-figures that cannot be reconciled with each other.
+Two invariants hold no matter what the brokers send:
+
+1. **Arithmetic closes.** For the subset of holdings that have a known cost
+   basis, ``sum(pnl) == costed_current - total_invested`` exactly.
+2. **Nothing is invented.** A holding with no cost basis (INDmoney does not
+   share the invested amount for broker-imported rows) reports ``None`` for
+   return figures rather than a percentage computed against a zero. A USD
+   holding with no FX rate available is never folded into a rupee total.
+
+The earlier version mixed the broker's rupee P&L with locally derived
+percentages, which disagree whenever quantity is pledged, in T+1, or partially
+realised — that is how a report ends up with figures that cannot be reconciled
+against each other.
 """
 
 from __future__ import annotations
@@ -17,40 +24,89 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
+
+from brokers import BOOK_IND, BOOK_US, extract_rows, normalise_kite
 
 log = logging.getLogger("pfm.portfolio")
+
+# A USD/INR rate outside this band means we have misread a field, not that the
+# rupee has moved. Better to refuse the conversion than to publish nonsense.
+FX_SANITY_RANGE = (60.0, 140.0)
 
 
 @dataclass
 class Holding:
     symbol: str
     exchange: str
+    book: str                      # BOOK_IND | BOOK_US
+    currency: str                  # "INR" | "USD"
     quantity: float
-    avg_price: float
-    ltp: float
-    invested: float
-    current: float
-    pnl: float
-    pnl_pct: float
+    avg_price: Optional[float]
+    ltp: Optional[float]
+    invested_native: Optional[float]
+    current_native: float
+    pnl_native: Optional[float]
+    pnl_pct: Optional[float]
+    fx_rate: float                 # native -> INR (1.0 when already INR)
+    invested_inr: Optional[float]
+    current_inr: Optional[float]   # None when a USD row has no usable FX rate
+    pnl_inr: Optional[float]
     day_pct: Optional[float]
-    broker_pnl: Optional[float] = None
+    broker_pnl_native: Optional[float] = None
+    source: str = ""
+    name: Optional[str] = None
     flags: List[str] = field(default_factory=list)
 
-    def line(self) -> str:
-        day = f"{self.day_pct:+.2f}% today" if self.day_pct is not None else "day change n/a"
-        return (f"{self.symbol}: qty {self.quantity:g} | avg Rs{self.avg_price:,.2f} | "
-                f"LTP Rs{self.ltp:,.2f} | P&L Rs{self.pnl:+,.0f} "
-                f"({self.pnl_pct:+.1f}%, {day})")
+    @property
+    def has_cost_basis(self) -> bool:
+        return self.invested_native is not None and self.invested_native > 0
+
+    # The bare names are always RUPEES, so report code that adds them together
+    # cannot accidentally mix currencies. Use the *_native fields to show a
+    # holding in its own currency.
+    @property
+    def invested(self) -> Optional[float]:
+        return self.invested_inr
+
+    @property
+    def current(self) -> Optional[float]:
+        return self.current_inr
+
+    @property
+    def pnl(self) -> Optional[float]:
+        return self.pnl_inr
+
+    @property
+    def symbol_display(self) -> str:
+        return f"{self.symbol} (US)" if self.book == BOOK_US else self.symbol
+
+
+@dataclass
+class BookTotals:
+    """Subtotals for one book, in its own currency and in rupees."""
+
+    book: str
+    currency: str
+    invested: Optional[float]          # native, costed rows only
+    current: float                     # native, all rows
+    costed_current: Optional[float]    # native, costed rows only
+    pnl: Optional[float]
+    pnl_pct: Optional[float]
+    current_inr: Optional[float]
+    invested_inr: Optional[float]
+    pnl_inr: Optional[float]
+    count: int
+    uncosted_count: int
 
 
 @dataclass
 class FactSheet:
     """The single source of truth handed to the report and to the LLM prompt."""
 
-    total_invested: float
-    total_current: float
-    total_pnl: float
+    total_invested: float              # INR, costed rows only
+    total_current: float               # INR, all rows with a usable rate
+    total_pnl: float                   # INR
     total_pnl_pct: float
     day_pnl: Optional[float]
     holdings: List[Holding]
@@ -61,50 +117,42 @@ class FactSheet:
     profitable_count: int
     losing_count: int
     data_quality: List[str]
+    books: Dict[str, BookTotals] = field(default_factory=dict)
+    usd_inr: Optional[float] = None
+    fx_source: str = ""
+    uncosted: List[str] = field(default_factory=list)
+    excluded_value_inr: float = 0.0
 
     @property
     def symbols(self) -> List[str]:
         return [h.symbol for h in self.holdings]
 
+    @property
+    def has_us_book(self) -> bool:
+        return BOOK_US in self.books
+
 
 # ---------------------------------------------------------------------------
-# Parsing the MCP payload
+# Parsing the MCP payload (kept for the Kite path and for tests)
 # ---------------------------------------------------------------------------
 def extract_holdings_json(text: str) -> Optional[List[dict]]:
-    """Pull a holdings list out of Kite MCP output.
+    """Pull a holdings list out of MCP tool output.
 
-    Kite MCP returns plain-text error strings (e.g. "Please log in first")
-    rather than raising, so a None return here must be treated as "not
-    authenticated", never as "no holdings".
+    Both servers answer unauthenticated calls with plain-text messages rather
+    than raising, so a None return must be read as "not authenticated", never
+    as "no holdings".
     """
     if not text:
         return None
-
-    def _coerce(obj: Any) -> Optional[List[dict]]:
-        if isinstance(obj, list):
-            return [o for o in obj if isinstance(o, dict)] or None
-        if isinstance(obj, dict):
-            for key in ("data", "holdings", "net", "result"):
-                inner = obj.get(key)
-                if isinstance(inner, list):
-                    return [o for o in inner if isinstance(o, dict)] or None
-                if isinstance(inner, dict):
-                    nested = _coerce(inner)
-                    if nested:
-                        return nested
-        return None
-
     try:
-        found = _coerce(json.loads(text))
-        if found:
-            return found
+        return extract_rows(json.loads(text), hint_keys=("holdings", "net", "data"))
     except (json.JSONDecodeError, TypeError):
         pass
 
     fenced = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
     if fenced:
         try:
-            found = _coerce(json.loads(fenced.group(1)))
+            found = extract_rows(json.loads(fenced.group(1)))
             if found:
                 return found
         except json.JSONDecodeError:
@@ -113,139 +161,208 @@ def extract_holdings_json(text: str) -> Optional[List[dict]]:
     array = re.search(r"(\[\s*\{[\s\S]*\}\s*\])", text)
     if array:
         try:
-            found = _coerce(json.loads(array.group(1)))
+            found = extract_rows(json.loads(array.group(1)))
             if found:
                 return found
         except json.JSONDecodeError:
             pass
-
     return None
 
 
-def _num(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(str(value).replace(",", "").strip())
-    except (TypeError, ValueError):
-        return default
+def _is_normalised(item: Dict[str, Any]) -> bool:
+    return "book" in item and "current_native" in item
 
 
-def _effective_quantity(item: dict) -> tuple[float, List[str]]:
-    """Total economically-held quantity, with an audit flag when it differs.
+# ---------------------------------------------------------------------------
+# FX
+# ---------------------------------------------------------------------------
+def resolve_fx(
+    configured: Optional[float],
+    snapshot_derived: Optional[float],
+) -> tuple[Optional[float], str]:
+    """Pick a USD/INR rate and say where it came from.
 
-    Kite splits a position across ``quantity`` (free), ``t1_quantity``
-    (settling) and ``collateral_quantity`` (pledged). Using ``quantity`` alone
-    reports a pledged holding as zero-invested, which then divides into a
-    meaningless percentage.
+    Preference order: an explicit config value, then a rate implied by
+    INDmoney's own rupee totals. No rate is ever assumed — without one, the US
+    book is reported in dollars only and no combined figure is published.
     """
-    free = _num(item.get("quantity"))
-    t1 = _num(item.get("t1_quantity"))
-    collateral = _num(item.get("collateral_quantity"))
-    authorised = _num(item.get("authorised_quantity"))
-    total = free + t1 + collateral
-
-    flags: List[str] = []
-    if t1:
-        flags.append(f"{t1:g} in T+1 settlement")
-    if collateral:
-        flags.append(f"{collateral:g} pledged as collateral")
-    if authorised:
-        flags.append(f"{authorised:g} authorised for sale")
-
-    if total <= 0:
-        opening = _num(item.get("opening_quantity"))
-        if opening > 0:
-            total = opening
-            flags.append("quantity taken from opening_quantity")
-    return total, flags
+    for value, source in ((configured, "configured in config.json"),
+                          (snapshot_derived, "implied by INDmoney rupee totals")):
+        if value is None:
+            continue
+        if FX_SANITY_RANGE[0] <= value <= FX_SANITY_RANGE[1]:
+            return float(value), f"{source} ({value:.2f})"
+        log.warning("Ignoring implausible USD/INR rate %.4f from %s", value, source)
+    return None, "unavailable"
 
 
 # ---------------------------------------------------------------------------
 # Building the fact sheet
 # ---------------------------------------------------------------------------
-def build_fact_sheet(holdings_raw: List[dict], *, mismatch_tolerance_pct: float = 1.0) -> FactSheet:
+def build_fact_sheet(
+    holdings_raw: Sequence[Dict[str, Any]],
+    *,
+    mismatch_tolerance_pct: float = 1.0,
+    usd_inr: Optional[float] = None,
+    fx_source: str = "",
+) -> FactSheet:
+    """Compute every reported figure from normalised (or raw Kite) holding rows."""
     holdings: List[Holding] = []
     data_quality: List[str] = []
+    uncosted: List[str] = []
     day_pnl_total = 0.0
     day_pnl_known = False
+    excluded_value_inr = 0.0
 
     for item in holdings_raw:
-        symbol = str(item.get("tradingsymbol") or item.get("symbol") or "UNKNOWN").upper().strip()
-        exchange = str(item.get("exchange") or "").upper()
-        qty, flags = _effective_quantity(item)
-        avg = _num(item.get("average_price"))
-        ltp = _num(item.get("last_price"))
+        # Accept raw Kite rows directly so existing callers and fixtures work.
+        row = item if _is_normalised(item) else normalise_kite(item)
+        if row is None:
+            continue
 
-        if ltp <= 0:
-            close = _num(item.get("close_price"))
-            if close > 0:
-                ltp = close
-                flags.append("last_price missing; used close_price")
+        symbol = str(row.get("symbol") or "UNKNOWN").upper()
+        book = row.get("book") or BOOK_IND
+        currency = (row.get("currency") or "INR").upper()
+        quantity = float(row.get("quantity") or 0.0)
+        avg = row.get("avg_price")
+        ltp = row.get("ltp")
+        invested = row.get("invested_native")
+        current = row.get("current_native")
+        flags = list(row.get("flags") or [])
 
-        invested = qty * avg
-        current = qty * ltp
-        pnl = current - invested
-        pnl_pct = (pnl / invested * 100.0) if invested else 0.0
+        if not current or current <= 0:
+            data_quality.append(f"{symbol}: no current value reported; excluded from totals.")
+            continue
+        if quantity <= 0:
+            data_quality.append(f"{symbol}: zero quantity reported; excluded from totals.")
+            continue
 
-        broker_pnl = item.get("pnl")
-        broker_pnl = _num(broker_pnl) if broker_pnl is not None else None
-        if broker_pnl is not None and invested > 0:
+        # Native P&L, and the percentage only when a cost basis exists.
+        if invested is not None and invested > 0:
+            pnl_native: Optional[float] = current - invested
+            pnl_pct: Optional[float] = pnl_native / invested * 100.0
+        else:
+            pnl_native, pnl_pct = None, None
+            uncosted.append(symbol)
+
+        # Broker-reported P&L is a cross-check, never the reported figure.
+        broker_pnl = row.get("broker_pnl_native")
+        if broker_pnl is not None and invested and pnl_native is not None:
             tolerance = max(1.0, invested * mismatch_tolerance_pct / 100.0)
-            if abs(broker_pnl - pnl) > tolerance:
-                flags.append(f"broker P&L Rs{broker_pnl:+,.0f} vs derived Rs{pnl:+,.0f}")
+            if abs(broker_pnl - pnl_native) > tolerance:
+                unit = "$" if currency == "USD" else "Rs"
+                flags.append(f"broker P&L {unit}{broker_pnl:+,.0f} vs derived {unit}{pnl_native:+,.0f}")
                 data_quality.append(
-                    f"{symbol}: broker-reported P&L (Rs{broker_pnl:+,.0f}) differs from "
-                    f"quantity x price arithmetic (Rs{pnl:+,.0f}). The derived figure is used "
-                    f"so that the report totals reconcile; the difference usually means part "
+                    f"{symbol}: broker-reported P&L ({unit}{broker_pnl:+,.0f}) differs from "
+                    f"quantity x price arithmetic ({unit}{pnl_native:+,.0f}). The derived figure "
+                    f"is used so the report totals reconcile; the difference usually means part "
                     f"of the position is pledged, settling, or partially realised."
                 )
 
-        day_pct_raw = item.get("day_change_percentage")
-        day_pct = _num(day_pct_raw) if day_pct_raw is not None else None
-        if day_pct is None:
-            close = _num(item.get("close_price"))
-            if close > 0 and ltp > 0:
-                day_pct = (ltp - close) / close * 100.0
-                flags.append("day change derived from close_price")
+        # Convert to rupees. USD rows without a rate stay out of every INR total.
+        if currency == "INR":
+            fx_rate = 1.0
+        elif usd_inr:
+            fx_rate = float(usd_inr)
+        else:
+            fx_rate = 0.0
 
-        if qty <= 0:
-            data_quality.append(f"{symbol}: zero quantity reported; excluded from totals.")
-            continue
-        if avg <= 0 or ltp <= 0:
-            data_quality.append(
-                f"{symbol}: missing average_price or last_price; percentages are unreliable."
-            )
+        if fx_rate:
+            current_inr: Optional[float] = current * fx_rate
+            invested_inr: Optional[float] = invested * fx_rate if invested is not None else None
+            pnl_inr: Optional[float] = pnl_native * fx_rate if pnl_native is not None else None
+        else:
+            current_inr = invested_inr = pnl_inr = None
+            flags.append("no USD/INR rate available; excluded from the combined rupee total")
 
         holdings.append(Holding(
-            symbol=symbol, exchange=exchange, quantity=qty, avg_price=avg, ltp=ltp,
-            invested=invested, current=current, pnl=pnl, pnl_pct=pnl_pct,
-            day_pct=day_pct, broker_pnl=broker_pnl, flags=flags,
+            symbol=symbol, exchange=str(row.get("exchange") or ""), book=book,
+            currency=currency, quantity=quantity, avg_price=avg, ltp=ltp,
+            invested_native=invested, current_native=current,
+            pnl_native=pnl_native, pnl_pct=pnl_pct,
+            fx_rate=fx_rate, invested_inr=invested_inr, current_inr=current_inr,
+            pnl_inr=pnl_inr, day_pct=row.get("day_pct"),
+            broker_pnl_native=broker_pnl, source=str(row.get("source") or ""),
+            name=row.get("name"), flags=flags,
         ))
 
-        if day_pct is not None and current and day_pct != -100:
-            # Rupee move today = current value minus yesterday's implied value.
-            day_pnl_total += current - (current / (1 + day_pct / 100.0))
-            day_pnl_known = True
+    # Sort by rupee value where known, otherwise push to the end.
+    holdings.sort(key=lambda h: (h.current_inr if h.current_inr is not None else -1),
+                  reverse=True)
 
-    holdings.sort(key=lambda h: h.current, reverse=True)
+    # -- per-book subtotals -------------------------------------------------
+    books: Dict[str, BookTotals] = {}
+    for book in (BOOK_IND, BOOK_US):
+        rows = [h for h in holdings if h.book == book]
+        if not rows:
+            continue
+        costed = [h for h in rows if h.has_cost_basis]
+        invested_native = sum(h.invested_native or 0.0 for h in costed) or None
+        costed_current = sum(h.current_native for h in costed) if costed else None
+        pnl_native = (costed_current - invested_native
+                      if (invested_native and costed_current is not None) else None)
+        books[book] = BookTotals(
+            book=book,
+            currency=rows[0].currency,
+            invested=invested_native,
+            current=sum(h.current_native for h in rows),
+            costed_current=costed_current,
+            pnl=pnl_native,
+            pnl_pct=(pnl_native / invested_native * 100.0)
+                    if (pnl_native is not None and invested_native) else None,
+            current_inr=(sum(h.current_inr for h in rows if h.current_inr is not None)
+                         if any(h.current_inr is not None for h in rows) else None),
+            invested_inr=(sum(h.invested_inr for h in costed if h.invested_inr is not None)
+                          if any(h.invested_inr is not None for h in costed) else None),
+            pnl_inr=(sum(h.pnl_inr for h in costed if h.pnl_inr is not None)
+                     if any(h.pnl_inr is not None for h in costed) else None),
+            count=len(rows),
+            uncosted_count=len(rows) - len(costed),
+        )
 
-    total_invested = sum(h.invested for h in holdings)
-    total_current = sum(h.current for h in holdings)
-    total_pnl = total_current - total_invested
+    # -- combined rupee totals ---------------------------------------------
+    convertible = [h for h in holdings if h.current_inr is not None]
+    costed_inr = [h for h in convertible if h.has_cost_basis and h.invested_inr is not None]
+
+    total_invested = sum(h.invested_inr or 0.0 for h in costed_inr)
+    costed_current = sum(h.current_inr or 0.0 for h in costed_inr)
+    total_current = sum(h.current_inr or 0.0 for h in convertible)
+    # Invariant: this equals sum(h.pnl_inr) over the costed set, exactly.
+    total_pnl = costed_current - total_invested
     total_pnl_pct = (total_pnl / total_invested * 100.0) if total_invested else 0.0
 
-    by_pct = sorted(holdings, key=lambda h: h.pnl_pct, reverse=True)
-    winners = [h for h in by_pct if h.pnl > 0][:3]
-    losers = [h for h in reversed(by_pct) if h.pnl < 0][:3]
-    top_by_value = holdings[:3]
-    concentration = (holdings[0].current / total_current * 100.0) if holdings and total_current else 0.0
+    excluded = [h for h in holdings if h.current_inr is None]
+    if excluded:
+        excluded_value_inr = 0.0
+        data_quality.append(
+            "No USD/INR rate was available, so "
+            + ", ".join(sorted(h.symbol for h in excluded))
+            + " are reported in dollars only and are not part of the combined rupee total. "
+              "Set portfolio.usd_inr_rate in config.json to include them."
+        )
 
-    # Arithmetic self-check. This assertion is the guarantee that nothing in the
-    # report can contradict anything else in the report.
-    residual = abs(sum(h.pnl for h in holdings) - total_pnl)
+    for holding in holdings:
+        if holding.day_pct is not None and holding.current_inr and holding.day_pct != -100:
+            day_pnl_total += holding.current_inr - (holding.current_inr / (1 + holding.day_pct / 100.0))
+            day_pnl_known = True
+
+    by_pct = sorted((h for h in holdings if h.pnl_pct is not None),
+                    key=lambda h: h.pnl_pct, reverse=True)
+    winners = [h for h in by_pct if (h.pnl_native or 0) > 0][:3]
+    losers = [h for h in reversed(by_pct) if (h.pnl_native or 0) < 0][:3]
+    top_by_value = convertible[:3] or holdings[:3]
+    concentration = ((convertible[0].current_inr / total_current * 100.0)
+                     if convertible and total_current else 0.0)
+
+    if uncosted:
+        data_quality.append(
+            "No cost basis was shared for " + ", ".join(sorted(set(uncosted)))
+            + ", so their return figures are shown as unavailable rather than estimated. "
+              "INDmoney does not pass through the original invested amount for holdings "
+              "imported from a linked broker."
+        )
+
+    residual = abs(sum(h.pnl_inr or 0.0 for h in costed_inr) - total_pnl)
     if residual > 0.01:
         data_quality.append(f"Internal arithmetic residual of Rs{residual:.2f} detected.")
 
@@ -260,16 +377,21 @@ def build_fact_sheet(holdings_raw: List[dict], *, mismatch_tolerance_pct: float 
         losers=losers,
         top_by_value=top_by_value,
         concentration_pct=concentration,
-        profitable_count=sum(1 for h in holdings if h.pnl > 0),
-        losing_count=sum(1 for h in holdings if h.pnl < 0),
+        profitable_count=sum(1 for h in holdings if (h.pnl_native or 0) > 0),
+        losing_count=sum(1 for h in holdings if (h.pnl_native or 0) < 0),
         data_quality=data_quality,
+        books=books,
+        usd_inr=usd_inr,
+        fx_source=fx_source,
+        uncosted=sorted(set(uncosted)),
+        excluded_value_inr=excluded_value_inr,
     )
 
 
 def render_fact_block(fs: FactSheet) -> str:
     """The compact, unambiguous fact block given to the LLM.
 
-    Deliberately small: a 1.5B model handed fifteen rows of numbers starts
+    Deliberately small: a 1.5B model handed twenty rows of numbers starts
     blending tickers together. It gets pre-chewed conclusions instead, and is
     forbidden from doing any arithmetic of its own.
     """
@@ -287,4 +409,16 @@ def render_fact_block(fs: FactSheet) -> str:
         f"Best performers: {names(fs.winners)}",
         f"Worst performers: {names(fs.losers)}",
     ]
+
+    india = fs.books.get(BOOK_IND)
+    us = fs.books.get(BOOK_US)
+    if india and us:
+        lines.append(f"Indian holdings: {india.count} worth Rs {india.current:,.0f}")
+        if us.current_inr is not None:
+            lines.append(f"US holdings: {us.count} worth USD {us.current:,.0f} "
+                         f"(Rs {us.current_inr:,.0f})")
+        else:
+            lines.append(f"US holdings: {us.count} worth USD {us.current:,.0f}")
+    if fs.uncosted:
+        lines.append("No cost basis available for: " + ", ".join(fs.uncosted))
     return "\n".join(lines)

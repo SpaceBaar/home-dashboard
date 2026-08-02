@@ -74,10 +74,19 @@ class FakeArticle:
         self.symbol, self.title, self.source, self.link = symbol, title, source, link
 
 
-def make_reports(report_dir: Path, days: int = 4) -> Tuple[List[str], str]:
+def make_reports(report_dir: Path, days: int = 4, *, with_us: bool = True) -> Tuple[List[str], str]:
     """Write ``days`` JSON+markdown reports, plus one legacy markdown-only one."""
     report_dir.mkdir(parents=True, exist_ok=True)
     holdings = extract_holdings_json((FIXTURES / "holdings.json").read_text(encoding="utf-8"))
+
+    # A US book from INDmoney, including one row with no cost basis.
+    us_rows: List[dict] = []
+    if with_us:
+        import brokers
+        shapes = json.loads((FIXTURES / "indmoney_us_shapes.json").read_text(encoding="utf-8"))
+        for key in ("shape_a_snake_case_usd", "shape_c_unknown_cost_basis"):
+            rows, _ = brokers.normalise_indmoney_rows(brokers.extract_rows(shapes[key]) or [])
+            us_rows.extend(rows)
 
     grouped = {
         "TATAPOWER": [
@@ -88,13 +97,17 @@ def make_reports(report_dir: Path, days: int = 4) -> Tuple[List[str], str]:
         ],
         "SBIN": [FakeArticle("SBIN", "SBI reports Q1 earnings", "NDTV Profit",
                              "https://example.com/c")],
+        # AAPL is held via the US book; NFLX is watchlist-only.
         "AAPL": [FakeArticle("AAPL", "Apple warns of a supply crunch", "Livemint",
                              "https://example.com/d")],
+        "NFLX": [FakeArticle("NFLX", "Netflix raises subscriber guidance", "Reuters",
+                             "https://example.com/f")],
         "SPICEJET": [FakeArticle("SPICEJET", "SpiceJet grounds three aircraft", "ET",
                                  "https://example.com/e")],
     }
     scores = [FakeScore("TATAPOWER", 7), FakeScore("SBIN", 5),
               FakeScore("AAPL", 3, confidence="low"),
+              FakeScore("NFLX", 8),
               FakeScore("SPICEJET", None, reason="", confidence="unscored",
                         method="all-attempts-failed")]
 
@@ -109,7 +122,8 @@ def make_reports(report_dir: Path, days: int = 4) -> Tuple[List[str], str]:
             if isinstance(item.get("last_price"), (int, float)):
                 item["last_price"] = round(item["last_price"] * (1 + 0.011 * offset), 2)
 
-        fs = build_fact_sheet(scaled)
+        fs = build_fact_sheet(scaled + us_rows, usd_inr=88.0 if with_us else None,
+                              fx_source="configured (88.00)" if with_us else "")
         held = {h.symbol for h in fs.holdings}
         narrative = report_mod.deterministic_narrative(fs, scores, held)
         payload = report_mod.build_payload(
@@ -117,6 +131,8 @@ def make_reports(report_dir: Path, days: int = 4) -> Tuple[List[str], str]:
             held=held, model="fake-model:1.5b",
             feed_stats={"feeds_total": 6, "feeds_ok": 6, "feeds_failed": [],
                         "entries_seen": 240, "articles_matched": 5},
+            broker_sentiment={"AAPL": {"sentiment": 7.0,
+                                       "sentiment_note": "label 'positive'"}},
             generated_at=stamp,
         )
         report_mod.write_payload(payload, report_dir)
@@ -184,16 +200,26 @@ def test_payload_shape(dates: List[str]) -> None:
     payload = web.load_payload(dates[-1])
     totals = payload["totals"]
 
-    residual = abs(sum(h["pnl"] for h in payload["holdings"]) - totals["pnl"])
-    check(residual < 0.5, f"per-holding P&L still sums to the total (residual {residual:.2f})")
-    check(abs(totals["current"] - totals["invested"] - totals["pnl"]) < 0.5,
-          "current - invested equals P&L in the payload")
+    # Sum the RUPEE column, and only over rows that have a cost basis - mixing
+    # the native 'pnl' across currencies would be meaningless.
+    costed = [h for h in payload["holdings"] if h.get("pnl_inr") is not None]
+    residual = abs(sum(h["pnl_inr"] for h in costed) - totals["pnl"])
+    check(residual < 0.5, f"per-holding rupee P&L sums to the total (residual {residual:.2f})")
+    check(any(h.get("pnl") is None for h in payload["holdings"]),
+          "an uncosted holding serialises P&L as null, not 0")
     check(totals["holdings_count"] == len(payload["holdings"]),
           "the holdings count matches the holdings array")
+    check(payload["fx"]["usd_inr"] == 88.0 and set(payload["books"]) == {"IND", "US"},
+          "the payload carries the FX rate and both book subtotals")
+    check(sorted(payload["uncosted"]) == ["AMZN", "MSFT"],
+          f"uncosted holdings are listed: {payload['uncosted']}")
 
     news = payload["news"]
-    check(news["AAPL"]["held"] is False, "AAPL is marked as watchlist, not held")
-    check(news["SPICEJET"]["held"] is True, "SPICEJET is marked as held")
+    check(news["NFLX"]["held"] is False, "NFLX is marked as watchlist, not held")
+    check(news["AAPL"]["held"] is True and news["AAPL"]["book"] == "US",
+          "AAPL is held via the US book and tagged accordingly")
+    check(news["SPICEJET"]["held"] is True and news["SPICEJET"]["book"] == "IND",
+          "SPICEJET is marked as held in the India book")
     check(news["SPICEJET"]["score"] is None and news["SPICEJET"]["label"] == "unscored",
           "an unrated stock is explicitly null rather than a guessed number")
     check(len(news["TATAPOWER"]["articles"]) == 2 and
@@ -303,6 +329,24 @@ def test_http(dates: List[str], legacy_date: str) -> None:
         check("news-card" in body and "Watchlist" in body,
               "news cards render with a watchlist section")
         check("n/a" in body, "the unrated stock shows n/a rather than a number")
+
+        # -- the two-book view ------------------------------------------
+        check("Books" in body and "book-tile" in body,
+              "the books summary card renders when both books are present")
+        check("India" in body and ">US<" in body.replace(" ", "") or "US" in body,
+              "both books are labelled")
+        check("Value (₹)" in body,
+              "the US table carries a rupee column alongside dollar figures")
+        check("$" in body and "₹" in body,
+              "dollars and rupees both appear, each in its own book")
+        check("USD/INR 88.00" in body or "88.00" in body,
+              "the FX rate used is disclosed in the browser")
+        check("without cost basis" in body,
+              "the US book flags holdings with no cost basis")
+        check("INDmoney 7.0/10" in body,
+              "INDmoney's own sentiment sits beside our score rather than replacing it")
+        check(body.count("class=\"holdings sortable\"") == 2,
+              "each book gets its own sortable table")
 
         status, body, _ = get(f"/r/{legacy_date}")
         check(status == 200 and "Legacy report" in body,

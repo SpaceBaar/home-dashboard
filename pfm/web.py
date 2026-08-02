@@ -337,6 +337,112 @@ def page(title: str, body: str, *, active_date: Optional[str], index: List[dict]
 </html>"""
 
 
+_CCY_SYMBOL = {"INR": "₹", "USD": "$"}
+_BOOK_LABEL = {"IND": "India", "US": "US"}
+
+
+def money(value: Optional[float], currency: str = "INR", *,
+          signed: bool = False, decimals: int = 0) -> str:
+    """Format in the holding's own currency. An em dash when the figure is absent."""
+    if value is None:
+        return "—"
+    unit = _CCY_SYMBOL.get(currency, currency + " ")
+    sign = "+" if signed and value >= 0 else ("-" if signed and value < 0 else "")
+    return f"{sign}{unit}{abs(value):,.{decimals}f}"
+
+
+def render_holdings_table(rows: List[dict], book: str, totals: Optional[dict]) -> str:
+    if not rows:
+        return ""
+    currency = rows[0].get("currency", "INR")
+    is_us = book == "US"
+
+    cells = []
+    for h in rows:
+        flags = "".join(
+            f'<span class="flag" title="{html.escape(f, quote=True)}">!</span>'
+            for f in h.get("flags", [])
+        )
+        # A holding with no cost basis shows an em dash, never a zero.
+        inr_cell = (f'<td data-sort="{h.get("current_inr") or 0}">'
+                    f'{money(h.get("current_inr"), "INR")}</td>') if is_us else ""
+        cells.append(f"""<tr>
+<td class="sym">{html.escape(h["symbol"])}{flags}</td>
+<td data-sort="{h["quantity"]}">{h["quantity"]:g}</td>
+<td data-sort="{h.get("avg_price") or 0}">{money(h.get("avg_price"), currency, decimals=2)}</td>
+<td data-sort="{h.get("ltp") or 0}">{money(h.get("ltp"), currency, decimals=2)}</td>
+<td data-sort="{h.get("invested") or 0}">{money(h.get("invested"), currency)}</td>
+<td data-sort="{h.get("current") or 0}">{money(h.get("current"), currency)}</td>
+<td data-sort="{h.get("pnl") or 0}" class="{tone(h.get("pnl"))}">{money(h.get("pnl"), currency, signed=True)}</td>
+<td data-sort="{h.get("pnl_pct") or 0}" class="{tone(h.get("pnl_pct"))}">{percent(h.get("pnl_pct"))}</td>
+<td data-sort="{h.get("day_pct") or 0}" class="{tone(h.get("day_pct"))}">{percent(h.get("day_pct"), decimals=2)}</td>
+{inr_cell}</tr>""")
+
+    foot = ""
+    if totals:
+        foot_inr = f'<td>{money(totals.get("current_inr"), "INR")}</td>' if is_us else ""
+        foot = f"""<tfoot><tr>
+<td>Total</td><td></td><td></td><td></td>
+<td>{money(totals.get("invested"), currency)}</td>
+<td>{money(totals.get("current"), currency)}</td>
+<td class="{tone(totals.get("pnl"))}">{money(totals.get("pnl"), currency, signed=True)}</td>
+<td class="{tone(totals.get("pnl_pct"))}">{percent(totals.get("pnl_pct"))}</td>
+<td></td>{foot_inr}</tr></tfoot>"""
+
+    inr_head = "<th>Value (₹)</th>" if is_us else ""
+    return f"""<div class="table-wrap">
+<table class="holdings sortable">
+<thead><tr>
+<th data-type="text">Symbol</th><th>Qty</th><th>Avg</th><th>LTP</th>
+<th>Invested</th><th>Value</th><th>P&amp;L</th><th>P&amp;L %</th><th>Today</th>{inr_head}
+</tr></thead>
+<tbody>{"".join(cells)}</tbody>
+{foot}
+</table></div>"""
+
+
+def render_books_card(payload: dict) -> str:
+    """Side-by-side book summary, shown only when there is more than one book."""
+    books = payload.get("books") or {}
+    if len(books) < 2:
+        return ""
+    fx = payload.get("fx") or {}
+    tiles = []
+    for key in ("IND", "US"):
+        totals = books.get(key)
+        if not totals:
+            continue
+        currency = totals.get("currency", "INR")
+        extra = ""
+        if key == "US" and totals.get("current_inr") is not None:
+            extra = f'<span class="book-inr">{money(totals["current_inr"], "INR")}</span>'
+        uncosted = totals.get("uncosted_count") or 0
+        # Say plainly that invested and P&L cover a subset, so the three numbers
+        # in this tile are not expected to subtract to each other.
+        note = (f'<span class="pill none" title="Invested and P&amp;L cover only the '
+                f'holdings whose cost basis the broker shared, so they will not equal '
+                f'Value minus Invested.">{uncosted} without cost basis</span>'
+                if uncosted else "")
+        tiles.append(f"""<div class="book-tile">
+<div class="book-head"><h3>{_BOOK_LABEL.get(key, key)}</h3>
+<span class="pill {tone(totals.get("pnl"))}">{percent(totals.get("pnl_pct"))}</span></div>
+<p class="book-value">{money(totals.get("current"), currency)}{extra}</p>
+<p class="book-meta">{totals.get("count", 0)} holdings ·
+invested {money(totals.get("invested"), currency)} ·
+P&amp;L {money(totals.get("pnl"), currency, signed=True)}</p>
+{note}</div>""")
+
+    fx_line = ""
+    if fx.get("usd_inr"):
+        fx_line = (f'<p class="subtle">Combined rupee figures use USD/INR '
+                   f'{fx["usd_inr"]:,.2f} — {html.escape(str(fx.get("source", "")))}.</p>')
+    else:
+        fx_line = ('<p class="subtle">No USD/INR rate was available, so the US book is '
+                   'shown in dollars only and is not included in the combined total.</p>')
+    return (f'<section class="card"><h2>Books</h2>'
+            f'<div class="book-grid">{"".join(tiles)}</div>{fx_line}</section>')
+
+
 def render_report_page(payload: dict) -> str:
     totals = payload.get("totals", {})
     date = payload.get("date", "")
@@ -352,7 +458,9 @@ def render_report_page(payload: dict) -> str:
         stat("Current value", rupees(totals.get("current"))),
         stat("Overall P&amp;L",
              f'{rupees(totals.get("pnl"), signed=True)} '
-             f'<small>{percent(totals.get("pnl_pct"))}</small>',
+             f'<small>{percent(totals.get("pnl_pct"))}'
+             + (" · costed only" if payload.get("uncosted") else "")
+             + "</small>",
              tone(totals.get("pnl"))),
     ]
     if totals.get("day_pnl") is not None:
@@ -368,39 +476,25 @@ def render_report_page(payload: dict) -> str:
                           f'<small>{percent(totals.get("concentration_pct"), signed=False)} '
                           f'of value</small>'))
 
-    # --- holdings table (sortable; data-sort carries the raw numeric value) ---
-    rows = []
-    for h in payload.get("holdings", []):
-        flags = ("".join(f'<span class="flag" title="{html.escape(f, quote=True)}">!</span>'
-                         for f in h.get("flags", [])))
-        rows.append(f"""<tr>
-<td class="sym">{html.escape(h["symbol"])}{flags}</td>
-<td data-sort="{h["quantity"]}">{h["quantity"]:g}</td>
-<td data-sort="{h["avg_price"]}">{h["avg_price"]:,.2f}</td>
-<td data-sort="{h["ltp"]}">{h["ltp"]:,.2f}</td>
-<td data-sort="{h["invested"]}">{rupees(h["invested"])}</td>
-<td data-sort="{h["current"]}">{rupees(h["current"])}</td>
-<td data-sort="{h["pnl"]}" class="{tone(h["pnl"])}">{rupees(h["pnl"], signed=True)}</td>
-<td data-sort="{h["pnl_pct"]}" class="{tone(h["pnl_pct"])}">{percent(h["pnl_pct"])}</td>
-<td data-sort="{h["day_pct"] if h["day_pct"] is not None else 0}" class="{tone(h["day_pct"])}">{percent(h["day_pct"], decimals=2)}</td>
-</tr>""")
-
-    holdings_table = f"""<div class="table-wrap">
-<table class="holdings sortable">
-<thead><tr>
-<th data-type="text">Symbol</th><th>Qty</th><th>Avg</th><th>LTP</th>
-<th>Invested</th><th>Value</th><th>P&amp;L</th><th>P&amp;L %</th><th>Today</th>
-</tr></thead>
-<tbody>{"".join(rows)}</tbody>
-<tfoot><tr>
-<td>Total</td><td></td><td></td><td></td>
-<td>{rupees(totals.get("invested"))}</td>
-<td>{rupees(totals.get("current"))}</td>
-<td class="{tone(totals.get("pnl"))}">{rupees(totals.get("pnl"), signed=True)}</td>
-<td class="{tone(totals.get("pnl"))}">{percent(totals.get("pnl_pct"))}</td>
-<td></td>
-</tr></tfoot>
-</table></div>""" if rows else '<p class="empty">No holdings in this report.</p>'
+    # --- holdings, split by book (sortable; data-sort carries raw numerics) ---
+    all_rows = payload.get("holdings", [])
+    books = payload.get("books") or {}
+    if not all_rows:
+        holdings_table = '<p class="empty">No holdings in this report.</p>'
+    elif len(books) > 1:
+        parts = []
+        for key in ("IND", "US"):
+            rows = [h for h in all_rows if h.get("book", "IND") == key]
+            if not rows:
+                continue
+            currency = rows[0].get("currency", "INR")
+            parts.append(f'<h3 class="subhead">{_BOOK_LABEL.get(key, key)} '
+                         f'<span class="pill none">{currency}</span></h3>'
+                         + render_holdings_table(rows, key, books.get(key)))
+        holdings_table = "".join(parts)
+    else:
+        only = next(iter(books), "IND")
+        holdings_table = render_holdings_table(all_rows, only, books.get(only))
 
     # --- news, held first then watchlist ---
     def news_card(symbol: str, item: dict) -> str:
@@ -410,6 +504,17 @@ def render_report_page(payload: dict) -> str:
         label = html.escape(str(item.get("label", "")))
         conf = html.escape(str(item.get("confidence", "")))
         reason = html.escape(str(item.get("reason") or ""))
+        # INDmoney's own sentiment, when it supplied one, shown next to ours
+        # rather than blended into it.
+        broker = item.get("broker_sentiment")
+        broker_badge = ""
+        if broker is not None:
+            note = html.escape(str(item.get("broker_sentiment_note") or ""))
+            gap = abs(float(broker) - score) if score is not None else 0.0
+            cls = "down" if gap >= 3.0 else "none"
+            broker_badge = (f'<span class="pill {cls}" title="INDmoney sentiment'
+                            f'{" — " + note if note else ""}">INDmoney '
+                            f'{float(broker):.1f}/10</span>')
         links = "".join(
             f'<li><a href="{html.escape(a["link"], quote=True)}" target="_blank" '
             f'rel="noopener noreferrer">{html.escape(a["title"])}</a>'
@@ -421,7 +526,8 @@ def render_report_page(payload: dict) -> str:
         count = item.get("headline_count", 0)
         return f"""<article class="news-card">
 <header>{badge}<div><h4>{html.escape(symbol)}</h4>
-<p class="news-meta">{label} · {count} article{"s" if count != 1 else ""} · confidence {conf}</p></div></header>
+<p class="news-meta">{label} · {count} article{"s" if count != 1 else ""} · confidence {conf}</p>
+{broker_badge}</div></header>
 {f'<p class="news-reason">{reason}</p>' if reason else ''}
 <ul class="news-links">{links}</ul>
 </article>"""
@@ -464,6 +570,8 @@ def render_report_page(payload: dict) -> str:
 </div>
 
 <section class="card"><div class="stats">{"".join(stats)}</div></section>
+
+{render_books_card(payload)}
 
 <section class="card"><h2>Holdings</h2>
 <p class="hint">Click a column heading to sort.</p>

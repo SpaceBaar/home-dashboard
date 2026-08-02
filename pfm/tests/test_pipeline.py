@@ -358,7 +358,8 @@ def test_end_to_end(fs, grouped, tmp_dir: Path):
     check("Watchlist (not held)" in content,
           "watchlist stocks are labelled as not held")
     check(f"{fs.total_current:,.2f}" in content, "the computed current value appears verbatim")
-    check(content.count("| **Total**") == 1, "the holdings table carries a reconciling total row")
+    check("**India total**" in content and "**Combined (Rs):**" in content,
+          "the holdings table carries a reconciling total row")
     check("## Data quality" in content, "a data-quality section is always present")
     for symbol in grouped:
         check(f"#### {symbol}" in content, f"news block rendered for {symbol}")

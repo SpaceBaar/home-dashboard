@@ -1,0 +1,164 @@
+{
+  "_note": "Plausible INDmoney networth_holdings response shapes. INDmoney publishes no field-level schema, so the normaliser is tested against several namings rather than one guess. Replace these with real captures from tools/probe_indmoney.py once available.",
+
+  "shape_a_snake_case_usd": {
+    "data": [
+      {
+        "symbol": "AAPL",
+        "name": "Apple Inc",
+        "asset_class": "US_STOCK",
+        "currency": "USD",
+        "quantity": 12,
+        "average_price": 180.5,
+        "last_price": 214.25,
+        "invested_amount": 2166.0,
+        "current_value": 2571.0,
+        "pnl": 405.0,
+        "pnl_percentage": 18.7,
+        "day_change_percentage": 0.94,
+        "xirr": 21.4,
+        "broker": "INDmoney"
+      },
+      {
+        "symbol": "TSLA",
+        "name": "Tesla Inc",
+        "asset_class": "US_STOCK",
+        "currency": "USD",
+        "quantity": 5,
+        "average_price": 240.0,
+        "last_price": 198.4,
+        "invested_amount": 1200.0,
+        "current_value": 992.0,
+        "pnl": -208.0,
+        "pnl_percentage": -17.33,
+        "day_change_percentage": -1.42
+      }
+    ]
+  },
+
+  "shape_b_camel_units_nested": {
+    "holdings": [
+      {
+        "ticker": "NVDA",
+        "displayName": "NVIDIA Corporation",
+        "assetType": "US_STOCKS",
+        "quote": { "unitPrice": 121.4, "changePercent": 2.11, "currencyCode": "USD" },
+        "units": 20,
+        "avgBuyPrice": 95.0,
+        "marketValue": 2428.0,
+        "investedValue": 1900.0
+      }
+    ]
+  },
+
+  "shape_c_unknown_cost_basis": {
+    "rows": [
+      {
+        "symbol": "MSFT",
+        "asset_class": "US_STOCK",
+        "currency": "USD",
+        "units": 4,
+        "unit_price": 430.1,
+        "current_value": 1720.4,
+        "invested_amount": "unknown",
+        "broker": "Vested",
+        "_note": "INDmoney documents that broker-imported rows may omit cost basis"
+      },
+      {
+        "symbol": "AMZN",
+        "asset_class": "US_STOCK",
+        "currency": "USD",
+        "units": 3,
+        "unit_price": 201.0,
+        "current_value": 603.0,
+        "invested_amount": null
+      }
+    ]
+  },
+
+  "shape_d_formatted_strings": {
+    "positions": [
+      {
+        "scrip": "GOOGL",
+        "asset_type": "US_STOCK",
+        "quantity": "8",
+        "avg_price": "$142.30",
+        "market_price": "$168.90",
+        "invested": "$1,138.40",
+        "market_value": "$1,351.20",
+        "change_percent": "+0.62%",
+        "trade_currency": "USD"
+      }
+    ]
+  },
+
+  "shape_e_mixed_books": {
+    "data": [
+      {
+        "symbol": "META",
+        "asset_class": "US_STOCK",
+        "currency": "USD",
+        "units": 2,
+        "unit_price": 600.0,
+        "invested_amount": 900.0,
+        "current_value": 1200.0
+      },
+      {
+        "symbol": "RELIANCE",
+        "asset_class": "IND_STOCK",
+        "currency": "INR",
+        "units": 10,
+        "unit_price": 1400.0,
+        "invested_amount": 12000.0,
+        "current_value": 14000.0
+      }
+    ]
+  },
+
+  "shape_f_unusable": {
+    "data": [
+      { "some_id": 4412, "note": "no symbol, no value, nothing usable" }
+    ]
+  },
+
+  "us_details_with_news": {
+    "data": [
+      {
+        "symbol": "AAPL",
+        "price": 214.25,
+        "market_cap": 3250000000000,
+        "sentiment": "positive",
+        "news": [
+          {
+            "title": "Apple warns iPhone and Mac sales face a supply crunch",
+            "source": "Reuters",
+            "url": "https://example.com/aapl-supply"
+          },
+          {
+            "headline": "Apple rides rising Mac demand to sustain India growth",
+            "publisher": "Livemint",
+            "link": "https://example.com/aapl-india"
+          }
+        ]
+      },
+      {
+        "symbol": "TSLA",
+        "price": 198.4,
+        "sentiment_score": -0.6,
+        "news_items": [
+          {
+            "title": "Musk rejects report of Tesla China business split",
+            "source": "Bloomberg",
+            "url": "https://example.com/tsla-china"
+          }
+        ]
+      },
+      {
+        "symbol": "NVDA",
+        "price": 121.4,
+        "sentiment": 8.5,
+        "news": []
+      }
+    ]
+  }
+}

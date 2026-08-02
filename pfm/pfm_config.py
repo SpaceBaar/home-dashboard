@@ -61,7 +61,8 @@ DEFAULTS: Dict[str, Any] = {
     },
     "web": {"host": "0.0.0.0", "port": 7373},
     "narrative": {"enabled": True, "max_attempts": 2},
-    "portfolio": {"pnl_mismatch_tolerance_pct": 1.0},
+    "portfolio": {"pnl_mismatch_tolerance_pct": 1.0, "usd_inr_rate": None},
+    "indmoney": {"enabled": True, "mcp_url": "https://mcp.indmoney.com/mcp"},
     "tracking": {"keywords": {}, "exclude_phrases": {}, "watchlist": []},
     "news_sources": [],
 }
@@ -150,6 +151,11 @@ class Config:
     @property
     def kite_mcp_url(self) -> str:
         return os.getenv("KITE_MCP_URL", "https://mcp.kite.trade/mcp")
+
+    @property
+    def indmoney_mcp_url(self) -> str:
+        configured = (self.raw.get("indmoney", {}) or {}).get("mcp_url")
+        return os.getenv("INDMONEY_MCP_URL") or configured or "https://mcp.indmoney.com/mcp"
 
 
 def _migrate_legacy(raw: Dict[str, Any]) -> Dict[str, Any]:

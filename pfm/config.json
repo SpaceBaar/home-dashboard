@@ -47,7 +47,15 @@
   "portfolio": {
     "india_broker": "zerodha",
     "us_broker": "indmoney",
-    "pnl_mismatch_tolerance_pct": 1.0
+    "pnl_mismatch_tolerance_pct": 1.0,
+    "usd_inr_rate": null,
+    "_note": "usd_inr_rate converts the US book into the combined rupee total. Leave null and the US book is reported in dollars only rather than converted at an assumed rate."
+  },
+
+  "indmoney": {
+    "enabled": true,
+    "mcp_url": "https://mcp.indmoney.com/mcp",
+    "_note": "Read-only MCP server for the US book. OAuth 2.1 + PKCE, handled by mcp-remote; sign in once with 'python tools/probe_indmoney.py --list-only' and the token is cached under ~/.mcp-auth. Set enabled to false, or pass --no-us, to report Indian holdings only."
   },
 
   "tracking": {

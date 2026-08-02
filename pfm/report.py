@@ -24,8 +24,33 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from brokers import BOOK_IND, BOOK_US
 from llm import LLMClient, StockScore
-from portfolio import FactSheet, render_fact_block
+from portfolio import BookTotals, FactSheet, Holding, render_fact_block
+
+_CCY = {"INR": "Rs", "USD": "$"}
+
+
+# Small formatters. Every one renders an em dash for None, so a figure the broker
+# did not supply can never appear as a zero.
+def _money(value: Optional[float], unit: str, *, signed: bool = False) -> str:
+    if value is None:
+        return "—"
+    sign = "+" if signed and value >= 0 else ("-" if signed and value < 0 else "")
+    return f"{sign}{unit}{abs(value):,.0f}"
+
+
+def _pct(value: Optional[float], *, decimals: int = 1) -> str:
+    return "—" if value is None else f"{value:+.{decimals}f}%"
+
+
+def _plain(value: Optional[float]) -> str:
+    return "—" if value is None else f"{value:,.2f}"
+
+
+def _round(value: Optional[float], places: int = 2) -> Optional[float]:
+    """Round for the JSON payload while preserving None as null."""
+    return None if value is None else round(float(value), places)
 
 log = logging.getLogger("pfm.report")
 
@@ -93,15 +118,19 @@ def build_allowed_numbers(fs: FactSheet, scores: Sequence[StockScore]) -> Set[fl
     for base in (fs.total_invested, fs.total_current, abs(fs.total_pnl)):
         add(base / 100_000.0)
         add(base / 10_000_000.0)
+    add(fs.usd_inr)
+    for totals in fs.books.values():
+        for value in (totals.invested, totals.current, totals.costed_current,
+                      totals.pnl, totals.pnl_pct, totals.current_inr,
+                      totals.invested_inr, totals.pnl_inr, float(totals.count)):
+            add(value)
     for holding in fs.holdings:
-        add(holding.pnl)
-        add(holding.pnl_pct)
-        add(holding.day_pct)
-        add(holding.invested)
-        add(holding.current)
-        add(holding.quantity)
-        add(holding.avg_price)
-        add(holding.ltp)
+        # Both the rupee view and the holding's own currency are quotable.
+        for value in (holding.pnl, holding.pnl_pct, holding.day_pct,
+                      holding.invested, holding.current, holding.quantity,
+                      holding.avg_price, holding.ltp, holding.pnl_native,
+                      holding.invested_native, holding.current_native):
+            add(value)
     for score in scores:
         add(float(score.score) if score.score is not None else None)
         add(float(score.headline_count))
@@ -221,6 +250,8 @@ Hard rules:
 - Use ONLY the numbers that appear in the DATA block. Copy them exactly.
 - Do NOT add, subtract, average or otherwise calculate anything.
 - If the DATA block says a stock was not rated, say it was not rated.
+- If the DATA block says a cost basis is unavailable for some holdings, do not
+  present the invested figure as covering the whole portfolio.
 - Write exactly two short paragraphs. No headings, no bullet points, no lists.
 - Paragraph 1: overall portfolio position, and which holdings did best and worst.
 - Paragraph 2: what the news ratings say, and which stocks they concern.
@@ -244,14 +275,35 @@ def deterministic_narrative(fs: FactSheet, scores: Sequence[StockScore], held: S
     direction = "above" if fs.total_pnl >= 0 else "below"
     top = fs.top_by_value[0].symbol if fs.top_by_value else "n/a"
 
+    costed_count = sum(1 for h in fs.holdings if h.has_cost_basis)
+    if costed_count == len(fs.holdings):
+        opening = (f"The portfolio is worth Rs {fs.total_current:,.0f} against "
+                   f"Rs {fs.total_invested:,.0f} invested, leaving it "
+                   f"Rs {abs(fs.total_pnl):,.0f} {direction} cost ({fs.total_pnl_pct:+.1f}%).")
+    else:
+        # Do not put value and invested side by side when they cover different
+        # sets of holdings - that reads as an arithmetic error.
+        opening = (f"The portfolio is worth Rs {fs.total_current:,.0f}. Cost basis is "
+                   f"available for {costed_count} of {len(fs.holdings)} holdings, and "
+                   f"across those the position is Rs {abs(fs.total_pnl):,.0f} {direction} "
+                   f"an invested Rs {fs.total_invested:,.0f} ({fs.total_pnl_pct:+.1f}%).")
+
     para1 = (
-        f"The portfolio is worth Rs {fs.total_current:,.0f} against Rs {fs.total_invested:,.0f} "
-        f"invested, leaving it Rs {abs(fs.total_pnl):,.0f} {direction} cost "
-        f"({fs.total_pnl_pct:+.1f}%). Of {len(fs.holdings)} holdings, {fs.profitable_count} "
+        f"{opening} Of {len(fs.holdings)} holdings, {fs.profitable_count} "
         f"are in profit and {fs.losing_count} are in loss. The strongest performers are "
         f"{listing(fs.winners)}, and the weakest are {listing(fs.losers)}. "
         f"{top} is the largest single position at {fs.concentration_pct:.0f}% of portfolio value."
     )
+
+    india, us = fs.books.get(BOOK_IND), fs.books.get(BOOK_US)
+    if india and us:
+        us_inr = (f" (Rs {us.current_inr:,.0f})" if us.current_inr is not None else "")
+        para1 += (f" The book splits into {india.count} Indian holdings worth "
+                  f"Rs {india.current:,.0f} and {us.count} US holdings worth "
+                  f"USD {us.current:,.0f}{us_inr}.")
+        if us.uncosted_count:
+            para1 += (f" {us.uncosted_count} of the US holdings arrived without a cost "
+                      f"basis, so their returns are not shown.")
 
     rated = [s for s in scores if s.score is not None]
     unrated = [s for s in scores if s.score is None]
@@ -358,9 +410,11 @@ def render_report(
         "",
         "| Metric | Value |",
         "| --- | --- |",
-        f"| Invested | Rs {fs.total_invested:,.2f} |",
+        f"| Invested | Rs {fs.total_invested:,.2f}"
+        + (" _(costed holdings only)_" if fs.uncosted else "") + " |",
         f"| Current value | Rs {fs.total_current:,.2f} |",
-        f"| Overall P&L | Rs {fs.total_pnl:+,.2f} ({fs.total_pnl_pct:+.2f}%) |",
+        f"| Overall P&L | Rs {fs.total_pnl:+,.2f} ({fs.total_pnl_pct:+.2f}%)"
+        + (" _(costed holdings only)_" if fs.uncosted else "") + " |",
     ]
     if fs.day_pnl is not None:
         lines.append(f"| Change today | Rs {fs.day_pnl:+,.2f} |")
@@ -369,22 +423,77 @@ def render_report(
         f"{fs.losing_count} in loss) |",
         f"| Largest position | {fs.top_by_value[0].symbol if fs.top_by_value else 'n/a'} "
         f"({fs.concentration_pct:.1f}% of value) |",
-        "",
-        "## Holdings",
-        "",
-        "| Symbol | Qty | Avg | LTP | Invested | Value | P&L | P&L % | Today |",
-        "| --- | --: | --: | --: | --: | --: | --: | --: | --: |",
     ]
-    for h in fs.holdings:
-        day = f"{h.day_pct:+.2f}%" if h.day_pct is not None else "—"
-        lines.append(
-            f"| {h.symbol} | {h.quantity:g} | {h.avg_price:,.2f} | {h.ltp:,.2f} | "
-            f"{h.invested:,.0f} | {h.current:,.0f} | {h.pnl:+,.0f} | {h.pnl_pct:+.1f}% | {day} |"
-        )
-    lines.append(
-        f"| **Total** | | | | **{fs.total_invested:,.0f}** | **{fs.total_current:,.0f}** | "
-        f"**{fs.total_pnl:+,.0f}** | **{fs.total_pnl_pct:+.1f}%** | |"
-    )
+    if fs.usd_inr:
+        lines.append(f"| USD/INR used | {fs.usd_inr:,.2f} — {fs.fx_source} |")
+    lines.append("")
+
+    # -- per-book summary, only when there is more than one book -------------
+    if len(fs.books) > 1:
+        lines += ["## Books", "",
+                  "| Book | Holdings | Invested | Value | P&L | P&L % | Value (Rs) |",
+                  "| --- | --: | --: | --: | --: | --: | --: |"]
+        needs_footnote = False
+        for key, label in ((BOOK_IND, "India"), (BOOK_US, "US")):
+            totals = fs.books.get(key)
+            if not totals:
+                continue
+            unit = _CCY.get(totals.currency, totals.currency)
+            # A star marks figures that cover only the holdings with a cost basis.
+            star = "*" if totals.uncosted_count else ""
+            needs_footnote = needs_footnote or bool(star)
+            lines.append(
+                f"| {label} ({totals.currency}) | {totals.count} | "
+                f"{_money(totals.invested, unit)}{star} | {unit}{totals.current:,.0f} | "
+                f"{_money(totals.pnl, unit, signed=True)}{star} | "
+                f"{_pct(totals.pnl_pct)}{star} | {_money(totals.current_inr, 'Rs')} |"
+            )
+        lines.append("")
+        if needs_footnote:
+            lines += [
+                "_* Invested and P&L cover only the holdings whose cost basis the broker "
+                "shared, so they will not equal Value minus Invested. Value covers every "
+                "holding. INDmoney does not pass through the original invested amount for "
+                "positions imported from a linked broker._", "",
+            ]
+
+    lines += ["## Holdings", ""]
+    for key, label in ((BOOK_IND, "India"), (BOOK_US, "US")):
+        rows = [h for h in fs.holdings if h.book == key]
+        if not rows:
+            continue
+        if len(fs.books) > 1:
+            lines += [f"### {label}", ""]
+        lines += ["| Symbol | Qty | Avg | LTP | Invested | Value | P&L | P&L % | Today | Value (Rs) |",
+                  "| --- | --: | --: | --: | --: | --: | --: | --: | --: | --: |"]
+        unit = _CCY.get(rows[0].currency, rows[0].currency)
+        for h in rows:
+            lines.append(
+                f"| {h.symbol} | {h.quantity:g} | {_plain(h.avg_price)} | {_plain(h.ltp)} | "
+                f"{_money(h.invested_native, unit)} | {unit}{h.current_native:,.0f} | "
+                f"{_money(h.pnl_native, unit, signed=True)} | {_pct(h.pnl_pct)} | "
+                f"{_pct(h.day_pct, decimals=2)} | {_money(h.current_inr, 'Rs')} |"
+            )
+        totals = fs.books.get(key)
+        if totals:
+            lines.append(
+                f"| **{label} total** | | | | **{_money(totals.invested, unit)}** | "
+                f"**{unit}{totals.current:,.0f}** | **{_money(totals.pnl, unit, signed=True)}** | "
+                f"**{_pct(totals.pnl_pct)}** | | **{_money(totals.current_inr, 'Rs')}** |"
+            )
+        lines.append("")
+
+    costed_count = sum(1 for h in fs.holdings if h.has_cost_basis)
+    if costed_count == len(fs.holdings):
+        lines += [f"**Combined (Rs):** invested {fs.total_invested:,.0f} · "
+                  f"value {fs.total_current:,.0f} · "
+                  f"P&L {fs.total_pnl:+,.0f} ({fs.total_pnl_pct:+.1f}%)", ""]
+    else:
+        lines += [f"**Combined (Rs):** value {fs.total_current:,.0f} across "
+                  f"{len(fs.holdings)} holdings. Cost basis is known for "
+                  f"{costed_count} of them: invested {fs.total_invested:,.0f}, "
+                  f"P&L {fs.total_pnl:+,.0f} ({fs.total_pnl_pct:+.1f}%). The return "
+                  f"figures therefore describe that subset, not the whole portfolio.", ""]
 
     lines += ["", "## News and sentiment", "", news_section.rstrip(), "",
               "## Commentary", "", narrative.strip(), "",
@@ -431,7 +540,9 @@ def render_report(
     return "\n".join(lines)
 
 
-SCHEMA_VERSION = 1
+# v2 adds the US book: per-holding currency and native values, per-book
+# subtotals, the USD/INR rate actually used, and broker sentiment cross-checks.
+SCHEMA_VERSION = 2
 
 
 def build_payload(
@@ -445,6 +556,7 @@ def build_payload(
     model: str,
     rejected: Optional[List[str]] = None,
     feed_stats: Optional[dict] = None,
+    broker_sentiment: Optional[Dict[str, dict]] = None,
     generated_at: Optional[datetime] = None,
 ) -> dict:
     """Structured sidecar consumed by the web view.
@@ -455,13 +567,16 @@ def build_payload(
     """
     stamp = generated_at or datetime.now()
     by_symbol = {s.symbol: s for s in scores}
+    us_symbols = {h.symbol for h in fs.holdings if h.book == BOOK_US}
+    broker_sentiment = broker_sentiment or {}
 
     news: dict = {}
     for symbol in sorted(set(grouped) | set(by_symbol)):
         score = by_symbol.get(symbol)
         articles = grouped.get(symbol, [])
-        news[symbol] = {
+        entry = {
             "held": symbol in held,
+            "book": BOOK_US if symbol in us_symbols else BOOK_IND,
             "score": score.score if score else None,
             "label": score.label if score else "unscored",
             "reason": score.reason if score else "",
@@ -474,6 +589,11 @@ def build_payload(
                 for a in articles
             ],
         }
+        sentiment = broker_sentiment.get(symbol)
+        if sentiment:
+            entry["broker_sentiment"] = sentiment.get("sentiment")
+            entry["broker_sentiment_note"] = sentiment.get("sentiment_note", "")
+        news[symbol] = entry
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -492,22 +612,51 @@ def build_payload(
             "concentration_pct": round(fs.concentration_pct, 2),
             "largest_position": fs.top_by_value[0].symbol if fs.top_by_value else None,
         },
+        "fx": {
+            "usd_inr": fs.usd_inr,
+            "source": fs.fx_source,
+        },
+        "books": {
+            key: {
+                "currency": t.currency,
+                "count": t.count,
+                "uncosted_count": t.uncosted_count,
+                "invested": _round(t.invested),
+                "current": _round(t.current),
+                "pnl": _round(t.pnl),
+                "pnl_pct": _round(t.pnl_pct),
+                "invested_inr": _round(t.invested_inr),
+                "current_inr": _round(t.current_inr),
+                "pnl_inr": _round(t.pnl_inr),
+            }
+            for key, t in fs.books.items()
+        },
         "holdings": [
             {
                 "symbol": h.symbol,
+                "name": h.name,
                 "exchange": h.exchange,
+                "book": h.book,
+                "currency": h.currency,
+                "source": h.source,
                 "quantity": h.quantity,
-                "avg_price": round(h.avg_price, 2),
-                "ltp": round(h.ltp, 2),
-                "invested": round(h.invested, 2),
-                "current": round(h.current, 2),
-                "pnl": round(h.pnl, 2),
-                "pnl_pct": round(h.pnl_pct, 2),
-                "day_pct": round(h.day_pct, 2) if h.day_pct is not None else None,
+                "avg_price": _round(h.avg_price),
+                "ltp": _round(h.ltp),
+                # Native currency, then the rupee view of the same row.
+                "invested": _round(h.invested_native),
+                "current": _round(h.current_native),
+                "pnl": _round(h.pnl_native),
+                "pnl_pct": _round(h.pnl_pct),
+                "invested_inr": _round(h.invested_inr),
+                "current_inr": _round(h.current_inr),
+                "pnl_inr": _round(h.pnl_inr),
+                "day_pct": _round(h.day_pct),
+                "has_cost_basis": h.has_cost_basis,
                 "flags": list(h.flags),
             }
             for h in fs.holdings
         ],
+        "uncosted": list(fs.uncosted),
         "winners": [h.symbol for h in fs.winners],
         "losers": [h.symbol for h in fs.losers],
         "news": news,

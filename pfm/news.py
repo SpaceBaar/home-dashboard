@@ -230,6 +230,7 @@ def collect_articles(
         articles.sort(key=lambda a: (a.published is not None, a.published or 0), reverse=True)
         grouped[symbol] = articles[:max_per_stock]
 
+    _ = entries_seen
     total = sum(len(v) for v in grouped.values())
     log.info("Attributed %d unique article(s) to %d stock(s) from %d/%d live feed(s).",
              total, len(grouped), feeds_ok, len(sources))
@@ -244,6 +245,79 @@ def collect_articles(
             "articles_matched": total,
         })
     return grouped
+
+
+# ---------------------------------------------------------------------------
+# Merging a second news source (INDmoney's US headlines)
+# ---------------------------------------------------------------------------
+def merge_articles(
+    grouped: Dict[str, List[Article]],
+    extra: Dict[str, dict],
+    *,
+    source_label: str = "INDmoney",
+    similarity_threshold: float = 0.9,
+    max_per_stock: int = 12,
+) -> Dict[str, List[Article]]:
+    """Fold externally supplied headlines into the RSS-derived groups.
+
+    Indian RSS feeds cover US names thinly, so INDmoney's own US news is the
+    better source for those tickers. Deduplication uses the same near-match rule
+    as the feed scan, so a story carried by both does not get counted twice and
+    skew the aggregate score.
+    """
+    for symbol, payload in extra.items():
+        articles = payload.get("articles") or []
+        if not articles:
+            continue
+        bucket = grouped.setdefault(symbol.upper(), [])
+        for item in articles:
+            title = (item.get("title") or "").strip()
+            if not title:
+                continue
+            norm = _norm_title(title)
+            if any(difflib.SequenceMatcher(None, norm, _norm_title(a.title)).ratio()
+                   >= similarity_threshold for a in bucket):
+                continue
+            bucket.append(Article(
+                symbol=symbol.upper(), title=title,
+                source=item.get("source") or source_label,
+                link=item.get("link") or "", published=None,
+            ))
+        grouped[symbol.upper()] = bucket[:max_per_stock]
+    return grouped
+
+
+def sentiment_disagreements(
+    scores: Sequence[StockScore],
+    broker_sentiment: Dict[str, dict],
+    *,
+    threshold: float = 3.0,
+) -> List[str]:
+    """Where our local score and the broker's sentiment differ sharply.
+
+    Not treated as an error on either side — the two look at the same headlines
+    with different models and possibly different scales. It is surfaced because a
+    wide gap is worth a human glance.
+    """
+    notes: List[str] = []
+    for score in scores:
+        if score.score is None:
+            continue
+        entry = broker_sentiment.get(score.symbol)
+        if not entry:
+            continue
+        theirs = entry.get("sentiment")
+        if theirs is None:
+            continue
+        gap = abs(float(theirs) - float(score.score))
+        if gap >= threshold:
+            note = entry.get("sentiment_note") or ""
+            suffix = f" ({note})" if note else ""
+            notes.append(
+                f"{score.symbol}: local model rated {score.score}/10 but INDmoney's "
+                f"sentiment maps to {theirs:.1f}/10{suffix} — a {gap:.1f} point gap."
+            )
+    return notes
 
 
 # ---------------------------------------------------------------------------

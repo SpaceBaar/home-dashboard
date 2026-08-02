@@ -1,9 +1,10 @@
 # pfm — Personal Finance Manager agent
 
-A nightly agent that reads your Zerodha holdings over the Kite MCP bridge,
-screens Indian market RSS feeds for news about the stocks you actually own,
-rates that news with a local LLM on a Raspberry Pi 5 + AI HAT+ (hailo-ollama),
-and writes a markdown report plus a Telegram summary.
+A nightly agent that reads your Indian holdings over the **Zerodha Kite** MCP
+bridge and your US holdings over the **INDmoney** MCP bridge, screens the news
+for the stocks you actually own, rates that news with a local LLM on a
+Raspberry Pi 5 + AI HAT+ (hailo-ollama), and writes a markdown report, a JSON
+sidecar, a browsable web view and a Telegram summary.
 
 ## Design principle
 
@@ -23,7 +24,11 @@ never asked to do arithmetic, because that is precisely where it invents things.
 ## Pipeline
 
 ```
-Kite MCP get_holdings
+Kite MCP  get_holdings         ─┐  India book, INR
+INDmoney  networth_holdings    ─┤  US book, USD
+                                │
+                                ▼
+brokers.normalise_* ───────────── one common holding shape, per-row currency
         │
         ▼
 portfolio.build_fact_sheet ──────── every figure, computed once, totals reconcile
@@ -54,7 +59,8 @@ so the browser and the report can never disagree.
 
 | File | Responsibility |
 | --- | --- |
-| `agent.py` | Orchestrator, MCP session, scheduler, CLI, expense listener |
+| `agent.py` | Orchestrator, both MCP sessions, scheduler, CLI, expense listener |
+| `brokers.py` | Kite and INDmoney providers, holdings normalisation, US news extraction |
 | `pfm_config.py` | Config load/merge/validate, path resolution, logging |
 | `portfolio.py` | Holdings parsing and all portfolio mathematics |
 | `news.py` | Feed fetching, symbol attribution, dedup, per-stock scoring |
@@ -65,6 +71,8 @@ so the browser and the report can never disagree.
 | `static/` | Stylesheet and table-sorting script for the web view |
 | `tests/test_pipeline.py` | Full offline harness — no Pi, no model, no network |
 | `tests/test_web.py` | Offline tests for the web view, including live HTTP routes |
+| `tests/test_us_book.py` | INDmoney normalisation, multi-currency math, US news |
+| `tools/probe_indmoney.py` | Capture INDmoney's real response shapes |
 | `tools/probe_llm.py` | On-Pi diagnosis of the runtime and the scoring prompt |
 | `tools/check_telegram.py` | Credential check |
 
@@ -82,8 +90,9 @@ Optional environment variables (`pfm/.env`):
 | --- | --- | --- |
 | `TELEGRAM_TOKEN` | — | bot token |
 | `TELEGRAM_CHAT_ID` | — | destination chat |
-| `NPX_PATH` | `npx` | absolute path to npx for the MCP bridge |
+| `NPX_PATH` | `npx` | absolute path to npx for the MCP bridges |
 | `KITE_MCP_URL` | `https://mcp.kite.trade/mcp` | Kite MCP endpoint |
+| `INDMONEY_MCP_URL` | `https://mcp.indmoney.com/mcp` | INDmoney MCP endpoint |
 
 ## Running
 
@@ -91,11 +100,14 @@ Optional environment variables (`pfm/.env`):
 python agent.py --preflight        # check runtime, model and config, then exit
 python agent.py --dry-run --no-llm # offline report from fixture holdings
 python agent.py --dry-run          # offline holdings, real model, real feeds
-python agent.py --once             # one real run against Kite, then exit
+python agent.py --once             # one real run against both brokers, then exit
+python agent.py --once --no-us     # India book only
 python agent.py --daemon           # service mode (systemd)
 python tests/test_pipeline.py      # full offline test harness
 python tests/test_web.py           # offline tests for the web view
+python tests/test_us_book.py       # INDmoney normalisation and multi-currency math
 python tools/probe_llm.py          # why is the model not scoring?
+python tools/probe_indmoney.py     # what does INDmoney actually return?
 ```
 
 Install the services:
@@ -107,6 +119,86 @@ sudo systemctl enable --now finance-agent pfm-web
 journalctl -u finance-agent -f
 journalctl -u pfm-web -f
 ```
+
+## US book via INDmoney
+
+INDmoney publishes a read-only MCP server at `https://mcp.indmoney.com/mcp`
+(OAuth 2.1 + PKCE, 14 tools, no write capability anywhere in it). This project
+uses three of those tools:
+
+| Tool | Purpose here |
+| --- | --- |
+| `networth_holdings` | Per-position US rows: units, price, invested, value, P&L, XIRR |
+| `get_us_stocks_details` | US quotes and, importantly, headlines with INDmoney's own sentiment |
+| `user_watchlist` | Optional source for watchlist tickers |
+
+### First-time sign-in
+
+`mcp-remote` runs the OAuth flow and caches the token under `~/.mcp-auth`, the
+same mechanism the Kite bridge already uses. On a headless Pi it prints a URL:
+
+```bash
+cd pfm
+python tools/probe_indmoney.py --list-only
+```
+
+Open the printed URL on your phone or laptop, complete OTP + MPIN **on
+INDmoney's own page**, and approve the consent screen. Your credentials never
+pass through this code. Once cached, the daemon refreshes silently.
+
+### Response shapes are not guessed blindly
+
+INDmoney does not publish a field-level schema, so `brokers.py` matches field
+names by canonical form — `unitPrice`, `unit_price` and `Unit Price` all resolve
+to the same key — and covers several naming conventions per concept. A row it
+cannot interpret is **excluded with a diagnostic**, never defaulted to zero.
+
+Run `tools/probe_indmoney.py` to capture the real shapes and tighten
+`_IND_FIELDS` in `brokers.py`. The probe redacts identifier fields by default
+and always preserves numbers, so the output is safe to share.
+
+### Two currencies
+
+Set `portfolio.usd_inr_rate` in `config.json` to fold the US book into a
+combined rupee total. Leave it `null` and the US book is reported in dollars
+only — no rate is ever assumed. Rates outside 60–140 are rejected on the
+grounds that they indicate a misread field, not a currency crisis.
+
+The report shows India and US tables in their own currencies, a per-book
+subtotal, and a combined rupee line. Every US row also carries a `Value (₹)`
+column.
+
+### Holdings with no cost basis
+
+INDmoney's own documentation notes that for holdings imported from a linked
+broker, the current value is accurate but the original invested amount often
+is not shared. Those rows arrive with a null cost basis, and the pipeline:
+
+- shows `—` for invested, average price, P&L and P&L %, never `0`;
+- still counts the full current value toward portfolio value;
+- marks book-level invested and P&L figures with `*` and a footnote, because
+  they cover only the costed subset and so will not equal value minus invested;
+- lists the affected tickers in the data-quality section.
+
+### News and sentiment
+
+US headlines come from `get_us_stocks_details` — much better US coverage than
+Indian RSS feeds — and are merged into the existing groups with the same
+near-duplicate guard, so a story carried by both sources is not counted twice.
+
+They are then scored by **your local model**, keeping every score in the report
+on one scale. INDmoney's own sentiment is recorded alongside rather than blended
+in. Where the two differ by 3 points or more, the gap is surfaced in the
+data-quality section with the scale assumption that was made — INDmoney's
+sentiment scale is undocumented, so a label maps cleanly but a bare number is
+only converted when its range is unambiguous.
+
+### When the token expires
+
+A stale INDmoney token never blocks the run. The India book reports as normal,
+the US section is marked unavailable in data quality, and Telegram gets one
+message with the re-auth command. Pass `--no-us`, or set `indmoney.enabled` to
+`false`, to skip the US book entirely.
 
 ## Web view
 
@@ -203,8 +295,14 @@ legacy markdown-only report, then exercises every route against a real HTTP
 server on a loopback port — including payload arithmetic, the single-data-point
 chart case, HTML escaping of report content, and static path traversal.
 
-Both suites need no Pi, no model and no network:
+`tests/test_us_book.py` covers the INDmoney path: several plausible response
+shapes including camelCase keys, nested quote objects, currency-formatted
+strings and unknown cost bases; USD/INR sanity rejection; the guarantee that a
+dollar figure is never added to a rupee total; and sentiment-disagreement
+flagging.
+
+All three suites need no Pi, no model, no broker and no network:
 
 ```bash
-python tests/test_pipeline.py && python tests/test_web.py
+python tests/test_pipeline.py && python tests/test_web.py && python tests/test_us_book.py
 ```

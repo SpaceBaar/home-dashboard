@@ -33,29 +33,48 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
 import schedule
 
+import brokers
 import news as news_mod
 import report as report_mod
+from brokers import BOOK_US, AuthRequired, IndmoneyProvider, KiteProvider, ProviderError
 from llm import LLMClient, LLMUnavailable
 from notify import Telegram
 from pfm_config import BASE_DIR, CACHE_DIR, REPORT_DIR, STATE_DIR, load_config, setup_logging
-from portfolio import build_fact_sheet, extract_holdings_json
+from portfolio import build_fact_sheet, extract_holdings_json, resolve_fx
 
 log = logging.getLogger("pfm.agent")
 
 CFG = None            # populated in main()
 TG: Optional[Telegram] = None
 LLM: Optional[LLMClient] = None
-_session = None       # mcp.ClientSession, imported lazily so --dry-run needs no MCP install
+_session = None       # Kite mcp.ClientSession; imported lazily so --dry-run needs no MCP install
+_ind_session = None   # INDmoney mcp.ClientSession, or None when the US book is off
 # Created lazily inside the running loop; a module-level asyncio.Lock() binds to
 # the wrong event loop on Python 3.9 and then fails at the first await.
 _run_lock: Optional[asyncio.Lock] = None
 _OFFSET_FILE = STATE_DIR / "telegram_offset.json"
+
+
+# Tickers treated as US names when they appear on the watchlist. Anything not
+# listed here is assumed Indian, since a wrong guess would send an Indian ticker
+# to a US quote endpoint.
+_US_LIKE = {"AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "GOOG", "META", "NFLX",
+            "AMD", "AVGO", "CRM", "ADBE", "UBER", "WMT", "NOW", "INTC", "MU", "QCOM",
+            "PLTR", "COIN", "SPY", "QQQ", "VOO"}
+
+
+def _num_or_none(value) -> Optional[float]:
+    try:
+        return None if value in (None, "") else float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _get_run_lock() -> asyncio.Lock:
@@ -139,11 +158,48 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                 TG.alert("Nightly analysis aborted: the holdings payload could not be parsed.")
             return None
 
-        # 1. Deterministic portfolio mathematics.
+        # 1a. US book from INDmoney. Never fatal: a stale OAuth token costs the
+        #     US section, not the whole night's report.
+        us_rows: List[dict] = []
+        us_problems: List[str] = []
+        broker_sentiment: dict = {}
+        snapshot_fx: Optional[float] = None
+
+        if _ind_session is not None:
+            provider = IndmoneyProvider(_ind_session)
+            try:
+                us_rows, us_problems = await provider.holdings()
+                log.info("INDmoney returned %d US holding(s).", len(us_rows))
+            except AuthRequired as exc:
+                log.warning("INDmoney needs re-authentication: %s", exc)
+                us_problems.append(
+                    "The US book was unavailable because the INDmoney session has expired. "
+                    "Re-authorise with: python tools/probe_indmoney.py --list-only"
+                )
+                if TG:
+                    TG.send("INDmoney session expired, so tonight's report covers the India "
+                            "book only.\n\nRe-authorise on the Pi:\n"
+                            "cd ~/Projects/home-dashboard/pfm && "
+                            "python tools/probe_indmoney.py --list-only\n\n"
+                            "That opens the INDmoney sign-in page; the token is then cached "
+                            "for the daemon.")
+            except ProviderError as exc:
+                log.error("INDmoney holdings failed: %s", exc)
+                us_problems.append(f"The US book could not be read from INDmoney: {exc}")
+
+        # 1b. Deterministic portfolio mathematics over both books.
+        usd_inr, fx_source = resolve_fx(
+            _num_or_none(CFG.portfolio.get("usd_inr_rate")), snapshot_fx)
+        if us_rows and not usd_inr:
+            log.warning("US holdings present but no USD/INR rate; reporting them in dollars only.")
+
         fact_sheet = build_fact_sheet(
-            holdings_raw,
+            list(holdings_raw) + us_rows,
             mismatch_tolerance_pct=float(CFG.portfolio.get("pnl_mismatch_tolerance_pct", 1.0)),
+            usd_inr=usd_inr,
+            fx_source=fx_source,
         )
+        fact_sheet.data_quality.extend(us_problems)
         held = {h.symbol for h in fact_sheet.holdings}
         log.info("Parsed %d holdings. Value Rs %s, P&L Rs %s (%+.1f%%).",
                  len(fact_sheet.holdings), f"{fact_sheet.total_current:,.0f}",
@@ -168,6 +224,31 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
             stats=feed_stats,
         )
 
+        # 2b. US headlines from INDmoney. Indian RSS covers US names thinly, so
+        #     this is the better source for those tickers. We still score them
+        #     with the local model, keeping every score on one scale.
+        if _ind_session is not None:
+            us_universe = sorted(
+                {h.symbol for h in fact_sheet.holdings if h.book == BOOK_US}
+                | {s for s in CFG.watchlist if s in _US_LIKE}
+            )
+            if us_universe:
+                try:
+                    details = await IndmoneyProvider(_ind_session).us_details(us_universe)
+                    broker_sentiment = brokers.extract_us_news(details)
+                    added = sum(len(v.get("articles") or []) for v in broker_sentiment.values())
+                    log.info("INDmoney supplied %d US headline(s) across %d ticker(s).",
+                             added, len(broker_sentiment))
+                    grouped = news_mod.merge_articles(
+                        grouped, broker_sentiment,
+                        similarity_threshold=float(CFG.news["duplicate_similarity_threshold"]),
+                        max_per_stock=int(CFG.news["max_articles_per_stock"]),
+                    )
+                except AuthRequired:
+                    log.warning("INDmoney session expired before the US news call.")
+                except Exception as exc:
+                    log.warning("INDmoney US news unavailable: %s", exc)
+
         # 3. One LLM call per stock, all of that stock's headlines together.
         scores = []
         if grouped and use_llm and LLM is not None:
@@ -184,6 +265,12 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                       for sym, arts in grouped.items()]
 
         news_section = news_mod.render_news_section(grouped, scores, held=held)
+
+        # Where our score and INDmoney's own sentiment disagree sharply, say so
+        # rather than silently preferring one of them.
+        disagreements = news_mod.sentiment_disagreements(scores, broker_sentiment)
+        if disagreements:
+            fact_sheet.data_quality.extend(disagreements)
 
         # 4. Commentary — validated against the computed figures.
         narrative, provenance, rejected = await report_mod.build_narrative(
@@ -208,6 +295,7 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                 fact_sheet, grouped, scores, narrative, provenance,
                 held=held, model=(LLM.model if LLM else "none"),
                 rejected=rejected, feed_stats=feed_stats,
+                broker_sentiment=broker_sentiment,
             ),
             REPORT_DIR,
         )
@@ -289,14 +377,16 @@ async def listen_for_expenses() -> None:
 
 
 async def mcp_keepalive() -> None:
-    """Keep the SSE stream warm; Cloudflare drops idle streams after ~100s."""
+    """Keep the streams warm; Cloudflare drops idle streams after ~100s."""
     while True:
         await asyncio.sleep(60)
-        try:
-            if _session:
-                await _session.list_tools()
-        except Exception as exc:
-            log.debug("Keepalive ping failed: %s", exc)
+        for label, session in (("kite", _session), ("indmoney", _ind_session)):
+            if session is None:
+                continue
+            try:
+                await session.list_tools()
+            except Exception as exc:
+                log.debug("Keepalive ping to %s failed: %s", label, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +454,45 @@ def _schedule_jobs(loop: asyncio.AbstractEventLoop) -> None:
     log.info("Scheduled: login at %s, analysis at %s (Pi local time).", login_time, analysis_time)
 
 
+@asynccontextmanager
+async def _indmoney_session(enabled: bool):
+    """Open the INDmoney MCP session, yielding None if it cannot be established.
+
+    Wrapped in its own context manager so that a failure here - an expired OAuth
+    token, npx trouble, INDmoney down - degrades to an India-only report instead
+    of taking the whole run with it.
+    """
+    global _ind_session
+    if not enabled:
+        yield None
+        return
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    url = CFG.indmoney_mcp_url
+    log.info("Starting the INDmoney MCP bridge (%s)...", url)
+    params = StdioServerParameters(
+        command=CFG.npx_path, args=["-y", "mcp-remote", url], env=dict(os.environ),
+    )
+    try:
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await asyncio.wait_for(session.initialize(), timeout=180)
+                _ind_session = session
+                log.info("INDmoney MCP connection established.")
+                try:
+                    yield session
+                finally:
+                    _ind_session = None
+    except Exception as exc:
+        log.warning("INDmoney MCP unavailable (%s). Continuing with the India book only. "
+                    "If this is an auth failure, run: python tools/probe_indmoney.py "
+                    "--list-only", exc)
+        _ind_session = None
+        yield None
+
+
 async def main_loop(args: argparse.Namespace) -> int:
     global _session
 
@@ -384,6 +513,8 @@ async def main_loop(args: argparse.Namespace) -> int:
         env=dict(os.environ),
     )
 
+    us_enabled = bool(CFG.raw.get("indmoney", {}).get("enabled", True)) and not args.no_us
+
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -398,36 +529,39 @@ async def main_loop(args: argparse.Namespace) -> int:
                             "deterministic report is still produced.")
                 use_llm = False
 
-            if args.once:
-                holdings = await probe_session()
-                if holdings is None:
-                    await send_login_link()
-                    log.error("No valid session. Log in via the Telegram link and re-run.")
-                    return 1
-                return 0 if await run_analysis(holdings, use_llm=use_llm) else 1
-
-            if not args.daemon:
-                answer = input("Run an on-demand analysis now? (y/n): ").strip().lower()
-                if answer == "y":
+            # The US book rides alongside the India book. If this session cannot
+            # be opened the context manager yields None and the run continues.
+            async with _indmoney_session(us_enabled):
+                if args.once:
                     holdings = await probe_session()
                     if holdings is None:
-                        log.info("Session expired — sending a fresh login link.")
                         await send_login_link()
-                        input("Press Enter here once you have completed the Telegram login... ")
+                        log.error("No valid session. Log in via the Telegram link and re-run.")
+                        return 1
+                    return 0 if await run_analysis(holdings, use_llm=use_llm) else 1
+
+                if not args.daemon:
+                    answer = input("Run an on-demand analysis now? (y/n): ").strip().lower()
+                    if answer == "y":
                         holdings = await probe_session()
-                    if holdings is None:
-                        log.error("Still no valid session; skipping the on-demand run.")
-                    else:
-                        await run_analysis(holdings, use_llm=use_llm)
+                        if holdings is None:
+                            log.info("Session expired — sending a fresh login link.")
+                            await send_login_link()
+                            input("Press Enter here once you have completed the Telegram login... ")
+                            holdings = await probe_session()
+                        if holdings is None:
+                            log.error("Still no valid session; skipping the on-demand run.")
+                        else:
+                            await run_analysis(holdings, use_llm=use_llm)
 
-            _schedule_jobs(asyncio.get_running_loop())
-            asyncio.create_task(listen_for_expenses())
-            asyncio.create_task(mcp_keepalive())
+                _schedule_jobs(asyncio.get_running_loop())
+                asyncio.create_task(listen_for_expenses())
+                asyncio.create_task(mcp_keepalive())
 
-            log.info("Agent running. Ctrl+C to exit.")
-            while True:
-                schedule.run_pending()
-                await asyncio.sleep(1)
+                log.info("Agent running. Ctrl+C to exit.")
+                while True:
+                    schedule.run_pending()
+                    await asyncio.sleep(1)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -441,6 +575,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="verify the runtime, model and config, then exit")
     parser.add_argument("--no-llm", action="store_true",
                         help="skip all model calls; produce the deterministic report only")
+    parser.add_argument("--no-us", action="store_true",
+                        help="skip the INDmoney US book; report Indian holdings only")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return parser.parse_args(argv)
 
