@@ -59,6 +59,7 @@ DEFAULTS: Dict[str, Any] = {
         "feed_attempts": 2,
         "duplicate_similarity_threshold": 0.9,
     },
+    "web": {"host": "0.0.0.0", "port": 7373},
     "narrative": {"enabled": True, "max_attempts": 2},
     "portfolio": {"pnl_mismatch_tolerance_pct": 1.0},
     "tracking": {"keywords": {}, "exclude_phrases": {}, "watchlist": []},

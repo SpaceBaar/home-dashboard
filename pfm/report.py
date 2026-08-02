@@ -16,6 +16,7 @@ figure for a percentage. See ``tests/test_pipeline.py``.
 from __future__ import annotations
 
 import difflib
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -428,6 +429,103 @@ def render_report(
               "against those figures before publication._", ""]
 
     return "\n".join(lines)
+
+
+SCHEMA_VERSION = 1
+
+
+def build_payload(
+    fs: FactSheet,
+    grouped: dict,
+    scores: Sequence[StockScore],
+    narrative: str,
+    provenance: str,
+    *,
+    held: Set[str],
+    model: str,
+    rejected: Optional[List[str]] = None,
+    feed_stats: Optional[dict] = None,
+    generated_at: Optional[datetime] = None,
+) -> dict:
+    """Structured sidecar consumed by the web view.
+
+    The web layer reads this rather than scraping the markdown, so the browser
+    gets the same computed figures the report does - no second parsing step that
+    could drift away from the source of truth.
+    """
+    stamp = generated_at or datetime.now()
+    by_symbol = {s.symbol: s for s in scores}
+
+    news: dict = {}
+    for symbol in sorted(set(grouped) | set(by_symbol)):
+        score = by_symbol.get(symbol)
+        articles = grouped.get(symbol, [])
+        news[symbol] = {
+            "held": symbol in held,
+            "score": score.score if score else None,
+            "label": score.label if score else "unscored",
+            "reason": score.reason if score else "",
+            "confidence": score.confidence if score else "unscored",
+            "method": score.method if score else "",
+            "headline_count": len(articles),
+            "chunk_scores": list(score.chunk_scores) if score else [],
+            "articles": [
+                {"title": a.title, "source": a.source, "link": a.link}
+                for a in articles
+            ],
+        }
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "date": f"{stamp:%Y-%m-%d}",
+        "generated_at": stamp.isoformat(timespec="seconds"),
+        "model": model,
+        "totals": {
+            "invested": round(fs.total_invested, 2),
+            "current": round(fs.total_current, 2),
+            "pnl": round(fs.total_pnl, 2),
+            "pnl_pct": round(fs.total_pnl_pct, 2),
+            "day_pnl": round(fs.day_pnl, 2) if fs.day_pnl is not None else None,
+            "holdings_count": len(fs.holdings),
+            "profitable_count": fs.profitable_count,
+            "losing_count": fs.losing_count,
+            "concentration_pct": round(fs.concentration_pct, 2),
+            "largest_position": fs.top_by_value[0].symbol if fs.top_by_value else None,
+        },
+        "holdings": [
+            {
+                "symbol": h.symbol,
+                "exchange": h.exchange,
+                "quantity": h.quantity,
+                "avg_price": round(h.avg_price, 2),
+                "ltp": round(h.ltp, 2),
+                "invested": round(h.invested, 2),
+                "current": round(h.current, 2),
+                "pnl": round(h.pnl, 2),
+                "pnl_pct": round(h.pnl_pct, 2),
+                "day_pct": round(h.day_pct, 2) if h.day_pct is not None else None,
+                "flags": list(h.flags),
+            }
+            for h in fs.holdings
+        ],
+        "winners": [h.symbol for h in fs.winners],
+        "losers": [h.symbol for h in fs.losers],
+        "news": news,
+        "commentary": {"text": narrative, "provenance": provenance},
+        "rejected_commentary": list(rejected or []),
+        "data_quality": list(fs.data_quality),
+        "feed_stats": dict(feed_stats or {}),
+    }
+
+
+def write_payload(payload: dict, report_dir: Path) -> Path:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    path = report_dir / f"portfolio_analysis_{payload['date']}.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)   # atomic, so the web view never reads a half-written file
+    log.info("Report data written to %s", path)
+    return path
 
 
 def write_report(content: str, report_dir: Path, stamp: Optional[datetime] = None) -> Path:

@@ -202,6 +202,16 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
         )
         path = report_mod.write_report(content, REPORT_DIR)
 
+        # Structured sidecar for the web view (pfm/web.py).
+        report_mod.write_payload(
+            report_mod.build_payload(
+                fact_sheet, grouped, scores, narrative, provenance,
+                held=held, model=(LLM.model if LLM else "none"),
+                rejected=rejected, feed_stats=feed_stats,
+            ),
+            REPORT_DIR,
+        )
+
         if TG:
             TG.send(report_mod.telegram_summary(fact_sheet, scores, path))
 

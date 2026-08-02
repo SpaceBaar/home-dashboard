@@ -38,6 +38,12 @@
     "_note": "LLM prose is validated against the computed fact sheet. Any ticker or figure not present in the source data causes a retry, then a fall back to a deterministic template."
   },
 
+  "web": {
+    "host": "0.0.0.0",
+    "port": 7373,
+    "_note": "Read-only report browser (pfm/web.py). Its own process and port, entirely separate from the Node home-dashboard app. Bind to 0.0.0.0 so it is reachable over the LAN and VPN; do not expose it to the public internet."
+  },
+
   "portfolio": {
     "india_broker": "zerodha",
     "us_broker": "indmoney",
@@ -64,7 +70,9 @@
       "GOLDCASE": ["GOLDCASE", "GOLD CASE"],
       "AAPL": ["APPLE INC", "APPLE"],
       "TSLA": ["TESLA INC", "TESLA"],
-      "NVDA": ["NVIDIA CORP", "NVIDIA"]
+      "NVDA": ["NVIDIA CORP", "NVIDIA"],
+      "RELIANCE": ["RELIANCE"],
+      "SPCX": ["SPACEX", "SPCX", "XAI"]
     },
     "exclude_phrases": {
       "_note": "Phrases removed from the article text before keyword matching, so sibling listed companies are not mis-attributed - e.g. an SBI Cards story must not count as SBIN news.",
@@ -73,7 +81,7 @@
       "IDEA": ["IDEA OF", "THE IDEA", "BAD IDEA", "GOOD IDEA", "NO IDEA"],
       "AAPL": ["APPLE CIDER", "BIG APPLE"]
     },
-    "watchlist": ["AAPL", "TSLA", "NVDA"]
+    "watchlist": ["AAPL", "TSLA", "NVDA", "RELIANCE", "SPCX"]
   },
 
   "news_sources": [

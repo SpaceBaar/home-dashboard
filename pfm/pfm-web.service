@@ -1,0 +1,25 @@
+[Unit]
+Description=Personal Finance Report Web View
+# Independent of the Node home-dashboard app: separate process, separate port.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spacebaar
+WorkingDirectory=/home/spacebaar/Projects/home-dashboard/pfm
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/spacebaar/Projects/pfm/.venv/bin/python /home/spacebaar/Projects/home-dashboard/pfm/web.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Read-only view - it never needs to write anything.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -39,10 +39,16 @@ report.build_narrative ──────────── prose, validated, el
         │
         ▼
 report.render_report / write_report → reports/portfolio_analysis_YYYY-MM-DD.md
-        │
-        ▼
-notify.Telegram ─────────────────── chunked summary push
+report.build_payload / write_payload → reports/portfolio_analysis_YYYY-MM-DD.json
+        │                                        │
+        ▼                                        ▼
+notify.Telegram ─────────────────── chunked   web.py ── browser, by date
+                                    summary
 ```
+
+Each run writes two files: the markdown report for reading, and a JSON sidecar
+with the same computed figures in structured form. The web view reads the JSON,
+so the browser and the report can never disagree.
 
 ## Files
 
@@ -55,7 +61,10 @@ notify.Telegram ─────────────────── chunke
 | `llm.py` | hailo-ollama client, preflight, tiered score parser, score cache |
 | `report.py` | Fact sheet → markdown, narrative validation, fallback template |
 | `notify.py` | Telegram with chunking, retries and token redaction |
+| `web.py` | Standalone read-only report browser (own process, own port) |
+| `static/` | Stylesheet and table-sorting script for the web view |
 | `tests/test_pipeline.py` | Full offline harness — no Pi, no model, no network |
+| `tests/test_web.py` | Offline tests for the web view, including live HTTP routes |
 | `tools/probe_llm.py` | On-Pi diagnosis of the runtime and the scoring prompt |
 | `tools/check_telegram.py` | Credential check |
 
@@ -85,16 +94,57 @@ python agent.py --dry-run          # offline holdings, real model, real feeds
 python agent.py --once             # one real run against Kite, then exit
 python agent.py --daemon           # service mode (systemd)
 python tests/test_pipeline.py      # full offline test harness
+python tests/test_web.py           # offline tests for the web view
 python tools/probe_llm.py          # why is the model not scoring?
 ```
 
-Install the service:
+Install the services:
 
 ```bash
-sudo cp finance-agent.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now finance-agent
+sudo cp finance-agent.service pfm-web.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now finance-agent pfm-web
 journalctl -u finance-agent -f
+journalctl -u pfm-web -f
 ```
+
+## Web view
+
+A separate, read-only process that serves the report archive over HTTP. It has
+nothing to do with the Node home-dashboard app — different process, different
+port, no shared code or assets. Stdlib only, so there is nothing extra to
+install.
+
+```bash
+python web.py                 # http://<pi>:7373/
+python web.py --port 8080
+python web.py --once /        # render one route to stdout, for debugging
+```
+
+| Route | Purpose |
+| --- | --- |
+| `/` | Latest report, with the value-over-time chart |
+| `/r/<date>` | A specific date, e.g. `/r/2026-08-02` |
+| `/raw/<date>.md` | The markdown source |
+| `/api/reports` | JSON index of every report |
+| `/api/reports/<date>` | The full structured payload |
+| `/healthz` | Liveness probe |
+
+Notes:
+
+- The reports directory is read on **every request**, so a new report appears
+  without restarting anything.
+- Reports written before the JSON sidecar existed still show up. They render
+  from their markdown and are marked `legacy` in the archive list.
+- Legacy reports left in `pfm/` itself (rather than `pfm/reports/`) are also
+  picked up, so nothing already on the Pi is lost.
+- Payloads are written atomically via a temporary file, so the browser never
+  reads a half-written report.
+- There is **no authentication**. Bind it to your LAN or VPN only — do not port
+  forward it. Set `web.host` in `config.json` to `127.0.0.1` if you would rather
+  reach it exclusively through an SSH tunnel or a reverse proxy.
+- The holdings table sorts client-side. Without JavaScript the page is still
+  fully readable, just in the server's default order (largest position first).
 
 ## Configuration notes
 
@@ -147,3 +197,14 @@ portfolio. Root causes and fixes:
 data. Each assertion maps to a defect above, including a case that feeds the
 verbatim hallucinated paragraph from the 2026-08-02 report through the validator
 and asserts it never reaches the published output.
+
+`tests/test_web.py` builds a temporary archive of several JSON reports plus one
+legacy markdown-only report, then exercises every route against a real HTTP
+server on a loopback port — including payload arithmetic, the single-data-point
+chart case, HTML escaping of report content, and static path traversal.
+
+Both suites need no Pi, no model and no network:
+
+```bash
+python tests/test_pipeline.py && python tests/test_web.py
+```
