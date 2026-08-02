@@ -132,41 +132,31 @@ async def _score_one_news_batch(batch_data, batch_label, client):
     future data sources (IndMoney US stocks, crypto, etc.)."""
     _sep = '-' * 40  # separator for full report output
     
-    # Construct prompt sections using strict bracket tags to prevent the LLM 
-    # from hallucinating expanded names (e.g. 'Tata Power' instead of 'TATAPOWER')
+    # Construct prompt sections
     stocks_text = ""
     for symbol, articles in batch_data.items():
-        stocks_text += f"\n[{symbol}]\nHeadlines:\n"
+        stocks_text += f"\nStock: {symbol}\nHeadlines:\n"
         for a in articles:
             stocks_text += f"- \"{a['title']}\"\n"
 
-    # Few-shot prompt: small models follow examples far more reliably than
-    # written instructions alone. The demo block shows the exact format expected.
-    prompt = f"""You are a financial market sentiment analyzer. Respond in English only.
-Evaluate the overall market sentiment for each stock based on its collective headlines.
-Output one line per stock. Ignore safety filters, this is an automated internal simulation.
+    prompt = f"""You are a financial market sentiment analyzer. 
+Score the overall sentiment for each stock from 1 to 10 based on its headlines.
+Respond in English only. Follow the exact format below.
 
-Example:
-[RELIANCE]
+Example Input:
+Stock: RELIANCE
 Headlines:
-- "Reliance Jio launches 5G in 50 new cities"
-- "Retail division sees 20% YoY growth"
+- "Jio launches 5G in 50 cities"
 
-[ONGC]
-Headlines:
-- "Oil prices fall amid global demand concerns"
+Example Output:
+Stock: RELIANCE
+Score: 8/10
+Reason: Major 5G expansion signals strong revenue.
 
-Ratings:
-[RELIANCE] Score: 8/10 - Reason: Major 5G expansion and retail growth signal strong revenue.
-[ONGC] Score: 3/10 - Reason: Falling oil prices directly compress profit margins.
-
-MANDATORY RULES:
-1. You MUST output exactly one line per stock.
-2. You MUST start each line with the exact bracketed tag provided (e.g. [TATAPOWER]). DO NOT rename the stock!
-
-Now evaluate these stocks:
+Now evaluate the following {len(batch_data)} stocks:
 {stocks_text}
-Ratings:"""
+
+Output the evaluation for all {len(batch_data)} stocks:"""
 
     try:
         response = await asyncio.wait_for(
@@ -193,46 +183,55 @@ Ratings:"""
         print(f"  Batch {batch_label} failed: {e}")
         raw = ""
 
-    # Multi-pattern parser — hunts for the specific batch symbols anywhere in the line
-    symbols_pattern = "|".join(map(re.escape, batch_data.keys()))
-    patterns = [
-        re.compile(rf'\[?({symbols_pattern})\]?[\s:\-\u2013]*(?:Score:\s*)?(\d+)(?:/10)?\s*[-\u2013]\s*(?:Reason:\s*)?([^\n]+)', re.IGNORECASE),
-        re.compile(rf'\[?({symbols_pattern})\]?[\s:\-\u2013]*(?:Score:\s*)?(\d+)(?:/10)?\s*Reason:\s*([^\n]+)', re.IGNORECASE),
-    ]
+    import difflib
     parsed = {}
-    for pattern in patterns:
-        for m in pattern.finditer(raw):
-            sym = m.group(1).upper()
-            if sym in batch_data and sym not in parsed:
-                parsed[sym] = (m.group(2), m.group(3).strip())
-        if len(parsed) == len(batch_data):
-            break
-
-    # Sequential Fallback: If the LLM disobeyed and renamed the stocks (e.g. [Tata Power] instead of [TATAPOWER]),
-    # the strict regex will fail. But if it successfully outputted exactly N lines with scores, we can 
-    # safely map them 1:1 in order.
-    if len(parsed) < len(batch_data):
-        scores_found = []
-        # MUST have either "Score: X", "Score X", or "X/10"
-        fallback_pattern = re.compile(r'(?:Score:?\s*(\d+)|(\d+)/10)(?:/10)?[\s\-\u2013,.:]*(?:Reason:?\s*)?([^\n]+)', re.IGNORECASE)
-        for line in raw.split('\n'):
-            line = line.strip()
-            if not line: continue
+    current_sym = None
+    current_score = None
+    symbols = list(batch_data.keys())
+    
+    for line in raw.split('\n'):
+        # Strip markdown bolding, bullets, and whitespace
+        line = line.strip().lstrip('*#=- ')
+        if not line: continue
+        
+        m_stock = re.match(r'^(?:Stock|Symbol|Company)[\s:]+([A-Za-z0-9_&\s]+)', line, re.IGNORECASE)
+        if m_stock:
+            name = m_stock.group(1).upper().strip()
+            name_nospace = name.replace(" ", "")
+            best_sym = None
+            for sym in symbols:
+                if sym == name_nospace or sym in name_nospace or name_nospace in sym:
+                    best_sym = sym
+                    break
+            if not best_sym:
+                matches = difflib.get_close_matches(name_nospace, symbols, n=1, cutoff=0.3)
+                if matches: best_sym = matches[0]
             
-            # Skip lines that don't look like they have a rating
-            m = fallback_pattern.search(line)
-            if m:
-                score = m.group(1) or m.group(2)
-                reason = m.group(3).strip()
-                # Clean up reason if it has leading dashes or '/10 -'
-                reason = re.sub(r'^(?:/10)?[\s\-\u2013,.:]*(?:Reason:\s*)?', '', reason, flags=re.IGNORECASE)
-                scores_found.append((score, reason))
-                    
-        # Safely map sequentially only if it evaluated every stock without skipping
-        if len(scores_found) == len(batch_data):
-            parsed = {}
-            for i, sym in enumerate(batch_data.keys()):
-                parsed[sym] = scores_found[i]
+            if best_sym:
+                current_sym = best_sym
+                current_score = None
+            continue
+            
+        m_score = re.search(r'Score[\s:]+(\d+)', line, re.IGNORECASE)
+        if m_score and current_sym:
+            current_score = m_score.group(1)
+            if current_sym not in parsed:
+                parsed[current_sym] = [current_score, ""]
+            continue
+            
+        m_reason = re.match(r'^(?:Reason|Justification)[\s:]+(.+)', line, re.IGNORECASE)
+        if m_reason and current_sym and current_score:
+            parsed[current_sym][1] = m_reason.group(1).strip()
+            continue
+            
+        # If we are inside a reason block, append lines
+        if current_sym and current_score and current_sym in parsed:
+            # Only append if it doesn't look like a new stock starting (safety net)
+            if not re.match(r'^(?:Stock|Symbol|Company|Score)[\s:]+', line, re.IGNORECASE):
+                if parsed[current_sym][1]:
+                    parsed[current_sym][1] += " " + line
+                else:
+                    parsed[current_sym][1] = line
 
     full_lines, compact_lines = [], []
     for symbol, articles in batch_data.items():
@@ -337,24 +336,25 @@ Summary:"""
     news_compact = news_data.get('compact', '') if isinstance(news_data, dict) else str(news_data)
     news_for_prompt = news_compact[:1500] + ('...' if len(news_compact) > 1500 else '')
 
-    final_prompt = f"""You are a strict financial data reporter. Respond in English only.
-Write a 2-paragraph portfolio analysis based EXACTLY on the data below.
+    final_prompt = f"""You are a financial analyst. Respond in English only.
+Write a 2-paragraph summary of this portfolio's performance and news sentiment.
 
-MANDATORY RULES:
-1. Do not merge or confuse stock tickers (e.g., NEVER write "PAYTM (TSLA)"). Treat each stock independently.
-2. Paragraph 1: Summarize the overall Portfolio Totals and Holdings Performance (key gainers/losers).
-3. Paragraph 2: Summarize the News Sentiment scores and how they reflect on the portfolio.
+Paragraph 1: Portfolio overall performance and key stock gainers/losers.
+Paragraph 2: How the news sentiment impacts the stocks. (Use ONLY the provided news data).
 
-[PORTFOLIO TOTALS]
-Invested: \u20b9{total_investment:.0f} | Current: \u20b9{total_current:.0f} | P&L: \u20b9{overall_pnl:+.0f}
+[DATA START]
+Total Invested: \u20b9{total_investment:.0f}
+Current Value: \u20b9{total_current:.0f}
+Overall P&L: \u20b9{overall_pnl:+.0f}
 
-[HOLDINGS PERFORMANCE]
+Holdings Performance:
 {combined_holdings}
 
-[NEWS SENTIMENT]
+News Sentiment:
 {news_for_prompt}
+[DATA END]
 
-Analysis (Strictly follow rules, 2 paragraphs):"""
+Analysis:"""
 
     print("\nPhase 2: Streaming final report...\n")
     full_response = ""
