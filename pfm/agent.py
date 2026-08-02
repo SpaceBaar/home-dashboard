@@ -130,21 +130,27 @@ async def _score_one_news_batch(batch, batch_label, client):
     Returns a tuple of (full_text_lines, compact_score_lines).
     Keeping this as a standalone helper makes it easy to reuse for
     future data sources (IndMoney US stocks, crypto, etc.)."""
+    _sep = '-' * 40  # separator for full report output
     numbered_headlines = "\n".join(
         f"{j+1}. {a['symbol']}: \"{a['title']}\""
         for j, a in enumerate(batch)
     )
+    # Few-shot prompt: small models follow examples far more reliably than
+    # written instructions alone. The demo block shows the exact format expected.
     prompt = f"""You are a financial market analyst. Respond in English only.
-Rate the market sentiment of each headline below for its stock.
+Rate the market sentiment of each headline for its stock. Output one line per headline.
 
-Use exactly one line per headline in this format:
-  N. Score: X/10 - Reason: one short English sentence
+Example:
+Headlines:
+1. RELIANCE: "Reliance Jio launches 5G in 50 new cities"
+2. ONGC: "Oil prices fall amid global demand concerns"
+Ratings:
+1. Score: 8/10 - Reason: Major 5G expansion signals strong revenue growth ahead.
+2. Score: 3/10 - Reason: Falling oil prices directly compress ONGC profit margins.
 
-Where X is 1 (very bearish) to 10 (very bullish). No other text.
-
+Now rate these headlines:
 Headlines:
 {numbered_headlines}
-
 Ratings:"""
 
     try:
@@ -155,7 +161,8 @@ Ratings:"""
                 keep_alive=keep_alive,
                 options={
                     'temperature': temperature,
-                    'num_predict': NEWS_BATCH_SIZE * 35,  # ~35 tokens per headline
+                    # ~35 tokens per headline + ~80 for the few-shot example overhead
+                    'num_predict': NEWS_BATCH_SIZE * 35 + 80,
                     'repeat_penalty': 1.3,
                 },
                 stream=False
