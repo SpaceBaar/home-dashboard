@@ -76,11 +76,12 @@
       "NIFTYBEES": ["NIFTYBEES", "NIFTY BEES"],
       "LIQUIDBEES": ["LIQUIDBEES", "LIQUID BEES"],
       "GOLDCASE": ["GOLDCASE", "GOLD CASE"],
-      "AAPL": ["APPLE INC", "APPLE"],
-      "TSLA": ["TESLA INC", "TESLA"],
-      "NVDA": ["NVIDIA CORP", "NVIDIA"],
       "RELIANCE": ["RELIANCE"],
-      "SPCX": ["SPACEX", "SPCX", "XAI"]
+      "AAPL": ["APPLE INC", "APPLE"],
+      "TSLA": ["TESLA INC", "TESLA", "TSLA", "Tesla, Inc. Common Stock"],
+      "NVDA": ["NVIDIA CORP", "NVIDIA", "NVDA", "NVIDIA Corporation Common Stock"],
+      "SPCX": ["SPACEX", "SPCX", "XAI", "SPACEEXPLORA", "Space Exploration Technologies Corp. Class A Common Stock"],
+      "ALPHABETCAPI": ["ALPHABETCAPI", "Alphabet Inc.", "Google", "YouTube", "Alphabet Inc. Class C Capital Stock"]
     },
     "exclude_phrases": {
       "_note": "Phrases removed from the article text before keyword matching, so sibling listed companies are not mis-attributed - e.g. an SBI Cards story must not count as SBIN news.",
@@ -88,8 +89,7 @@
       "LICI": ["LIC HOUSING", "LIC HFL", "LIC MUTUAL FUND"],
       "IDEA": ["IDEA OF", "THE IDEA", "BAD IDEA", "GOOD IDEA", "NO IDEA"],
       "AAPL": ["APPLE CIDER", "BIG APPLE"]
-    },
-    "watchlist": ["AAPL", "TSLA", "NVDA", "RELIANCE", "SPCX"]
+    }
   },
 
   "news_sources": [
