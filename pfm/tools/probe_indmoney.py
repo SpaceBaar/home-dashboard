@@ -54,17 +54,29 @@ INDMONEY_MCP_URL = "https://mcp.indmoney.com/mcp"
 # (option chains, greeks, mutual-fund research) is out of scope here.
 PROBES: List[Dict[str, Any]] = [
     {"tool": "networth_snapshot", "args": {},
-     "why": "cross-asset totals; also reveals whether values arrive in INR"},
+     "why": "cross-asset totals; confirms values arrive in INR"},
     {"tool": "networth_holdings", "args": {"asset_type": "US_STOCK"},
      "why": "THE important one - per-position US rows"},
     {"tool": "networth_holdings", "args": {"asset_type": "IND_STOCK"},
-     "why": "compare against Kite to see which fields INDmoney omits"},
-    {"tool": "networth_allocation_breakdown", "args": {"asset_type": "US_STOCK"},
-     "why": "asset-class level US subtotal, useful as a cross-check"},
-    {"tool": "user_watchlist", "args": {},
-     "why": "could drive the watchlist automatically instead of config.json"},
+     "why": "confirm rows come back as asset_type STOCK so they stay out of the US book"},
+    {"tool": "networth_allocation_breakdown",
+     "args": {"asset_type": "US_STOCK", "breakdown_by": "sector"},
+     "why": "asset-class US subtotal; breakdown_by is required"},
+    {"tool": "user_watchlist", "args": {"type": "all"},
+     "why": "watchlist tickers; type is required"},
     {"tool": "get_us_stocks_details", "args": {"symbols": ["AAPL", "TSLA"]},
-     "why": "live US quotes plus news + sentiment"},
+     "why": "baseline US quotes (confirmed: no news in the baseline reply)"},
+    {"tool": "lookup_ind_keys",
+     "args": {"names": ["Space Exploration Technologies Corp. Class A Common Stock",
+                        "Apple Inc."]},
+     "why": "resolve instrument names to tickers - networth_holdings has no ticker field"},
+]
+
+# The `segments` tokens that turn on news and analyst data are not documented.
+# This sweep finds a working one; whichever returns headlines is the answer.
+SEGMENT_CANDIDATES = [
+    ["news"], ["news", "analyst"], ["news_sentiment"], ["NEWS"],
+    ["analyst"], ["all"], ["news", "analyst_consensus"], ["overview", "news"],
 ]
 
 # Field names worth masking. Values are replaced, keys are kept, and numbers are
@@ -241,6 +253,45 @@ async def main() -> int:
                 for line in describe(safe)[:80]:
                     print(f"  {line}")
 
+            # --- sweep for the segments value that enables news ------------
+            available = {t.name for t in listed.tools}
+            if not args.tool and not args.list_only and "get_us_stocks_details" in available:
+                print("\n" + "=" * 72)
+                print("SWEEP get_us_stocks_details segments= (looking for news)")
+                print("=" * 72)
+                winners = []
+                for segments in SEGMENT_CANDIDATES:
+                    label = json.dumps(segments)
+                    try:
+                        result = await asyncio.wait_for(
+                            session.call_tool("get_us_stocks_details",
+                                              arguments={"symbols": ["AAPL"],
+                                                         "segments": segments}),
+                            timeout=120)
+                        payload = parse_tool_text(result)
+                    except Exception as exc:
+                        print(f"  segments={label:<28} rejected: {str(exc)[:90]}")
+                        continue
+
+                    text = json.dumps(payload).lower()
+                    has_news = any(k in text for k in
+                                   ('"news', '"headline', '"article', 'sentiment'))
+                    keys = sorted((payload.get("AAPL") or {}).keys()) \
+                        if isinstance(payload, dict) else []
+                    print(f"  segments={label:<28} "
+                          f"{'NEWS FOUND' if has_news else 'no news'}  keys={keys}")
+                    captured["results"][f"segments={label}"] = redact(payload, enabled=do_redact)
+                    if has_news:
+                        winners.append(segments)
+
+                if winners:
+                    print(f"\n  Working segments values: {winners}")
+                    print("  Put the first of these at the head of "
+                          "IndmoneyProvider.NEWS_SEGMENT_CANDIDATES in brokers.py.")
+                else:
+                    print("\n  No segments value produced news. US headlines will keep "
+                          "coming from the RSS feeds; the pipeline handles that.")
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     out = CACHE_DIR / f"indmoney_probe_{datetime.now():%Y%m%d_%H%M%S}.json"
     out.write_text(json.dumps(captured, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -249,19 +300,28 @@ async def main() -> int:
     print(f"Saved to {out}")
     print("=" * 72)
     print("""
-What to check in that file before trusting the parser:
+Already confirmed from the 2026-08-02 capture, and encoded in brokers.py:
 
-  1. Units. Are US values in USD or already converted to INR? Look for a
-     currency field, or compare unit_price against current_value / quantity.
-  2. Cost basis. INDmoney documents that imported broker rows may not share the
-     original invested amount. Confirm how "unknown" is represented - null,
-     zero, absent, or a string.
-  3. Field names. quantity vs units vs qty; last_price vs unit_price vs ltp.
-  4. Nesting. Is the list at the top level, or under data/holdings/rows?
-  5. US news. Does get_us_stocks_details return headlines, and is its sentiment
-     a label, a number, or a score on some other scale?
+  * networth_holdings US rows are in RUPEES, not dollars. INDmoney has already
+    converted them (units x unit_price == market_value, and the implied average
+    only makes sense as INR). get_us_stocks_details, by contrast, quotes in USD.
+  * There is no ticker field - only `investment` (long name) and
+    `investment_code`. Tickers are resolved via lookup_ind_keys.
+  * An unknown cost basis arrives as the string "unknown", and total_pnl is then
+    filled with the market value while pnl_per is 0. Both are placeholders and
+    are discarded.
+  * Indian rows come back with asset_type 'STOCK', which is what keeps INDmoney's
+    mirror of your Zerodha holdings out of the US book.
+  * get_us_stocks_details is keyed by symbol at the top level, with numbers under
+    entity_stats and identity under entity_basic.
 
-Paste the file contents back and the normaliser can be tightened to match.
+Worth re-checking if something looks wrong:
+
+  1. Whether a `segments` value now returns news (see the sweep above).
+  2. Whether lookup_ind_keys resolved every holding name to a ticker.
+  3. Whether any new asset_type values need adding to _US_ASSET_HINTS.
+
+Paste the file contents back if the parser needs adjusting.
 """)
     return 0
 

@@ -351,11 +351,14 @@ def money(value: Optional[float], currency: str = "INR", *,
     return f"{sign}{unit}{abs(value):,.{decimals}f}"
 
 
-def render_holdings_table(rows: List[dict], book: str, totals: Optional[dict]) -> str:
+def render_holdings_table(rows: List[dict], book: str, totals: Optional[dict],
+                          *, show_inr: bool = False) -> str:
     if not rows:
         return ""
     currency = rows[0].get("currency", "INR")
-    is_us = book == "US"
+    # A rupee column only earns its space when the book is priced in something
+    # else. INDmoney pre-converts the US book, so normally it does not.
+    is_us = show_inr and currency != "INR"
 
     cells = []
     for h in rows:
@@ -432,13 +435,18 @@ invested {money(totals.get("invested"), currency)} ·
 P&amp;L {money(totals.get("pnl"), currency, signed=True)}</p>
 {note}</div>""")
 
-    fx_line = ""
-    if fx.get("usd_inr"):
+    us_currency = (books.get("US") or {}).get("currency", "INR")
+    if us_currency == "INR":
+        fx_line = ('<p class="subtle">The US book is shown in rupees because INDmoney '
+                   'reports US positions already converted. No exchange rate is '
+                   'applied.</p>')
+    elif fx.get("usd_inr"):
         fx_line = (f'<p class="subtle">Combined rupee figures use USD/INR '
                    f'{fx["usd_inr"]:,.2f} — {html.escape(str(fx.get("source", "")))}.</p>')
     else:
         fx_line = ('<p class="subtle">No USD/INR rate was available, so the US book is '
-                   'shown in dollars only and is not included in the combined total.</p>')
+                   'shown in its own currency only and is not included in the combined '
+                   'total.</p>')
     return (f'<section class="card"><h2>Books</h2>'
             f'<div class="book-grid">{"".join(tiles)}</div>{fx_line}</section>')
 
@@ -482,6 +490,7 @@ def render_report_page(payload: dict) -> str:
     if not all_rows:
         holdings_table = '<p class="empty">No holdings in this report.</p>'
     elif len(books) > 1:
+        show_inr = any((b or {}).get("currency", "INR") != "INR" for b in books.values())
         parts = []
         for key in ("IND", "US"):
             rows = [h for h in all_rows if h.get("book", "IND") == key]
@@ -490,7 +499,8 @@ def render_report_page(payload: dict) -> str:
             currency = rows[0].get("currency", "INR")
             parts.append(f'<h3 class="subhead">{_BOOK_LABEL.get(key, key)} '
                          f'<span class="pill none">{currency}</span></h3>'
-                         + render_holdings_table(rows, key, books.get(key)))
+                         + render_holdings_table(rows, key, books.get(key),
+                                                 show_inr=show_inr))
         holdings_table = "".join(parts)
     else:
         only = next(iter(books), "IND")

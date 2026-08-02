@@ -235,19 +235,48 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
             if us_universe:
                 try:
                     details = await IndmoneyProvider(_ind_session).us_details(us_universe)
+
+                    # networth_holdings carries no day-change field for US rows,
+                    # so take it from the live quote. A percentage move is
+                    # currency-agnostic, so it needs no conversion.
+                    quotes = brokers.extract_us_quotes(details)
+                    filled = 0
+                    for holding in fact_sheet.holdings:
+                        quote = quotes.get(holding.symbol)
+                        if holding.book == BOOK_US and holding.day_pct is None and quote:
+                            if quote.get("day_pct") is not None:
+                                holding.day_pct = quote["day_pct"]
+                                holding.flags.append(
+                                    "day change from the INDmoney live quote")
+                                filled += 1
+                    if filled:
+                        log.info("Filled the day change for %d US holding(s) from quotes.",
+                                 filled)
+
                     broker_sentiment = brokers.extract_us_news(details)
                     added = sum(len(v.get("articles") or []) for v in broker_sentiment.values())
-                    log.info("INDmoney supplied %d US headline(s) across %d ticker(s).",
-                             added, len(broker_sentiment))
-                    grouped = news_mod.merge_articles(
-                        grouped, broker_sentiment,
-                        similarity_threshold=float(CFG.news["duplicate_similarity_threshold"]),
-                        max_per_stock=int(CFG.news["max_articles_per_stock"]),
-                    )
+                    if added:
+                        log.info("INDmoney supplied %d US headline(s) across %d ticker(s).",
+                                 added, len(broker_sentiment))
+                        grouped = news_mod.merge_articles(
+                            grouped, broker_sentiment,
+                            similarity_threshold=float(
+                                CFG.news["duplicate_similarity_threshold"]),
+                            max_per_stock=int(CFG.news["max_articles_per_stock"]),
+                        )
+                    else:
+                        log.info("INDmoney returned no US headlines; RSS remains the only "
+                                 "news source for US tickers.")
+                        fact_sheet.data_quality.append(
+                            "INDmoney returned quotes but no headlines for the US book, so "
+                            "US news came from the RSS feeds only. The 'segments' value that "
+                            "enables news is undocumented; tools/probe_indmoney.py can be "
+                            "used to find one."
+                        )
                 except AuthRequired:
                     log.warning("INDmoney session expired before the US news call.")
                 except Exception as exc:
-                    log.warning("INDmoney US news unavailable: %s", exc)
+                    log.warning("INDmoney US quotes/news unavailable: %s", exc)
 
         # 3. One LLM call per stock, all of that stock's headlines together.
         scores = []

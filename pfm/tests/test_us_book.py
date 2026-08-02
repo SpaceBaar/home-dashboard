@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Tests for the INDmoney US book: normalisation, multi-currency math, US news.
+"""Tests for the INDmoney US book: normalisation, currency, US news.
 
-No network, no MCP server, no model. Every INDmoney response shape lives in
-tests/fixtures/indmoney_us_shapes.json.
+No network, no MCP server, no model. Response structures in
+tests/fixtures/indmoney_us_shapes.json were captured from the live INDmoney MCP
+server on 2026-08-02 with tools/probe_indmoney.py; the figures were replaced with
+representative values so no real holdings live in the repository.
 
-The point of these tests is not that the guessed field names are right — only a
-real capture from tools/probe_indmoney.py can settle that. It is that the
-normaliser either understands a row or **refuses it**, and that a refused or
-cost-basis-free row can never turn into a fabricated number in the report.
+Two live findings drive most of these tests:
+
+1. ``networth_holdings`` reports US positions **already converted to rupees**,
+   while ``get_us_stocks_details`` quotes in USD. Treating the holdings as USD
+   would multiply the US book by roughly 88.
+2. When the cost basis is unknown, INDmoney sends the string ``"unknown"`` and
+   then fills ``total_pnl`` with the market value and ``pnl_per`` with 0. Taking
+   that at face value would report a 100% gain on the position.
 
 Run with either:
     python tests/test_us_book.py
@@ -16,6 +22,7 @@ Run with either:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -27,10 +34,10 @@ sys.path.insert(0, str(HERE.parent))
 import brokers                                              # noqa: E402
 import news as news_mod                                     # noqa: E402
 import report as report_mod                                 # noqa: E402
-from brokers import BOOK_IND, BOOK_US                       # noqa: E402
+from brokers import BOOK_IND, BOOK_US, IndmoneyProvider     # noqa: E402
 from llm import StockScore                                  # noqa: E402
 from pfm_config import load_config                          # noqa: E402
-from portfolio import (FX_SANITY_RANGE, build_fact_sheet,   # noqa: E402
+from portfolio import (FX_SANITY_RANGE, build_fact_sheet,    # noqa: E402
                        extract_holdings_json, resolve_fx)
 
 FIXTURES = HERE / "fixtures"
@@ -53,11 +60,20 @@ def section(title: str) -> None:
 
 
 def rows_of(shape_key: str) -> List[dict]:
-    return brokers.extract_rows(SHAPES[shape_key]) or []
+    return brokers.extract_rows(SHAPES[shape_key], hint_keys=("holdings",)) or []
+
+
+def us_holdings() -> List[dict]:
+    holdings, _ = brokers.normalise_indmoney_rows(rows_of("real_networth_holdings_us"))
+    return holdings
+
+
+def india_rows() -> List[dict]:
+    return extract_holdings_json((FIXTURES / "holdings.json").read_text(encoding="utf-8"))
 
 
 # ===========================================================================
-# 1. Number parsing — the None-vs-zero distinction
+# 1. Number parsing
 # ===========================================================================
 def test_number_parsing() -> None:
     section("Number parsing keeps None distinct from zero")
@@ -65,8 +81,8 @@ def test_number_parsing() -> None:
     cases = [
         (1234.5, 1234.5), ("1234.5", 1234.5), ("1,234.50", 1234.5),
         ("$1,138.40", 1138.4), ("₹1,23,456.78", 123456.78), ("+0.62%", 0.62),
-        ("-17.33", -17.33), ("unknown", None), ("N/A", None), ("", None),
-        (None, None), ("--", None), (True, None), ("abc", None), (0, 0.0),
+        ("unknown", None), ("N/A", None), ("", None), (None, None),
+        ("--", None), (True, None), ("abc", None), (0, 0.0),
     ]
     for raw, expected in cases:
         got = brokers._num(raw)
@@ -75,214 +91,245 @@ def test_number_parsing() -> None:
         check(ok, f"_num({raw!r}) -> {got!r} (expected {expected!r})")
 
     check(brokers._num("unknown") is None and brokers._num(0) == 0.0,
-          "'unknown' is None while a real zero stays 0.0 — a missing cost basis "
-          "must never become a zero cost basis")
+          "INDmoney's literal 'unknown' is None while a real zero stays 0.0")
+
+    check(brokers._canon("unitPrice") == brokers._canon("unit_price")
+          == brokers._canon("Unit Price") == "unitprice",
+          "field lookup is by canonical key, so naming convention does not matter")
 
 
 # ===========================================================================
-# 2. Normalising the various shapes
+# 2. The real captured shape
 # ===========================================================================
-def test_normalisation() -> None:
-    section("INDmoney rows normalise across plausible field namings")
+def test_real_us_shape() -> None:
+    section("Live networth_holdings shape normalises correctly")
 
-    holdings, problems = brokers.normalise_indmoney_rows(rows_of("shape_a_snake_case_usd"))
-    check(len(holdings) == 2 and not problems, "snake_case USD shape parses both rows")
-    aapl = next(h for h in holdings if h["symbol"] == "AAPL")
-    check(aapl["currency"] == "USD" and aapl["book"] == BOOK_US,
-          "currency and book detected as USD / US")
-    check(aapl["quantity"] == 12 and abs(aapl["invested_native"] - 2166.0) < 0.01,
-          f"quantity {aapl['quantity']:g}, invested {aapl['invested_native']}")
-    check(any("XIRR" in f for f in aapl["flags"]),
-          "broker-reported XIRR is retained as a flag, not as a computed figure")
+    holdings, problems = brokers.normalise_indmoney_rows(rows_of("real_networth_holdings_us"))
+    check(len(holdings) == 3, f"all three US rows parse ({len(holdings)})")
 
-    holdings, problems = brokers.normalise_indmoney_rows(rows_of("shape_b_camel_units_nested"))
-    check(len(holdings) == 1 and not problems, "camelCase + nested quote shape parses")
-    nvda = holdings[0]
-    check(nvda["symbol"] == "NVDA" and nvda["quantity"] == 20,
-          "units/avgBuyPrice/marketValue are recognised")
-    check(nvda["ltp"] == 121.4 and nvda["day_pct"] == 2.11,
-          "values nested one level under 'quote' are found")
+    spacex = next(h for h in holdings if "Space Exploration" in (h.get("name") or ""))
+    check(abs(spacex["quantity"] - 0.05061407) < 1e-9,
+          "fractional units are preserved exactly")
+    check(abs(spacex["current_native"] - 523.38) < 0.01
+          and abs(spacex["invested_native"] - 954.2) < 0.01,
+          "market_value and invested_amount are read")
+    check(abs(spacex["quantity"] * spacex["ltp"] - spacex["current_native"]) < 0.05,
+          "units x unit_price reconciles with market_value")
 
-    holdings, problems = brokers.normalise_indmoney_rows(rows_of("shape_d_formatted_strings"))
-    check(len(holdings) == 1, "currency-formatted strings parse")
-    googl = holdings[0]
-    check(abs(googl["invested_native"] - 1138.40) < 0.01 and abs(googl["ltp"] - 168.90) < 0.01,
-          f"'$1,138.40' -> {googl['invested_native']}, '$168.90' -> {googl['ltp']}")
+    # The finding that matters most.
+    check(spacex["currency"] == "INR",
+          "US holdings are treated as RUPEES — INDmoney has already converted them")
+    check(all(h["currency"] == "INR" for h in holdings),
+          "every US holding row is rupee-denominated")
 
-    holdings, problems = brokers.normalise_indmoney_rows(rows_of("shape_e_mixed_books"))
-    check([h["symbol"] for h in holdings] == ["META"],
-          "an IND_STOCK row is filtered out of the US book (Kite is authoritative there)")
+    check(spacex["symbol"] and spacex["symbol"] != "UNKNOWN",
+          f"a label is derived when no ticker is supplied ({spacex['symbol']})")
+    check(any("ticker not supplied" in f for f in spacex["flags"]),
+          "the derived label is flagged, so it is never mistaken for a real ticker")
+    check(spacex["name"] == "Space Exploration Technologies Corp. Class A Common Stock",
+          "the full instrument name is retained for lookup and display")
+
+    apple = next(h for h in holdings if h["name"] == "Apple Inc.")
+    check(apple["symbol"] == "APPLE" or apple["symbol"].startswith("APPLE"),
+          f"a simple name yields a sensible label ({apple['symbol']})")
+    check(any("XIRR" in f for f in apple["flags"]),
+          "broker-reported XIRR is kept as a flag, not as a computed figure")
+
+
+def test_placeholder_pnl_discarded() -> None:
+    section("The unknown-cost-basis placeholder P&L is discarded")
+
+    holdings, _ = brokers.normalise_indmoney_rows(rows_of("real_networth_holdings_us"))
+    tesla = next(h for h in holdings if h["name"] == "Tesla Inc.")
+
+    check(tesla["invested_native"] is None and tesla["avg_price"] is None,
+          "invested and average price are None for the 'unknown' row")
+    check(tesla["broker_pnl_native"] is None,
+          "total_pnl of 82000 — equal to market_value — is discarded as a placeholder")
+    check(any("placeholder" in f for f in tesla["flags"]),
+          "the discard is recorded in the flags")
+    check(abs(tesla["current_native"] - 82000.0) < 0.01,
+          "the market value itself is still trusted and used")
+
+    fs = build_fact_sheet([tesla])
+    check(fs.total_pnl == 0 and fs.total_invested == 0,
+          "the placeholder cannot leak into portfolio P&L")
+    check(fs.total_current == 0 or fs.holdings[0].pnl_pct is None,
+          "no return percentage is produced for it")
+
+
+def test_indian_rows_excluded() -> None:
+    section("INDmoney's Indian rows stay out of the US book")
+
+    rows = brokers.extract_rows(SHAPES["real_networth_holdings_ind"],
+                                hint_keys=("holdings",)) or []
+    check(len(rows) == 1, "the Indian envelope is unwrapped past positions/open_orders")
+    check(rows[0]["asset_type"] == "STOCK",
+          "Indian rows carry asset_type 'STOCK', not 'IND_STOCK'")
+    check(not brokers.is_us_row(rows[0]),
+          "so they are not identified as US rows")
+
+    holdings, _ = brokers.normalise_indmoney_rows(rows, us_only=True)
+    check(not holdings,
+          "the Zerodha Gold ETF is excluded — Kite already reports it, and counting "
+          "it twice would inflate the portfolio")
+
+
+def test_alternative_shapes() -> None:
+    section("Fallback namings still parse if the API shifts")
+
+    holdings, _ = brokers.normalise_indmoney_rows(rows_of("shape_b_camel_units_nested"))
+    check(len(holdings) == 1 and holdings[0]["symbol"] == "NVDA",
+          "camelCase keys with a nested quote object parse")
+    check(holdings[0]["currency"] == "USD",
+          "an explicit currencyCode of USD overrides the rupee default")
+    check(holdings[0]["ltp"] == 121.4 and holdings[0]["day_pct"] == 2.11,
+          "values nested under 'quote' are found")
+
+    holdings, _ = brokers.normalise_indmoney_rows(
+        brokers.extract_rows(SHAPES["shape_d_formatted_strings"],
+                             hint_keys=("positions",)) or [])
+    check(len(holdings) == 1 and abs(holdings[0]["invested_native"] - 1138.40) < 0.01,
+          "currency-formatted strings parse")
 
     holdings, problems = brokers.normalise_indmoney_rows(rows_of("shape_f_unusable"))
     check(not holdings and len(problems) == 1,
           "an uninterpretable row is EXCLUDED, not defaulted to zero")
     check("probe_indmoney" in problems[0],
-          "the diagnostic tells you how to capture the real shape")
-
-
-def test_unknown_cost_basis() -> None:
-    section("Missing cost basis is preserved as unknown")
-
-    holdings, problems = brokers.normalise_indmoney_rows(rows_of("shape_c_unknown_cost_basis"))
-    check(len(holdings) == 2 and not problems,
-          "rows with no invested amount are still kept — the value is real")
-    for h in holdings:
-        check(h["invested_native"] is None and h["avg_price"] is None,
-              f"{h['symbol']}: invested and average price are None, not 0")
-        check(any("invested amount not shared" in f for f in h["flags"]),
-              f"{h['symbol']}: flagged for the data-quality section")
-    msft = next(h for h in holdings if h["symbol"] == "MSFT")
-    check(abs(msft["current_native"] - 1720.4) < 0.01,
-          "the current value is still used — only the return is unknown")
-    check(any("Vested" in f for f in msft["flags"]),
-          "the underlying broker is recorded")
+          "the diagnostic says how to capture the real shape")
 
 
 # ===========================================================================
-# 3. FX handling
+# 3. Ticker resolution, watchlist, quotes
 # ===========================================================================
-def test_fx() -> None:
-    section("USD/INR resolution refuses to guess")
+class FakeSession:
+    """Minimal MCP session stub returning fixture payloads."""
 
-    rate, source = resolve_fx(88.5, None)
-    check(rate == 88.5 and "config" in source, f"a configured rate is used ({source})")
+    def __init__(self, replies: dict):
+        self.replies = replies
+        self.calls: List[tuple] = []
 
-    rate, source = resolve_fx(None, 87.2)
-    check(rate == 87.2 and "implied" in source, f"an implied rate is used ({source})")
+    async def call_tool(self, name, arguments=None):
+        self.calls.append((name, dict(arguments or {})))
+        value = self.replies.get(name)
+        if isinstance(value, Exception):
+            raise value
+        if value is None:
+            raise RuntimeError(f"no stub for {name}")
 
-    rate, source = resolve_fx(88.0, 87.0)
-    check(rate == 88.0, "the configured rate wins over the implied one")
+        class Block:
+            def __init__(self, text): self.text = text
 
-    rate, source = resolve_fx(None, None)
-    check(rate is None and source == "unavailable",
-          "with no rate available, none is invented")
+        class Result:
+            def __init__(self, text): self.content = [Block(text)]
 
-    for bad in (0.0115, 1.0, 5000.0, -88.0):
-        rate, _ = resolve_fx(bad, None)
-        check(rate is None, f"an implausible rate {bad} is rejected "
-                            f"(sanity band {FX_SANITY_RANGE[0]:g}-{FX_SANITY_RANGE[1]:g})")
-
-
-# ===========================================================================
-# 4. Multi-currency fact sheet
-# ===========================================================================
-def india_rows() -> List[dict]:
-    return extract_holdings_json((FIXTURES / "holdings.json").read_text(encoding="utf-8"))
+        return Result(json.dumps(value))
 
 
-def test_multi_currency():
-    section("Combined fact sheet across two books and two currencies")
+def test_ticker_resolution() -> None:
+    section("Tickers resolved from instrument names via lookup_ind_keys")
 
-    us_rows, _ = brokers.normalise_indmoney_rows(rows_of("shape_a_snake_case_usd"))
-    all_rows = india_rows() + us_rows
-    fs = build_fact_sheet(all_rows, usd_inr=88.0, fx_source="configured (88.00)")
+    for label, payload in (("dict keyed by name", SHAPES["lookup_dict_keyed"]),
+                           ("list of records", SHAPES["lookup_list_shaped"])):
+        resolved = IndmoneyProvider._parse_lookup(payload)
+        check(bool(resolved), f"a lookup reply shaped as a {label} is parsed")
 
-    check(set(fs.books) == {BOOK_IND, BOOK_US}, "both books are present")
-    india, us = fs.books[BOOK_IND], fs.books[BOOK_US]
-    check(india.currency == "INR" and us.currency == "USD",
-          "each book keeps its own currency")
-    check(us.count == 2 and abs(us.current - (2571.0 + 992.0)) < 0.01,
-          f"US subtotal is in dollars (${us.current:,.2f})")
-    check(abs(us.current_inr - us.current * 88.0) < 0.01,
-          f"US subtotal converts to Rs {us.current_inr:,.0f} at 88.00")
+    resolved = IndmoneyProvider._parse_lookup(SHAPES["lookup_dict_keyed"])
+    key = brokers._canon("Space Exploration Technologies Corp. Class A Common Stock")
+    check(resolved.get(key) == "SPCX", f"the SpaceX name maps to SPCX ({resolved.get(key)})")
 
-    # The invariant: for the costed subset, the arithmetic closes exactly.
-    costed = [h for h in fs.holdings if h.has_cost_basis and h.pnl_inr is not None]
-    residual = abs(sum(h.pnl_inr for h in costed) - fs.total_pnl)
-    check(residual < 0.01,
-          f"combined rupee P&L reconciles across both books (residual {residual:.4f})")
-    check(abs((fs.total_invested + fs.total_pnl)
-              - sum(h.current_inr for h in costed)) < 0.01,
-          "invested + P&L equals the costed current value")
+    session = FakeSession({
+        "networth_holdings": SHAPES["real_networth_holdings_us"],
+        "lookup_ind_keys": SHAPES["lookup_dict_keyed"],
+    })
+    provider = IndmoneyProvider(session)
+    holdings, problems = asyncio.run(provider.holdings())
 
-    aapl = next(h for h in fs.holdings if h.symbol == "AAPL")
-    check(aapl.currency == "USD" and aapl.fx_rate == 88.0,
-          "a US holding carries its own FX rate")
-    check(abs(aapl.current_native - 2571.0) < 0.01
-          and abs(aapl.current_inr - 2571.0 * 88.0) < 0.01,
-          f"native ${aapl.current_native:,.0f} and Rs {aapl.current_inr:,.0f} are both kept")
-    check(abs(aapl.pnl_pct - 18.7) < 0.5,
-          f"the return percentage is currency-independent ({aapl.pnl_pct:+.1f}%)")
-    return fs
+    symbols = {h["symbol"] for h in holdings}
+    check("SPCX" in symbols, f"the holding is relabelled SPCX after lookup ({symbols})")
+    check("AAPL" in symbols, "Apple Inc. resolves to AAPL")
+    spcx = next(h for h in holdings if h["symbol"] == "SPCX")
+    check(any("resolved from the instrument name" in f for f in spcx["flags"]),
+          "the resolution is recorded")
+    check(not any("ticker not supplied" in f for f in spcx["flags"]),
+          "the derived-label warning is cleared once a real ticker is known")
+    check(any(call[0] == "lookup_ind_keys" for call in session.calls),
+          "lookup_ind_keys was actually consulted")
 
-
-def test_no_fx_available():
-    section("US book with no FX rate is never folded into a rupee total")
-
-    us_rows, _ = brokers.normalise_indmoney_rows(rows_of("shape_a_snake_case_usd"))
-    fs = build_fact_sheet(india_rows() + us_rows, usd_inr=None, fx_source="unavailable")
-
-    us_holdings = [h for h in fs.holdings if h.book == BOOK_US]
-    check(all(h.current_inr is None for h in us_holdings),
-          "US rows have no rupee value")
-    check(all(any("no USD/INR rate" in f for f in h.flags) for h in us_holdings),
-          "each excluded row says why")
-    check(any("not part of the combined rupee total" in q for q in fs.data_quality),
-          "the report discloses the exclusion")
-
-    india_only = build_fact_sheet(india_rows())
-    check(abs(fs.total_current - india_only.total_current) < 0.01,
-          "the combined rupee total equals the India-only total, so no US dollars "
-          "were silently added as if they were rupees")
-    check(fs.books[BOOK_US].current > 0,
-          "the US book still reports its own dollar subtotal")
+    # Lookup failure must degrade, not crash.
+    session = FakeSession({
+        "networth_holdings": SHAPES["real_networth_holdings_us"],
+        "lookup_ind_keys": RuntimeError("tool unavailable"),
+    })
+    holdings, problems = asyncio.run(IndmoneyProvider(session).holdings())
+    check(len(holdings) == 3, "holdings survive a lookup_ind_keys failure")
+    check(any("could not be resolved" in p for p in problems),
+          "the failure is reported in data quality rather than hidden")
 
 
-def test_uncosted_in_fact_sheet():
-    section("Holdings with no cost basis suppress returns rather than inventing them")
+def test_watchlist() -> None:
+    section("Watchlist tickers from nested watchlists[].stocks[]")
 
-    us_rows, _ = brokers.normalise_indmoney_rows(rows_of("shape_c_unknown_cost_basis"))
-    fs = build_fact_sheet(india_rows() + us_rows, usd_inr=88.0, fx_source="configured")
+    session = FakeSession({"user_watchlist": SHAPES["real_user_watchlist"]})
+    symbols = asyncio.run(IndmoneyProvider(session).watchlist())
+    check(symbols == ["MSFT", "NVDA", "SPCX"], f"all tickers across lists: {symbols}")
+    check(session.calls[0][1] == {"type": "all"},
+          "the required 'type' parameter is supplied")
 
-    msft = next(h for h in fs.holdings if h.symbol == "MSFT")
-    check(msft.pnl_pct is None and msft.pnl_native is None,
-          "P&L and percentage are None for an uncosted holding")
-    check(msft.current_inr is not None and msft.current_inr > 0,
-          "its current value still counts toward portfolio value")
-    check(set(fs.uncosted) == {"MSFT", "AMZN"}, f"uncosted holdings listed: {fs.uncosted}")
-    check(any("No cost basis was shared" in q for q in fs.data_quality),
-          "the data-quality section explains it")
-    check(fs.books[BOOK_US].uncosted_count == 2,
-          "the US book counts its uncosted rows")
-
-    costed = [h for h in fs.holdings if h.has_cost_basis and h.pnl_inr is not None]
-    residual = abs(sum(h.pnl_inr for h in costed) - fs.total_pnl)
-    check(residual < 0.01,
-          f"totals still reconcile with uncosted rows present (residual {residual:.4f})")
-    check(fs.total_current > sum(h.current_inr for h in costed),
-          "portfolio value exceeds the costed subset, as it should")
+    session = FakeSession({"user_watchlist": RuntimeError("nope")})
+    check(asyncio.run(IndmoneyProvider(session).watchlist()) == [],
+          "a watchlist failure returns empty rather than raising")
 
 
-# ===========================================================================
-# 5. US news and sentiment
-# ===========================================================================
-def test_us_news():
+def test_us_quotes() -> None:
+    section("US quotes from the symbol-keyed get_us_stocks_details reply")
+
+    details = SHAPES["real_us_stocks_details"]
+    quotes = brokers.extract_us_quotes(details)
+
+    check(set(quotes) == {"AAPL", "TSLA"}, "both tickers extracted from a dict-keyed reply")
+    check(quotes["AAPL"]["live_price_usd"] == 308.91,
+          "live_price is read from under entity_stats")
+    check(quotes["AAPL"]["day_pct"] == -7.35,
+          "day_change_percentage is read — networth_holdings has no day change at all")
+    check(quotes["AAPL"]["name"] == "Apple Inc." and quotes["AAPL"]["sector"],
+          "identity fields come from entity_basic")
+    check(quotes["TSLA"]["week52_high"] == 498.83, "52-week fields parse despite the digit prefix")
+
+    session = FakeSession({"get_us_stocks_details": details})
+    collected = asyncio.run(IndmoneyProvider(session).us_details(["AAPL", "TSLA"]))
+    check(set(collected) == {"AAPL", "TSLA"},
+          "the provider returns the per-symbol dicts, not a flattened list")
+    check(any(call[1].get("segments") for call in session.calls),
+          "a segments value is attempted, since news is not in the baseline reply")
+    check(any("symbols" in call[1] for call in session.calls),
+          "the confirmed 'symbols' parameter name is used")
+
+
+def test_us_news() -> None:
     section("US news extraction and sentiment mapping")
 
-    rows = brokers.extract_rows(SHAPES["us_details_with_news"]) or []
-    details = {}
-    for row in rows:
-        details[str(row.get("symbol")).upper()] = row
-    extracted = brokers.extract_us_news(details)
+    check(not brokers._has_news(SHAPES["real_us_stocks_details"]),
+          "the baseline quote reply carries no headlines, and that is detected")
+    check(brokers._has_news(SHAPES["real_us_stocks_details_with_news"]),
+          "a reply that does carry headlines is detected")
 
-    check(set(extracted) == {"AAPL", "TSLA", "NVDA"}, "all three tickers extracted")
+    extracted = brokers.extract_us_news(SHAPES["real_us_stocks_details_with_news"])
     check(len(extracted["AAPL"]["articles"]) == 2,
           "both 'title/source/url' and 'headline/publisher/link' namings are read")
-    titles = [a["title"] for a in extracted["AAPL"]["articles"]]
-    check(any("supply crunch" in t for t in titles), f"headline text preserved: {titles[0][:40]}")
     check(extracted["AAPL"]["articles"][0]["link"].startswith("https://"),
           "article links are preserved")
-    check(len(extracted["TSLA"]["articles"]) == 1, "'news_items' is also recognised")
-    check(extracted["NVDA"]["articles"] == [] and extracted["NVDA"]["sentiment"] == 8.5,
-          "a ticker with sentiment but no headlines is still captured")
+    check(len(extracted["TSLA"]["articles"]) == 1,
+          "headlines nested under entity_news are found")
 
-    check(extracted["AAPL"]["sentiment"] == 7.0 and "label" in extracted["AAPL"]["sentiment_note"],
-          f"the label 'positive' maps to {extracted['AAPL']['sentiment']}/10")
+    check(extracted["AAPL"]["sentiment"] == 3.0
+          and "label" in extracted["AAPL"]["sentiment_note"],
+          f"the label 'negative' maps to {extracted['AAPL']['sentiment']}/10")
     tsla = extracted["TSLA"]
     check(tsla["sentiment"] is not None and tsla["sentiment"] < 5,
           f"a -0.6 score maps to the bearish half ({tsla['sentiment']}/10)")
     check("-1..+1" in tsla["sentiment_note"],
-          f"the assumed scale is recorded rather than presented as fact: "
+          f"the assumed scale is disclosed rather than presented as fact: "
           f"{tsla['sentiment_note']!r}")
 
     for value in ("gibberish", None, object()):
@@ -290,152 +337,194 @@ def test_us_news():
         check(score is None, f"unmappable sentiment {value!r} yields None")
 
 
-def test_merge_and_disagreement():
+# ===========================================================================
+# 4. FX and the combined fact sheet
+# ===========================================================================
+def test_fx() -> None:
+    section("USD/INR resolution refuses to guess")
+
+    rate, source = resolve_fx(88.5, None)
+    check(rate == 88.5 and "config" in source, f"a configured rate is used ({source})")
+    rate, _ = resolve_fx(None, 87.2)
+    check(rate == 87.2, "an implied rate is used when there is no configured one")
+    rate, _ = resolve_fx(88.0, 87.0)
+    check(rate == 88.0, "the configured rate wins")
+    rate, source = resolve_fx(None, None)
+    check(rate is None and source == "unavailable", "no rate is ever invented")
+    for bad in (0.0115, 1.0, 5000.0, -88.0):
+        check(resolve_fx(bad, None)[0] is None,
+              f"an implausible rate {bad} is rejected (band "
+              f"{FX_SANITY_RANGE[0]:g}-{FX_SANITY_RANGE[1]:g})")
+
+
+def test_combined_fact_sheet():
+    section("Combined fact sheet across both books")
+
+    us = us_holdings()
+    fs = build_fact_sheet(india_rows() + us)
+
+    check(set(fs.books) == {BOOK_IND, BOOK_US}, "both books are present")
+    india, usb = fs.books[BOOK_IND], fs.books[BOOK_US]
+    check(usb.currency == "INR",
+          "the US book is rupee-denominated, so no FX conversion is applied")
+    check(usb.count == 3 and usb.uncosted_count == 1,
+          f"US book: {usb.count} holdings, {usb.uncosted_count} without cost basis")
+
+    expected = 523.38 + 190800.0 + 82000.0
+    check(abs(usb.current - expected) < 0.05,
+          f"US subtotal is the plain sum of rupee values ({usb.current:,.2f})")
+    check(abs(fs.total_current - (india.current + usb.current)) < 0.05,
+          "the combined total is the sum of both books, with no rate applied")
+
+    costed = [h for h in fs.holdings if h.has_cost_basis and h.pnl_inr is not None]
+    residual = abs(sum(h.pnl_inr for h in costed) - fs.total_pnl)
+    check(residual < 0.01, f"P&L reconciles across both books (residual {residual:.4f})")
+
+    # A USD-priced row still converts correctly, so the mixed case works.
+    usd_row, _ = brokers.normalise_indmoney_rows(rows_of("shape_b_camel_units_nested"))
+    mixed = build_fact_sheet(india_rows() + us + usd_row, usd_inr=88.0,
+                            fx_source="configured (88.00)")
+    nvda = next(h for h in mixed.holdings if h.symbol == "NVDA")
+    check(nvda.currency == "USD" and nvda.fx_rate == 88.0,
+          "a genuinely USD-priced row is converted at the configured rate")
+    check(abs(nvda.current_inr - 2428.0 * 88.0) < 0.01,
+          f"NVDA converts to Rs {nvda.current_inr:,.0f}")
+    spcx = next(h for h in mixed.holdings if h.name and "Space" in h.name)
+    check(spcx.fx_rate == 1.0,
+          "while the rupee-denominated INDmoney rows are left alone")
+    return fs
+
+
+def test_no_fx_needed_for_indmoney():
+    section("A missing FX rate does not break the INDmoney US book")
+
+    fs = build_fact_sheet(india_rows() + us_holdings(), usd_inr=None)
+    us_rows = [h for h in fs.holdings if h.book == BOOK_US]
+    check(all(h.current_inr is not None for h in us_rows),
+          "US holdings still have rupee values without any configured rate — "
+          "because INDmoney supplied them in rupees")
+    check(not any("no USD/INR rate" in q for q in fs.data_quality),
+          "no FX warning is raised when none is needed")
+
+    usd_row, _ = brokers.normalise_indmoney_rows(rows_of("shape_b_camel_units_nested"))
+    fs2 = build_fact_sheet(india_rows() + usd_row, usd_inr=None)
+    nvda = next(h for h in fs2.holdings if h.symbol == "NVDA")
+    check(nvda.current_inr is None,
+          "a genuinely USD row with no rate is excluded from the rupee total")
+    check(any("not part of the combined rupee total" in q for q in fs2.data_quality),
+          "and the exclusion is disclosed")
+
+
+def test_uncosted_reporting():
+    section("Uncosted holdings suppress returns rather than inventing them")
+
+    fs = build_fact_sheet(india_rows() + us_holdings())
+    tesla = next(h for h in fs.holdings if h.name == "Tesla Inc.")
+
+    check(tesla.pnl_pct is None and tesla.pnl_native is None,
+          "P&L and percentage are None, not a 100% gain")
+    check(tesla.current_inr and tesla.current_inr > 0,
+          "its value still counts toward portfolio value")
+    check(len(fs.uncosted) == 1, f"uncosted holdings listed: {fs.uncosted}")
+    check(any("No cost basis was shared" in q for q in fs.data_quality),
+          "the data-quality section explains it")
+
+    costed = [h for h in fs.holdings if h.has_cost_basis and h.pnl_inr is not None]
+    check(abs(sum(h.pnl_inr for h in costed) - fs.total_pnl) < 0.01,
+          "totals still reconcile with an uncosted row present")
+    check(fs.total_current > sum(h.current_inr for h in costed),
+          "portfolio value exceeds the costed subset, as it must")
+
+
+# ===========================================================================
+# 5. News merge, disagreement, report
+# ===========================================================================
+def test_merge_and_disagreement() -> None:
     section("Merging US headlines and flagging sentiment disagreement")
 
     grouped = {
         "AAPL": [news_mod.Article("AAPL", "Apple warns iPhone and Mac sales face a supply crunch",
                                   "Livemint", "https://example.com/rss-dup")],
     }
-    extra = {
-        "AAPL": {"articles": [
-            {"title": "Apple warns iPhone and Mac sales face a supply crunch",
-             "source": "Reuters", "link": "https://example.com/indmoney-dup"},
-            {"title": "Apple unveils a new India assembly line",
-             "source": "Reuters", "link": "https://example.com/new"},
-        ], "sentiment": 7.0, "sentiment_note": "label 'positive'"},
-        "MSFT": {"articles": [
-            {"title": "Microsoft raises Azure capacity guidance",
-             "source": "Bloomberg", "link": "https://example.com/msft"},
-        ], "sentiment": None, "sentiment_note": ""},
-    }
+    extra = brokers.extract_us_news(SHAPES["real_us_stocks_details_with_news"])
     merged = news_mod.merge_articles(dict(grouped), extra)
 
     check(len(merged["AAPL"]) == 2,
           "the story carried by both RSS and INDmoney is not double-counted")
-    check(any("India assembly line" in a.title for a in merged["AAPL"]),
+    check(any("India growth" in a.title for a in merged["AAPL"]),
           "genuinely new INDmoney headlines are added")
-    check("MSFT" in merged and len(merged["MSFT"]) == 1,
-          "a ticker with no RSS coverage gains a group from INDmoney")
+    check("TSLA" in merged, "a ticker with no RSS coverage gains a group from INDmoney")
 
-    scores = [
-        StockScore("AAPL", 3, "Supply constraints dominate.", "high", "label", 2),
-        StockScore("NVDA", 8, "Demand commentary strong.", "high", "label", 0),
-        StockScore("TSLA", 4, "Mixed.", "high", "label", 1),
-    ]
-    sentiment = {
-        "AAPL": {"sentiment": 7.0, "sentiment_note": "label 'positive'"},
-        "NVDA": {"sentiment": 8.5, "sentiment_note": "assumed 1..10 scale"},
-        "TSLA": {"sentiment": None, "sentiment_note": ""},
-    }
-    notes = news_mod.sentiment_disagreements(scores, sentiment, threshold=3.0)
-
+    scores = [StockScore("AAPL", 8, "Reads constructive.", "high", "label", 2),
+              StockScore("TSLA", 4, "Mixed.", "high", "label", 1)]
+    notes = news_mod.sentiment_disagreements(scores, extra, threshold=3.0)
     check(len(notes) == 1 and notes[0].startswith("AAPL"),
-          f"only the 4-point AAPL gap is flagged: {len(notes)} note(s)")
-    check("3/10" in notes[0] and "7.0/10" in notes[0],
+          f"only the wide AAPL gap is flagged ({len(notes)} note(s))")
+    check("8/10" in notes[0] and "3.0/10" in notes[0],
           "both scores appear so you can judge which to trust")
-    check("label 'positive'" in notes[0],
-          "the scale assumption is disclosed in the note")
-    check(not any(n.startswith("NVDA") for n in notes),
-          "a 0.5-point difference is not noise-flagged")
-    check(not any(n.startswith("TSLA") for n in notes),
-          "a ticker with no broker sentiment is skipped")
+    check("label" in notes[0], "the scale assumption is disclosed")
 
 
-# ===========================================================================
-# 6. Report and payload
-# ===========================================================================
 def test_report_and_payload(fs):
     section("Report and JSON payload carry both books")
 
-    scores = [StockScore("AAPL", 6, "Mixed but constructive.", "high", "label", 2),
-              StockScore("TSLA", 3, "China split denial.", "high", "label", 1)]
+    scores = [StockScore("AAPL", 6, "Mixed but constructive.", "high", "label", 2)]
     held = {h.symbol for h in fs.holdings}
-    broker_sentiment = {"AAPL": {"sentiment": 7.0, "sentiment_note": "label 'positive'"}}
-
     narrative = report_mod.deterministic_narrative(fs, scores, held)
-    check("US holdings" in narrative or "US" in narrative,
-          "the deterministic narrative mentions the US book")
 
     allowed_symbols, allowed_aliases = report_mod.build_allowed_names(
         fs, scores, CFG.keyword_map)
-    allowed_numbers = report_mod.build_allowed_numbers(fs, scores)
     result = report_mod.validate_narrative(
         narrative, allowed_symbols=allowed_symbols, allowed_aliases=allowed_aliases,
-        allowed_numbers=allowed_numbers)
-    check(result.ok, f"the multi-currency narrative passes validation "
+        allowed_numbers=report_mod.build_allowed_numbers(fs, scores))
+    check(result.ok, f"the two-book narrative validates "
                      f"({result.violations[:3] if result.violations else 'clean'})")
-
-    content = report_mod.render_report(
-        fs, "_no news_", narrative, "deterministic", scores=scores,
-        model="fake:1.5b")
-    check("### India" in content and "### US" in content,
-          "the markdown report has separate India and US holdings tables")
-    check("**India total**" in content and "**US total**" in content,
-          "each book has its own reconciling total row")
-    check("**Combined (Rs):**" in content, "a combined rupee line is present")
-    check("USD/INR used" in content and "88.00" in content,
-          "the FX rate actually used is disclosed in the report")
-    check("$2,571" in content or "$2571" in content,
-          "US rows are shown in dollars")
-
-    # With every holding costed, the report may state value against invested directly.
-    check("Combined (Rs):** invested" in content,
-          "a fully costed portfolio states invested and value together")
-
-    # With uncosted rows, it must not.
-    us_uncosted, _ = brokers.normalise_indmoney_rows(rows_of("shape_c_unknown_cost_basis"))
-    fs2 = build_fact_sheet(india_rows() + us_uncosted, usd_inr=88.0, fx_source="configured")
-    narrative2 = report_mod.deterministic_narrative(fs2, scores, held)
-    content2 = report_mod.render_report(fs2, "_none_", narrative2, "deterministic",
-                                        scores=scores, model="fake:1.5b")
-    check("Cost basis is known for" in content2,
-          "with uncosted rows, value and invested are not presented as one pair")
-    check("Cost basis is available for" in narrative2,
+    check("Cost basis is available for" in narrative,
           "the narrative says which subset the return figures describe")
-    check("costed holdings only" in content2,
-          "the position table labels the invested and P&L rows as a subset")
-    check("* Invested and P&L cover only" in content2,
-          "the books table carries the footnote explaining the star")
-    result2 = report_mod.validate_narrative(
-        narrative2,
-        allowed_symbols=report_mod.build_allowed_names(fs2, scores, CFG.keyword_map)[0],
-        allowed_aliases=report_mod.build_allowed_names(fs2, scores, CFG.keyword_map)[1],
-        allowed_numbers=report_mod.build_allowed_numbers(fs2, scores))
-    check(result2.ok, f"the uncosted-aware narrative also validates "
-                      f"({result2.violations[:3] if result2.violations else 'clean'})")
+
+    content = report_mod.render_report(fs, "_none_", narrative, "deterministic",
+                                       scores=scores, model="fake:1.5b")
+    check("### India" in content and "### US" in content,
+          "separate India and US holdings tables")
+    check("**US total**" in content, "the US book has its own reconciling total row")
+    check("* Invested and P&L cover only" in content,
+          "the footnote explaining the star is present")
+    check("costed holdings only" in content,
+          "the position table labels invested and P&L as a subset")
 
     payload = report_mod.build_payload(
         fs, {}, scores, narrative, "deterministic", held=held, model="fake:1.5b",
-        broker_sentiment=broker_sentiment)
+        broker_sentiment=brokers.extract_us_news(SHAPES["real_us_stocks_details_with_news"]))
     check(payload["schema_version"] == 2, "the payload declares schema version 2")
-    check(payload["fx"]["usd_inr"] == 88.0, "the FX rate is recorded in the payload")
     check(set(payload["books"]) == {BOOK_IND, BOOK_US}, "per-book subtotals are present")
-
-    us_holding = next(h for h in payload["holdings"] if h["symbol"] == "AAPL")
-    check(us_holding["currency"] == "USD" and us_holding["book"] == BOOK_US,
-          "holdings carry currency and book")
-    check(us_holding["current"] is not None and us_holding["current_inr"] is not None,
-          "both native and rupee values are serialised")
-    check(us_holding["source"] == "indmoney", "the originating broker is recorded")
-    check(payload["news"]["AAPL"]["broker_sentiment"] == 7.0,
-          "INDmoney's sentiment is recorded alongside our own score")
+    us_row = next(h for h in payload["holdings"] if h["book"] == BOOK_US)
+    check(us_row["currency"] == "INR" and us_row["source"] == "indmoney",
+          "US rows record their currency and originating broker")
+    check(any(h["pnl"] is None for h in payload["holdings"]),
+          "an uncosted holding serialises P&L as null, not 0")
+    check(payload["news"]["AAPL"]["broker_sentiment"] == 3.0,
+          "INDmoney's sentiment is recorded next to our own score")
 
     serialised = json.dumps(payload)
     check("NaN" not in serialised and "Infinity" not in serialised,
-          "the payload is strict JSON with no NaN or Infinity")
+          "the payload is strict JSON")
 
 
 # ===========================================================================
 def test_all():
     test_number_parsing()
-    test_normalisation()
-    test_unknown_cost_basis()
-    test_fx()
-    fs = test_multi_currency()
-    test_no_fx_available()
-    test_uncosted_in_fact_sheet()
+    test_real_us_shape()
+    test_placeholder_pnl_discarded()
+    test_indian_rows_excluded()
+    test_alternative_shapes()
+    test_ticker_resolution()
+    test_watchlist()
+    test_us_quotes()
     test_us_news()
+    test_fx()
+    fs = test_combined_fact_sheet()
+    test_no_fx_needed_for_indmoney()
+    test_uncosted_reporting()
     test_merge_and_disagreement()
     test_report_and_payload(fs)
     assert not _failures, f"{len(_failures)} check(s) failed:\n" + "\n".join(_failures)

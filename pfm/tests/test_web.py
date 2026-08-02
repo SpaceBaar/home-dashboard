@@ -84,9 +84,17 @@ def make_reports(report_dir: Path, days: int = 4, *, with_us: bool = True) -> Tu
     if with_us:
         import brokers
         shapes = json.loads((FIXTURES / "indmoney_us_shapes.json").read_text(encoding="utf-8"))
-        for key in ("shape_a_snake_case_usd", "shape_c_unknown_cost_basis"):
-            rows, _ = brokers.normalise_indmoney_rows(brokers.extract_rows(shapes[key]) or [])
-            us_rows.extend(rows)
+        rows = brokers.extract_rows(shapes["real_networth_holdings_us"],
+                                    hint_keys=("holdings",)) or []
+        us_rows, _ = brokers.normalise_indmoney_rows(rows)
+        # Stand in for lookup_ind_keys, which needs a live session.
+        for row in us_rows:
+            if "Space Exploration" in (row.get("name") or ""):
+                row["symbol"] = "SPCX"
+            elif row.get("name") == "Apple Inc.":
+                row["symbol"] = "AAPL"
+            elif row.get("name") == "Tesla Inc.":
+                row["symbol"] = "TSLA"
 
     grouped = {
         "TATAPOWER": [
@@ -211,7 +219,7 @@ def test_payload_shape(dates: List[str]) -> None:
           "the holdings count matches the holdings array")
     check(payload["fx"]["usd_inr"] == 88.0 and set(payload["books"]) == {"IND", "US"},
           "the payload carries the FX rate and both book subtotals")
-    check(sorted(payload["uncosted"]) == ["AMZN", "MSFT"],
+    check(payload["uncosted"] == ["TSLA"],
           f"uncosted holdings are listed: {payload['uncosted']}")
 
     news = payload["news"]
@@ -335,12 +343,13 @@ def test_http(dates: List[str], legacy_date: str) -> None:
               "the books summary card renders when both books are present")
         check("India" in body and ">US<" in body.replace(" ", "") or "US" in body,
               "both books are labelled")
-        check("Value (₹)" in body,
-              "the US table carries a rupee column alongside dollar figures")
-        check("$" in body and "₹" in body,
-              "dollars and rupees both appear, each in its own book")
-        check("USD/INR 88.00" in body or "88.00" in body,
-              "the FX rate used is disclosed in the browser")
+        # INDmoney reports US holdings already in rupees, so the US book is INR
+        # too and no dollar figures appear. That is the correct behaviour, not a
+        # missing conversion.
+        check("₹" in body and "$" not in body,
+              "both books render in rupees, because INDmoney pre-converts the US book")
+        check("SPCX" in body and "AAPL" in body,
+              "US tickers appear once resolved")
         check("without cost basis" in body,
               "the US book flags holdings with no cost basis")
         check("INDmoney 7.0/10" in body,

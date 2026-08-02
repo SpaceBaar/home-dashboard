@@ -1,38 +1,203 @@
 {
-  "_note": "Plausible INDmoney networth_holdings response shapes. INDmoney publishes no field-level schema, so the normaliser is tested against several namings rather than one guess. Replace these with real captures from tools/probe_indmoney.py once available.",
+  "_note": "Structures captured from the live INDmoney MCP server on 2026-08-02 via tools/probe_indmoney.py. Field names and nesting are real; the figures have been replaced with representative values so no actual holdings are committed to the repository. The alternative-naming shapes further down guard against the API shifting.",
 
-  "shape_a_snake_case_usd": {
-    "data": [
+  "real_networth_holdings_us": {
+    "holdings": [
       {
-        "symbol": "AAPL",
-        "name": "Apple Inc",
-        "asset_class": "US_STOCK",
-        "currency": "USD",
-        "quantity": 12,
-        "average_price": 180.5,
-        "last_price": 214.25,
-        "invested_amount": 2166.0,
-        "current_value": 2571.0,
-        "pnl": 405.0,
-        "pnl_percentage": 18.7,
-        "day_change_percentage": 0.94,
-        "xirr": 21.4,
-        "broker": "INDmoney"
+        "investment_code": "203532",
+        "investment": "Space Exploration Technologies Corp. Class A Common Stock",
+        "asset_type": "US_STOCK",
+        "assetclass_l2": "Global Equity",
+        "invested_amount": 954.2,
+        "market_value": 523.38,
+        "holding_percent": 0.1586,
+        "total_pnl": -430.82,
+        "pnl_per": -45.15,
+        "xirr": 0,
+        "total_units": 0.05061407,
+        "unit_price": 10340.67,
+        "broker": "INDmoney",
+        "market_cap": ""
       },
       {
-        "symbol": "TSLA",
-        "name": "Tesla Inc",
-        "asset_class": "US_STOCK",
-        "currency": "USD",
-        "quantity": 5,
-        "average_price": 240.0,
-        "last_price": 198.4,
-        "invested_amount": 1200.0,
-        "current_value": 992.0,
-        "pnl": -208.0,
-        "pnl_percentage": -17.33,
-        "day_change_percentage": -1.42
+        "investment_code": "118186",
+        "investment": "Apple Inc.",
+        "asset_type": "US_STOCK",
+        "assetclass_l2": "Global Equity",
+        "invested_amount": 158400.0,
+        "market_value": 190800.0,
+        "holding_percent": 5.36,
+        "total_pnl": 32400.0,
+        "pnl_per": 20.45,
+        "xirr": 18.2,
+        "total_units": 7.0,
+        "unit_price": 27257.14,
+        "broker": "INDmoney",
+        "market_cap": "Mega Cap"
+      },
+      {
+        "investment_code": "116683",
+        "investment": "Tesla Inc.",
+        "asset_type": "US_STOCK",
+        "assetclass_l2": "Global Equity",
+        "invested_amount": "unknown",
+        "market_value": 82000.0,
+        "holding_percent": 2.3,
+        "total_pnl": 82000.0,
+        "pnl_per": 0,
+        "xirr": 0,
+        "total_units": 3.0,
+        "unit_price": 27333.33,
+        "broker": "Vested",
+        "market_cap": "Mega Cap"
       }
+    ]
+  },
+
+  "real_networth_holdings_ind": {
+    "is_cached_response": false,
+    "holding_error": false,
+    "position_error": false,
+    "positions": null,
+    "open_orders": [],
+    "holdings": [
+      {
+        "investment_code": "INDS29570",
+        "investment": "Zerodha Gold ETF",
+        "asset_type": "STOCK",
+        "assetclass_l2": "Gold",
+        "invested_amount": "unknown",
+        "market_value": 1650.2,
+        "holding_percent": 0.947,
+        "total_pnl": 1650.2,
+        "pnl_per": 0,
+        "xirr": 0,
+        "total_units": 74,
+        "unit_price": 22.3,
+        "broker": "Zerodha",
+        "market_cap": "Others"
+      }
+    ]
+  },
+
+  "real_us_stocks_details": {
+    "AAPL": {
+      "entity_class": "STOCK",
+      "entity_basic": {
+        "name": "Apple Inc.",
+        "short_name": "Apple Inc.",
+        "display_name": "Apple Inc.",
+        "symbol": "AAPL",
+        "ind_key": "AAPL",
+        "market_cap_in_currency": 4897204862976,
+        "market_cap": "Mega Cap",
+        "sector": "Information Technology",
+        "is_active": true
+      },
+      "entity_stats": {
+        "live_price": 308.91,
+        "day_change": -24.52,
+        "day_change_percentage": -7.35,
+        "day_low": 300,
+        "day_high": 310.1,
+        "day_open": 304.81,
+        "prev_close": 333.43,
+        "52week_high": 344.5699,
+        "52week_low": 201.5,
+        "last_updated": "2026-08-01 08:45:50",
+        "volume": 135739227,
+        "ext_hr_live_price": 307.34,
+        "ext_hr_day_change_percentage": -0.51
+      }
+    },
+    "TSLA": {
+      "entity_class": "STOCK",
+      "entity_basic": {
+        "name": "Tesla Inc.",
+        "symbol": "TSLA",
+        "ind_key": "TSLA",
+        "market_cap": "Mega Cap",
+        "sector": "Consumer Discretionary"
+      },
+      "entity_stats": {
+        "live_price": 311.21,
+        "day_change": 2.36,
+        "day_change_percentage": 0.76,
+        "prev_close": 308.85,
+        "52week_high": 498.83,
+        "52week_low": 297.38,
+        "last_updated": "2026-08-01 08:45:57"
+      }
+    }
+  },
+
+  "real_us_stocks_details_with_news": {
+    "AAPL": {
+      "entity_basic": { "symbol": "AAPL", "name": "Apple Inc." },
+      "entity_stats": { "live_price": 308.91, "day_change_percentage": -7.35 },
+      "news": [
+        {
+          "title": "Apple warns iPhone and Mac sales face a supply crunch",
+          "source": "Reuters",
+          "url": "https://example.com/aapl-supply",
+          "sentiment": "negative"
+        },
+        {
+          "headline": "Apple rides rising Mac demand to sustain India growth",
+          "publisher": "Livemint",
+          "link": "https://example.com/aapl-india"
+        }
+      ],
+      "sentiment": "negative"
+    },
+    "TSLA": {
+      "entity_basic": { "symbol": "TSLA" },
+      "entity_stats": { "live_price": 311.21, "day_change_percentage": 0.76 },
+      "entity_news": {
+        "news_items": [
+          {
+            "title": "Musk rejects report of Tesla China business split",
+            "source": "Bloomberg",
+            "url": "https://example.com/tsla-china"
+          }
+        ],
+        "sentiment_score": -0.6
+      }
+    }
+  },
+
+  "real_user_watchlist": {
+    "type": "all",
+    "watchlists": [
+      {
+        "name": "Watchlist 1",
+        "watchlist_id": 7858608,
+        "stocks": [{ "ind_key": "SPCX", "ticker": "SPCX" }]
+      },
+      {
+        "name": "US ideas",
+        "watchlist_id": 7858609,
+        "stocks": [
+          { "ind_key": "NVDA", "ticker": "NVDA" },
+          { "ind_key": "MSFT", "ticker": "MSFT" }
+        ]
+      },
+      { "name": "Empty", "watchlist_id": 7858610, "stocks": [] }
+    ]
+  },
+
+  "lookup_dict_keyed": {
+    "Space Exploration Technologies Corp. Class A Common Stock": {
+      "ind_key": "SPCX",
+      "name": "Space Exploration Technologies Corp. Class A Common Stock"
+    },
+    "Apple Inc.": { "ind_key": "AAPL", "name": "Apple Inc." }
+  },
+
+  "lookup_list_shaped": {
+    "results": [
+      { "name": "Tesla Inc.", "ind_key": "TSLA" },
+      { "name": "Microsoft Corporation", "ind_key": "MSFT" }
     ]
   },
 
@@ -51,114 +216,23 @@
     ]
   },
 
-  "shape_c_unknown_cost_basis": {
-    "rows": [
-      {
-        "symbol": "MSFT",
-        "asset_class": "US_STOCK",
-        "currency": "USD",
-        "units": 4,
-        "unit_price": 430.1,
-        "current_value": 1720.4,
-        "invested_amount": "unknown",
-        "broker": "Vested",
-        "_note": "INDmoney documents that broker-imported rows may omit cost basis"
-      },
-      {
-        "symbol": "AMZN",
-        "asset_class": "US_STOCK",
-        "currency": "USD",
-        "units": 3,
-        "unit_price": 201.0,
-        "current_value": 603.0,
-        "invested_amount": null
-      }
-    ]
-  },
-
   "shape_d_formatted_strings": {
     "positions": [
       {
-        "scrip": "GOOGL",
+        "ticker": "GOOGL",
         "asset_type": "US_STOCK",
-        "quantity": "8",
+        "total_units": "8",
         "avg_price": "$142.30",
-        "market_price": "$168.90",
-        "invested": "$1,138.40",
+        "unit_price": "$168.90",
+        "invested_amount": "$1,138.40",
         "market_value": "$1,351.20",
-        "change_percent": "+0.62%",
-        "trade_currency": "USD"
-      }
-    ]
-  },
-
-  "shape_e_mixed_books": {
-    "data": [
-      {
-        "symbol": "META",
-        "asset_class": "US_STOCK",
-        "currency": "USD",
-        "units": 2,
-        "unit_price": 600.0,
-        "invested_amount": 900.0,
-        "current_value": 1200.0
-      },
-      {
-        "symbol": "RELIANCE",
-        "asset_class": "IND_STOCK",
-        "currency": "INR",
-        "units": 10,
-        "unit_price": 1400.0,
-        "invested_amount": 12000.0,
-        "current_value": 14000.0
+        "day_change_percentage": "+0.62%",
+        "currency": "USD"
       }
     ]
   },
 
   "shape_f_unusable": {
-    "data": [
-      { "some_id": 4412, "note": "no symbol, no value, nothing usable" }
-    ]
-  },
-
-  "us_details_with_news": {
-    "data": [
-      {
-        "symbol": "AAPL",
-        "price": 214.25,
-        "market_cap": 3250000000000,
-        "sentiment": "positive",
-        "news": [
-          {
-            "title": "Apple warns iPhone and Mac sales face a supply crunch",
-            "source": "Reuters",
-            "url": "https://example.com/aapl-supply"
-          },
-          {
-            "headline": "Apple rides rising Mac demand to sustain India growth",
-            "publisher": "Livemint",
-            "link": "https://example.com/aapl-india"
-          }
-        ]
-      },
-      {
-        "symbol": "TSLA",
-        "price": 198.4,
-        "sentiment_score": -0.6,
-        "news_items": [
-          {
-            "title": "Musk rejects report of Tesla China business split",
-            "source": "Bloomberg",
-            "url": "https://example.com/tsla-china"
-          }
-        ]
-      },
-      {
-        "symbol": "NVDA",
-        "price": 121.4,
-        "sentiment": 8.5,
-        "news": []
-      }
-    ]
+    "holdings": [{ "some_id": 4412, "note": "no name, no value, nothing usable" }]
   }
 }

@@ -429,10 +429,16 @@ def render_report(
     lines.append("")
 
     # -- per-book summary, only when there is more than one book -------------
+    # A rupee column is pointless when every book is already in rupees, which is
+    # the normal case: INDmoney pre-converts the US book.
+    show_inr_column = any(t.currency != "INR" for t in fs.books.values())
+
     if len(fs.books) > 1:
+        inr_head = " Value (Rs) |" if show_inr_column else ""
+        inr_rule = " --: |" if show_inr_column else ""
         lines += ["## Books", "",
-                  "| Book | Holdings | Invested | Value | P&L | P&L % | Value (Rs) |",
-                  "| --- | --: | --: | --: | --: | --: | --: |"]
+                  f"| Book | Holdings | Invested | Value | P&L | P&L % |{inr_head}",
+                  f"| --- | --: | --: | --: | --: | --: |{inr_rule}"]
         needs_footnote = False
         for key, label in ((BOOK_IND, "India"), (BOOK_US, "US")):
             totals = fs.books.get(key)
@@ -442,13 +448,18 @@ def render_report(
             # A star marks figures that cover only the holdings with a cost basis.
             star = "*" if totals.uncosted_count else ""
             needs_footnote = needs_footnote or bool(star)
+            inr_cell = f" {_money(totals.current_inr, 'Rs')} |" if show_inr_column else ""
             lines.append(
                 f"| {label} ({totals.currency}) | {totals.count} | "
                 f"{_money(totals.invested, unit)}{star} | {unit}{totals.current:,.0f} | "
                 f"{_money(totals.pnl, unit, signed=True)}{star} | "
-                f"{_pct(totals.pnl_pct)}{star} | {_money(totals.current_inr, 'Rs')} |"
+                f"{_pct(totals.pnl_pct)}{star} |{inr_cell}"
             )
         lines.append("")
+        us_book = fs.books.get(BOOK_US)
+        if us_book and us_book.currency == "INR":
+            lines += ["_The US book is shown in rupees because INDmoney reports US "
+                      "positions already converted; no exchange rate is applied here._", ""]
         if needs_footnote:
             lines += [
                 "_* Invested and P&L cover only the holdings whose cost basis the broker "
@@ -464,22 +475,27 @@ def render_report(
             continue
         if len(fs.books) > 1:
             lines += [f"### {label}", ""]
-        lines += ["| Symbol | Qty | Avg | LTP | Invested | Value | P&L | P&L % | Today | Value (Rs) |",
-                  "| --- | --: | --: | --: | --: | --: | --: | --: | --: | --: |"]
+        inr_head = " Value (Rs) |" if show_inr_column else ""
+        inr_rule = " --: |" if show_inr_column else ""
+        lines += [f"| Symbol | Qty | Avg | LTP | Invested | Value | P&L | P&L % | "
+                  f"Today |{inr_head}",
+                  f"| --- | --: | --: | --: | --: | --: | --: | --: | --: |{inr_rule}"]
         unit = _CCY.get(rows[0].currency, rows[0].currency)
         for h in rows:
+            inr_cell = f" {_money(h.current_inr, 'Rs')} |" if show_inr_column else ""
             lines.append(
                 f"| {h.symbol} | {h.quantity:g} | {_plain(h.avg_price)} | {_plain(h.ltp)} | "
                 f"{_money(h.invested_native, unit)} | {unit}{h.current_native:,.0f} | "
                 f"{_money(h.pnl_native, unit, signed=True)} | {_pct(h.pnl_pct)} | "
-                f"{_pct(h.day_pct, decimals=2)} | {_money(h.current_inr, 'Rs')} |"
+                f"{_pct(h.day_pct, decimals=2)} |{inr_cell}"
             )
         totals = fs.books.get(key)
         if totals:
+            inr_cell = f" **{_money(totals.current_inr, 'Rs')}** |" if show_inr_column else ""
             lines.append(
                 f"| **{label} total** | | | | **{_money(totals.invested, unit)}** | "
                 f"**{unit}{totals.current:,.0f}** | **{_money(totals.pnl, unit, signed=True)}** | "
-                f"**{_pct(totals.pnl_pct)}** | | **{_money(totals.current_inr, 'Rs')}** |"
+                f"**{_pct(totals.pnl_pct)}** | |{inr_cell}"
             )
         lines.append("")
 

@@ -146,52 +146,84 @@ Open the printed URL on your phone or laptop, complete OTP + MPIN **on
 INDmoney's own page**, and approve the consent screen. Your credentials never
 pass through this code. Once cached, the daemon refreshes silently.
 
-### Response shapes are not guessed blindly
+### What the API actually returns
 
-INDmoney does not publish a field-level schema, so `brokers.py` matches field
-names by canonical form — `unitPrice`, `unit_price` and `Unit Price` all resolve
-to the same key — and covers several naming conventions per concept. A row it
-cannot interpret is **excluded with a diagnostic**, never defaulted to zero.
+Captured from the live server on 2026-08-02. These findings are encoded in
+`brokers.py`; the structures live in `tests/fixtures/indmoney_us_shapes.json`
+with the figures replaced.
 
-Run `tools/probe_indmoney.py` to capture the real shapes and tighten
-`_IND_FIELDS` in `brokers.py`. The probe redacts identifier fields by default
-and always preserves numbers, so the output is safe to share.
+**US holdings are already in rupees.** This is the opposite of the obvious
+assumption and the single most dangerous detail. For the captured SpaceX row,
+`0.05061407 units × 10340.67 = 523.38 market_value`, and the implied average of
+18,852 per unit only makes sense as ₹ (≈ $214 at 88) — $18,852 a share does not.
+`get_us_stocks_details`, by contrast, quotes in USD (AAPL at 308.91). Treating
+the holdings as dollars would have multiplied the US book by about 88.
 
-### Two currencies
+**There is no ticker field.** Rows carry only `investment` (a long name like
+`"Space Exploration Technologies Corp. Class A Common Stock"`) and
+`investment_code`. Tickers are resolved through `lookup_ind_keys`; if that fails,
+a label is derived from the name, **flagged as derived**, and the failure appears
+in the data-quality section — because an unresolved ticker also means news
+matching will miss that holding.
 
-Set `portfolio.usd_inr_rate` in `config.json` to fold the US book into a
-combined rupee total. Leave it `null` and the US book is reported in dollars
-only — no rate is ever assumed. Rates outside 60–140 are rejected on the
-grounds that they indicate a misread field, not a currency crisis.
+**An unknown cost basis brings a fake P&L.** `invested_amount` arrives as the
+string `"unknown"`, and INDmoney then fills `total_pnl` with the market value and
+`pnl_per` with `0`. Taken at face value that reports a 100% gain, so both are
+discarded.
 
-The report shows India and US tables in their own currencies, a per-book
-subtotal, and a combined rupee line. Every US row also carries a `Value (₹)`
-column.
+**Indian rows carry `asset_type: "STOCK"`**, not `IND_STOCK`. That is what keeps
+INDmoney's mirror of your Zerodha holdings out of the US book — otherwise every
+Indian position would be counted twice.
+
+**Quotes are keyed by symbol**, not returned as a list: `{"AAPL": {entity_basic:
+{…}, entity_stats: {…}}}`.
+
+Field lookup is by canonical key, so `unitPrice`, `unit_price` and `Unit Price`
+all resolve together. A row that cannot be interpreted is **excluded with a
+diagnostic naming the fields it saw**, never defaulted to zero.
+
+### Currency
+
+Because INDmoney pre-converts, the US book is rupee-denominated and the combined
+total needs no FX rate at all. `portfolio.usd_inr_rate` stays relevant only for a
+genuinely USD-priced row, should the API ever start sending one — and rates
+outside 60–140 are rejected as a misread field rather than a currency crisis.
 
 ### Holdings with no cost basis
 
-INDmoney's own documentation notes that for holdings imported from a linked
-broker, the current value is accurate but the original invested amount often
-is not shared. Those rows arrive with a null cost basis, and the pipeline:
+Rows without an invested amount:
 
-- shows `—` for invested, average price, P&L and P&L %, never `0`;
-- still counts the full current value toward portfolio value;
-- marks book-level invested and P&L figures with `*` and a footnote, because
-  they cover only the costed subset and so will not equal value minus invested;
-- lists the affected tickers in the data-quality section.
+- show `—` for invested, average price, P&L and P&L %, never `0`;
+- still count their full current value toward portfolio value;
+- mark book-level invested and P&L with `*` and a footnote, since those cover
+  only the costed subset and so will not equal value minus invested;
+- are listed in the data-quality section.
+
+The narrative changes shape too: with uncosted rows it says *"Cost basis is
+available for 20 of 22 holdings"* rather than putting value and invested side by
+side as though they described the same set.
 
 ### News and sentiment
 
-US headlines come from `get_us_stocks_details` — much better US coverage than
-Indian RSS feeds — and are merged into the existing groups with the same
-near-duplicate guard, so a story carried by both sources is not counted twice.
+`get_us_stocks_details` does **not** return headlines in its baseline reply — the
+confirmed response has only `entity_basic` and `entity_stats`. It takes a
+`segments` parameter whose valid tokens are undocumented, so the provider tries
+several, falls back to the baseline quote, and records in data quality that US
+news came from RSS only. `tools/probe_indmoney.py` sweeps candidate `segments`
+values and tells you which one works; put it at the head of
+`IndmoneyProvider.NEWS_SEGMENT_CANDIDATES`.
 
-They are then scored by **your local model**, keeping every score in the report
-on one scale. INDmoney's own sentiment is recorded alongside rather than blended
-in. Where the two differ by 3 points or more, the gap is surfaced in the
-data-quality section with the scale assumption that was made — INDmoney's
-sentiment scale is undocumented, so a label maps cleanly but a bare number is
-only converted when its range is unambiguous.
+The quote reply is still useful: `networth_holdings` has no day-change field for
+US rows, so `day_change_percentage` is taken from the live quote. A percentage
+move is currency-agnostic, so it attaches to a rupee-denominated holding without
+conversion.
+
+When headlines do arrive they are merged with the same near-duplicate guard, then
+scored by **your local model** so every score in the report shares one scale.
+INDmoney's own sentiment is recorded beside ours, never blended in. A gap of 3
+points or more is surfaced in data quality along with the scale assumption made —
+a label maps cleanly, but a bare number is only converted when its range is
+unambiguous.
 
 ### When the token expires
 
