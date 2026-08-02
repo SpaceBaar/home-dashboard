@@ -160,6 +160,10 @@ Ratings:
 [RELIANCE] Score: 8/10 - Reason: Major 5G expansion and retail growth signal strong revenue.
 [ONGC] Score: 3/10 - Reason: Falling oil prices directly compress profit margins.
 
+MANDATORY RULES:
+1. You MUST output exactly one line per stock.
+2. You MUST start each line with the exact bracketed tag provided (e.g. [TATAPOWER]). DO NOT rename the stock!
+
 Now evaluate these stocks:
 {stocks_text}
 Ratings:"""
@@ -192,21 +196,38 @@ Ratings:"""
     # Multi-pattern parser — hunts for the specific batch symbols anywhere in the line
     symbols_pattern = "|".join(map(re.escape, batch_data.keys()))
     patterns = [
-        # Explicit dash separator (e.g. "[SYMBOL] Score: 8/10 - Reason: ...")
         re.compile(rf'\[?({symbols_pattern})\]?[\s:\-\u2013]*(?:Score:\s*)?(\d+)(?:/10)?\s*[-\u2013]\s*(?:Reason:\s*)?([^\n]+)', re.IGNORECASE),
-        # Explicit Reason keyword without dash (e.g. "[SYMBOL] Score: 8/10 Reason: ...")
         re.compile(rf'\[?({symbols_pattern})\]?[\s:\-\u2013]*(?:Score:\s*)?(\d+)(?:/10)?\s*Reason:\s*([^\n]+)', re.IGNORECASE),
-        # Fallback space/comma separator
-        re.compile(rf'\[?({symbols_pattern})\]?[\s:\-\u2013]*(?:Score:\s*)?(\d+)(?:/10)?[,.\s]+([^\n]+)', re.IGNORECASE),
     ]
     parsed = {}
     for pattern in patterns:
-        if len(parsed) == len(batch_data):
-            break
         for m in pattern.finditer(raw):
             sym = m.group(1).upper()
-            if sym not in parsed:
+            if sym in batch_data and sym not in parsed:
                 parsed[sym] = (m.group(2), m.group(3).strip())
+        if len(parsed) == len(batch_data):
+            break
+
+    # Sequential Fallback: If the LLM disobeyed and renamed the stocks (e.g. [Tata Power] instead of [TATAPOWER]),
+    # the strict regex will fail. But if it successfully outputted exactly N lines with scores, we can 
+    # safely map them 1:1 in order.
+    if len(parsed) < len(batch_data):
+        scores_found = []
+        fallback_pattern = re.compile(r'(?:Score:\s*)?(\d+)(?:/10)?\s*[-\u2013,.]*\s*(?:Reason:)?\s*(.+)', re.IGNORECASE)
+        for line in raw.split('\n'):
+            line = line.strip()
+            if not line: continue
+            m = fallback_pattern.search(line)
+            if m:
+                # Ensure it's matching near the beginning of a rating line, not random text
+                if line.find(m.group(0)) < 40:
+                    scores_found.append((m.group(1), m.group(2).strip()))
+                    
+        # Safely map sequentially only if it evaluated every stock without skipping
+        if len(scores_found) == len(batch_data):
+            parsed = {}
+            for i, sym in enumerate(batch_data.keys()):
+                parsed[sym] = scores_found[i]
 
     full_lines, compact_lines = [], []
     for symbol, articles in batch_data.items():
@@ -311,18 +332,24 @@ Summary:"""
     news_compact = news_data.get('compact', '') if isinstance(news_data, dict) else str(news_data)
     news_for_prompt = news_compact[:1500] + ('...' if len(news_compact) > 1500 else '')
 
-    final_prompt = f"""You are a financial analyst. Respond in English only.
-Write a 2-paragraph portfolio analysis based on the data below.
+    final_prompt = f"""You are a strict financial data reporter. Respond in English only.
+Write a 2-paragraph portfolio analysis based EXACTLY on the data below.
 
-Portfolio: Invested \u20b9{total_investment:.0f} | Current \u20b9{total_current:.0f} | P&L \u20b9{overall_pnl:+.0f}
+MANDATORY RULES:
+1. Do not merge or confuse stock tickers (e.g., NEVER write "PAYTM (TSLA)"). Treat each stock independently.
+2. Paragraph 1: Summarize the overall Portfolio Totals and Holdings Performance (key gainers/losers).
+3. Paragraph 2: Summarize the News Sentiment scores and how they reflect on the portfolio.
 
-Holdings summary:
+[PORTFOLIO TOTALS]
+Invested: \u20b9{total_investment:.0f} | Current: \u20b9{total_current:.0f} | P&L: \u20b9{overall_pnl:+.0f}
+
+[HOLDINGS PERFORMANCE]
 {combined_holdings}
 
-News sentiment scores:
+[NEWS SENTIMENT]
 {news_for_prompt}
 
-Analysis (2 paragraphs, English only):"""
+Analysis (Strictly follow rules, 2 paragraphs):"""
 
     print("\nPhase 2: Streaming final report...\n")
     full_response = ""
