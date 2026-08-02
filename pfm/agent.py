@@ -55,6 +55,19 @@ async def generate_daily_login():
     send_telegram_message(msg)
     print("✅ Login link sent to Telegram!")
 
+async def probe_session():
+    """Checks whether the current Kite token is still valid by attempting get_holdings.
+    Returns the holdings JSON string on success, or None if auth is required.
+    Using get_holdings as the probe means we get the data for free if the session is live."""
+    global active_mcp_session
+    if active_mcp_session is None:
+        return None
+    try:
+        result = await active_mcp_session.call_tool("get_holdings", arguments={})
+        return result.content[0].text  # Non-None → session is valid
+    except Exception:
+        return None  # Auth error or any failure → need a fresh login
+
 # ==========================================
 # MASTER LOGIC: SNAPSHOT & SYNTHESIS
 # ==========================================
@@ -215,7 +228,22 @@ async def fetch_and_score_news():
     # 2. Score Relevant Articles using local LLM
     scored_news_summary = []
     print("Evaluating article sentiment via Hailo-Ollama...")
-    
+
+    # Pre-warm: trigger model load before the loop so the cold-start penalty
+    # (which can be several minutes on the Hailo NPU) is paid once up front
+    # rather than eating into the per-article timeout.
+    print("  ⏳ Pre-warming model in Hailo VRAM (may take a few minutes on cold start)...")
+    try:
+        await asyncio.wait_for(
+            client.generate(model='llama3.2:3b', prompt='Ready.', keep_alive=keep_alive, stream=False),
+            timeout=300  # Allow up to 5 minutes for the very first cold load
+        )
+        print("  ✅ Model warm.")
+    except asyncio.TimeoutError:
+        print("  ⚠️  Pre-warm timed out; proceeding anyway — first article may still be slow.")
+    except Exception as e:
+        print(f"  ⚠️  Pre-warm error: {e}; proceeding anyway.")
+
     # Analyze a maximum of 5 articles to keep processing times crisp
     for article in relevant_articles[:5]:
         prompt = f"""
@@ -228,9 +256,7 @@ async def fetch_and_score_news():
         """
         try:
             print(f"  → Scoring: {article['title'][:60]}...")
-            # keep_alive=-1 keeps the model loaded in Hailo VRAM between calls,
-            # avoiding the cold-load penalty that triggers the generation timeout.
-            # asyncio.wait_for provides a hard deadline so we never hang silently.
+            # Model should already be warm; 120s is generous for inference after load.
             response = await asyncio.wait_for(
                 client.generate(
                     model='llama3.2:3b',
@@ -239,7 +265,7 @@ async def fetch_and_score_news():
                     options={'temperature': temperature},
                     stream=False
                 ),
-                timeout=60  # 60-second hard deadline per article
+                timeout=120  # 120-second hard deadline per article (post-warm)
             )
             ai_output = response['response'].strip()
             
@@ -257,14 +283,18 @@ async def fetch_and_score_news():
             
     return "\n".join(scored_news_summary)
 
-async def run_nightly_analysis():
-    """Main daemon pipeline loop wrapper"""
+async def run_nightly_analysis(holdings_text=None):
+    """Main daemon pipeline loop wrapper.
+    Accepts optional pre-fetched holdings_text to avoid a redundant get_holdings
+    call when the session was already probed (e.g. interactive on-demand mode)."""
     global active_mcp_session
     print("\n[ROUTINE] Initiating full nightly ingestion loop...")
     
     try:
-        holdings_result = await active_mcp_session.call_tool("get_holdings", arguments={})
-        holdings_text = holdings_result.content[0].text
+        # Fetch holdings if not already provided by the caller
+        if holdings_text is None:
+            holdings_result = await active_mcp_session.call_tool("get_holdings", arguments={})
+            holdings_text = holdings_result.content[0].text
         
         # Scrape and score live news
         news_intelligence = await fetch_and_score_news()
@@ -313,6 +343,21 @@ async def listen_for_expenses():
         await asyncio.sleep(1)
 
 # ==========================================
+# MCP KEEPALIVE
+# ==========================================
+async def mcp_keepalive():
+    """Pings the MCP server every 60s with a list_tools call to prevent
+    Cloudflare from killing the idle SSE stream (CF drops streams after ~100s)."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if active_mcp_session:
+                await active_mcp_session.list_tools()
+        except Exception:
+            # Silently ignore; the bridge will log its own reconnect attempts
+            pass
+
+# ==========================================
 # SCHEDULER WRAPPERS
 # ==========================================
 def job_morning():
@@ -344,9 +389,20 @@ async def main_loop():
                 print("\n" + "="*50)
                 choice = input("Do you want to run an INTEGRATED ON-DEMAND TEST right now? (y/n): ").strip().lower()
                 if choice == 'y':
-                    await generate_daily_login()
-                    input("\nPress Enter HERE in the terminal AFTER you have clicked the Telegram link and logged in...")
-                    await run_nightly_analysis()
+                    # Probe the session before asking for a login; Kite tokens survive
+                    # until midnight / 6 AM IST, so a same-day re-run won't need a new one.
+                    print("\nChecking if existing Kite session is still valid...")
+                    holdings_text = await probe_session()
+                    if holdings_text is not None:
+                        print("✅ Session still valid — skipping login.")
+                    else:
+                        print("🔐 Session expired or not found — requesting fresh login.")
+                        await generate_daily_login()
+                        input("\nPress Enter HERE in the terminal AFTER you have clicked the Telegram link and logged in...")
+                        # Fetch holdings now that we have a fresh token
+                        holdings_result = await active_mcp_session.call_tool("get_holdings", arguments={})
+                        holdings_text = holdings_result.content[0].text
+                    await run_nightly_analysis(holdings_text=holdings_text)
                     print("\n✅ Integrated test execution successfully complete.")
                 print("="*50 + "\n")
             else:
@@ -356,8 +412,10 @@ async def main_loop():
             schedule.every().day.at("09:00").do(job_morning)
             schedule.every().day.at("23:00").do(job_night)
 
-            # ACTIVATE THE EXPENSE LISTENER
+            # ACTIVATE BACKGROUND TASKS
             asyncio.create_task(listen_for_expenses())
+            # Keep the MCP SSE stream alive so Cloudflare doesn't drop it
+            asyncio.create_task(mcp_keepalive())
             
             print("Agent is now running quietly in the background. Press Ctrl+C to exit.")
             while True:
