@@ -113,15 +113,16 @@ async def analyze_with_ai_and_save(holdings_text, news_intelligence):
     {news_intelligence}
     """
     
-    print("Streaming master report generation from Qwen2...\n")
+    print("Streaming master report generation from Hailo-Ollama...\n")
     client = ollama.AsyncClient(host='http://127.0.0.1:8000')
     
     full_response = ""
     print("📈 AI Analyst Integrated Report:\n" + "="*50)
+    # keep_alive=-1 holds the model in Hailo VRAM so it stays warm for this long generation
     async for chunk in await client.generate(
         model='llama3.2:3b',
         prompt=prompt,
-        keep_alive=-1,
+        keep_alive=keep_alive,
         options={'temperature': temperature},
         stream=True
     ):
@@ -226,7 +227,20 @@ async def fetch_and_score_news():
         REASON: [one short sentence explaining why]
         """
         try:
-            response = await client.generate(model='llama3.2:3b', prompt=prompt, options={'temperature': temperature}, stream=False)
+            print(f"  → Scoring: {article['title'][:60]}...")
+            # keep_alive=-1 keeps the model loaded in Hailo VRAM between calls,
+            # avoiding the cold-load penalty that triggers the generation timeout.
+            # asyncio.wait_for provides a hard deadline so we never hang silently.
+            response = await asyncio.wait_for(
+                client.generate(
+                    model='llama3.2:3b',
+                    prompt=prompt,
+                    keep_alive=keep_alive,
+                    options={'temperature': temperature},
+                    stream=False
+                ),
+                timeout=60  # 60-second hard deadline per article
+            )
             ai_output = response['response'].strip()
             
             scored_news_summary.append(
@@ -236,6 +250,8 @@ async def fetch_and_score_news():
                 f"Link: {article['link']}\n"
                 f"{'-'*40}"
             )
+        except asyncio.TimeoutError:
+            print(f"  → Timed out scoring headline for {article['symbol']}, skipping.")
         except Exception as e:
             print(f"Failed to evaluate headline: {e}")
             
@@ -349,5 +365,5 @@ async def main_loop():
                 await asyncio.sleep(1)
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main_loop())
+    # asyncio.run() is the modern, correct entry point (Python 3.7+)
+    asyncio.run(main_loop())

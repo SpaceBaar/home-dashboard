@@ -1,7 +1,12 @@
 import requests
 import json
 import xml.etree.ElementTree as ET
+import asyncio
 import ollama
+
+# Keep model loaded in Hailo VRAM between calls to avoid cold-load timeout penalty
+_KEEP_ALIVE = -1
+_TEMPERATURE = 0.1
 
 async def fetch_and_score_news(config_path='config.json'):
     print("\n📰 Fetching market news from RSS feeds...")
@@ -64,9 +69,16 @@ async def fetch_and_score_news(config_path='config.json'):
         """
         
         try:
-            keep_alive=-1
-            temperature=0.1
-            response = await client.generate(model='llama3.2:3b', prompt=prompt, options={'temperature': temperature}, stream=False)
+            response = await asyncio.wait_for(
+                client.generate(
+                    model='llama3.2:3b',
+                    prompt=prompt,
+                    keep_alive=_KEEP_ALIVE,
+                    options={'temperature': _TEMPERATURE},
+                    stream=False
+                ),
+                timeout=60
+            )
             ai_output = response['response'].strip()
             
             scored_news_summary.append(
@@ -76,6 +88,8 @@ async def fetch_and_score_news(config_path='config.json'):
                 f"Link: {article['link']}\n"
                 f"{'-'*40}"
             )
+        except asyncio.TimeoutError:
+            print(f"Timed out scoring article for {article['stock']}, skipping.")
         except Exception as e:
             print(f"Failed to score article: {e}")
             
