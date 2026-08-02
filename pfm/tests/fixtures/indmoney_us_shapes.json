@@ -21,23 +21,23 @@
       },
       {
         "investment_code": "118186",
-        "investment": "Apple Inc.",
+        "investment": "Apple Inc. Common Stock",
         "asset_type": "US_STOCK",
         "assetclass_l2": "Global Equity",
-        "invested_amount": 158400.0,
-        "market_value": 190800.0,
-        "holding_percent": 5.36,
-        "total_pnl": 32400.0,
-        "pnl_per": 20.45,
-        "xirr": 18.2,
-        "total_units": 7.0,
-        "unit_price": 27257.14,
+        "invested_amount": 143705.38,
+        "market_value": 208889.42,
+        "holding_percent": 63.3,
+        "total_pnl": 65184.04,
+        "pnl_per": 45.36,
+        "xirr": 0,
+        "total_units": 7.08671654,
+        "unit_price": 29476.19,
         "broker": "INDmoney",
         "market_cap": "Mega Cap"
       },
       {
         "investment_code": "116683",
-        "investment": "Tesla Inc.",
+        "investment": "Tesla Inc. Common Stock",
         "asset_type": "US_STOCK",
         "assetclass_l2": "Global Equity",
         "invested_amount": "unknown",
@@ -46,8 +46,8 @@
         "total_pnl": 82000.0,
         "pnl_per": 0,
         "xirr": 0,
-        "total_units": 3.0,
-        "unit_price": 27333.33,
+        "total_units": 2.76,
+        "unit_price": 29710.14,
         "broker": "Vested",
         "market_cap": "Mega Cap"
       }
@@ -92,7 +92,9 @@
         "market_cap_in_currency": 4897204862976,
         "market_cap": "Mega Cap",
         "sector": "Information Technology",
-        "is_active": true
+        "is_active": true,
+        "mycroft_id": "118186",
+        "is_gift": true
       },
       "entity_stats": {
         "live_price": 308.91,
@@ -117,7 +119,8 @@
         "symbol": "TSLA",
         "ind_key": "TSLA",
         "market_cap": "Mega Cap",
-        "sector": "Consumer Discretionary"
+        "sector": "Consumer Discretionary",
+        "mycroft_id": "116683"
       },
       "entity_stats": {
         "live_price": 311.21,
@@ -187,11 +190,33 @@
   },
 
   "lookup_dict_keyed": {
-    "Space Exploration Technologies Corp. Class A Common Stock": {
+    "Space Exploration Technologies": {
       "ind_key": "SPCX",
-      "name": "Space Exploration Technologies Corp. Class A Common Stock"
+      "name": "Space Exploration Technologies"
     },
-    "Apple Inc.": { "ind_key": "AAPL", "name": "Apple Inc." }
+    "Apple": { "ind_key": "AAPL", "name": "Apple" }
+  },
+
+  "lookup_uri_too_long_error": {
+    "error": "service_error",
+    "message": "API returned 414: /v4/global-search/",
+    "tool": "lookup_ind_keys",
+    "service": "global_search"
+  },
+
+  "real_allocation_breakdown_us": {
+    "asset_type": "US_STOCK",
+    "breakdown_by": "sector",
+    "data": [
+      {
+        "sector": "Industrials",
+        "invested_value": 148652.91,
+        "current_value": 218140.19,
+        "return": 69487.28,
+        "return_percentage": 46.74,
+        "progress_value_percentage": 66.11
+      }
+    ]
   },
 
   "lookup_list_shaped": {

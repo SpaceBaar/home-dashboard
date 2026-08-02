@@ -165,11 +165,51 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
         broker_sentiment: dict = {}
         snapshot_fx: Optional[float] = None
 
+        us_quotes: dict = {}
         if _ind_session is not None:
             provider = IndmoneyProvider(_ind_session)
             try:
                 us_rows, us_problems = await provider.holdings()
                 log.info("INDmoney returned %d US holding(s).", len(us_rows))
+
+                # Resolve tickers by exact id join before anything else uses the
+                # symbols. investment_code equals entity_basic.mycroft_id, so a
+                # quote lookup over the candidate pool identifies each holding
+                # without any name matching.
+                if us_rows:
+                    candidates = set(CFG.watchlist) | _US_LIKE
+                    try:
+                        candidates |= set(await provider.watchlist())
+                    except Exception as exc:
+                        log.info("INDmoney watchlist unavailable: %s", exc)
+                    candidates |= {h["symbol"] for h in us_rows if not brokers.needs_ticker(h)}
+
+                    details = await provider.us_details(sorted(candidates))
+                    code_index = brokers.build_code_index(details)
+                    filled, warnings = brokers.resolve_by_code(us_rows, code_index)
+                    us_problems.extend(warnings)
+                    if filled:
+                        log.info("Resolved %d US ticker(s) via INDmoney's instrument ids.",
+                                 filled)
+
+                    # Anything still unnamed falls back to the search endpoint.
+                    if any(brokers.needs_ticker(h) for h in us_rows):
+                        await provider._resolve_tickers(us_rows, us_problems)
+
+                    # Fetch details for tickers discovered after the first call so
+                    # their news and quotes are available too.
+                    resolved = {h["symbol"] for h in us_rows if not brokers.needs_ticker(h)}
+                    missing = sorted(resolved - set(details))
+                    if missing:
+                        details.update(await provider.us_details(missing))
+
+                    us_quotes = brokers.extract_us_quotes(details)
+                    broker_sentiment = brokers.extract_us_news(details)
+
+                    # The rate INDmoney itself applied, read back out of the data.
+                    snapshot_fx, fx_note = brokers.derive_usd_inr(us_rows, us_quotes)
+                    if snapshot_fx:
+                        log.info("Implied USD/INR %.2f (%s)", snapshot_fx, fx_note)
             except AuthRequired as exc:
                 log.warning("INDmoney needs re-authentication: %s", exc)
                 us_problems.append(
@@ -190,8 +230,6 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
         # 1b. Deterministic portfolio mathematics over both books.
         usd_inr, fx_source = resolve_fx(
             _num_or_none(CFG.portfolio.get("usd_inr_rate")), snapshot_fx)
-        if us_rows and not usd_inr:
-            log.warning("US holdings present but no USD/INR rate; reporting them in dollars only.")
 
         fact_sheet = build_fact_sheet(
             list(holdings_raw) + us_rows,
@@ -201,6 +239,19 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
         )
         fact_sheet.data_quality.extend(us_problems)
         held = {h.symbol for h in fact_sheet.holdings}
+
+        # networth_holdings has no day-change field for US rows, so take it from
+        # the live quote. A percentage move needs no currency conversion.
+        filled = 0
+        for holding in fact_sheet.holdings:
+            quote = us_quotes.get(holding.symbol)
+            if holding.book == BOOK_US and holding.day_pct is None and quote:
+                if quote.get("day_pct") is not None:
+                    holding.day_pct = quote["day_pct"]
+                    holding.flags.append("day change from the INDmoney live quote")
+                    filled += 1
+        if filled:
+            log.info("Filled the day change for %d US holding(s) from live quotes.", filled)
         log.info("Parsed %d holdings. Value Rs %s, P&L Rs %s (%+.1f%%).",
                  len(fact_sheet.holdings), f"{fact_sheet.total_current:,.0f}",
                  f"{fact_sheet.total_pnl:+,.0f}", fact_sheet.total_pnl_pct)
@@ -227,56 +278,22 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
         # 2b. US headlines from INDmoney. Indian RSS covers US names thinly, so
         #     this is the better source for those tickers. We still score them
         #     with the local model, keeping every score on one scale.
-        if _ind_session is not None:
-            us_universe = sorted(
-                {h.symbol for h in fact_sheet.holdings if h.book == BOOK_US}
-                | {s for s in CFG.watchlist if s in _US_LIKE}
+        # Headlines were collected alongside the quotes in step 1a; fold them in.
+        added = sum(len(v.get("articles") or []) for v in broker_sentiment.values())
+        if added:
+            log.info("INDmoney supplied %d US headline(s) across %d ticker(s).",
+                     added, len(broker_sentiment))
+            grouped = news_mod.merge_articles(
+                grouped, broker_sentiment,
+                similarity_threshold=float(CFG.news["duplicate_similarity_threshold"]),
+                max_per_stock=int(CFG.news["max_articles_per_stock"]),
             )
-            if us_universe:
-                try:
-                    details = await IndmoneyProvider(_ind_session).us_details(us_universe)
-
-                    # networth_holdings carries no day-change field for US rows,
-                    # so take it from the live quote. A percentage move is
-                    # currency-agnostic, so it needs no conversion.
-                    quotes = brokers.extract_us_quotes(details)
-                    filled = 0
-                    for holding in fact_sheet.holdings:
-                        quote = quotes.get(holding.symbol)
-                        if holding.book == BOOK_US and holding.day_pct is None and quote:
-                            if quote.get("day_pct") is not None:
-                                holding.day_pct = quote["day_pct"]
-                                holding.flags.append(
-                                    "day change from the INDmoney live quote")
-                                filled += 1
-                    if filled:
-                        log.info("Filled the day change for %d US holding(s) from quotes.",
-                                 filled)
-
-                    broker_sentiment = brokers.extract_us_news(details)
-                    added = sum(len(v.get("articles") or []) for v in broker_sentiment.values())
-                    if added:
-                        log.info("INDmoney supplied %d US headline(s) across %d ticker(s).",
-                                 added, len(broker_sentiment))
-                        grouped = news_mod.merge_articles(
-                            grouped, broker_sentiment,
-                            similarity_threshold=float(
-                                CFG.news["duplicate_similarity_threshold"]),
-                            max_per_stock=int(CFG.news["max_articles_per_stock"]),
-                        )
-                    else:
-                        log.info("INDmoney returned no US headlines; RSS remains the only "
-                                 "news source for US tickers.")
-                        fact_sheet.data_quality.append(
-                            "INDmoney returned quotes but no headlines for the US book, so "
-                            "US news came from the RSS feeds only. The 'segments' value that "
-                            "enables news is undocumented; tools/probe_indmoney.py can be "
-                            "used to find one."
-                        )
-                except AuthRequired:
-                    log.warning("INDmoney session expired before the US news call.")
-                except Exception as exc:
-                    log.warning("INDmoney US quotes/news unavailable: %s", exc)
+        elif _ind_session is not None and us_rows:
+            log.info("INDmoney returned no US headlines; RSS remains the only US source.")
+            fact_sheet.data_quality.append(
+                "INDmoney returned quotes but no headlines for the US book, so US news "
+                "came from the RSS feeds only."
+            )
 
         # 3. One LLM call per stock, all of that stock's headlines together.
         scores = []

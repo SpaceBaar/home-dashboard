@@ -129,18 +129,20 @@ def test_real_us_shape() -> None:
     check(spacex["name"] == "Space Exploration Technologies Corp. Class A Common Stock",
           "the full instrument name is retained for lookup and display")
 
-    apple = next(h for h in holdings if h["name"] == "Apple Inc.")
-    check(apple["symbol"] == "APPLE" or apple["symbol"].startswith("APPLE"),
-          f"a simple name yields a sensible label ({apple['symbol']})")
-    check(any("XIRR" in f for f in apple["flags"]),
-          "broker-reported XIRR is kept as a flag, not as a computed figure")
+    apple = next(h for h in holdings if h["name"].startswith("Apple"))
+    check(apple["symbol"].startswith("APPLE"),
+          f"a name yields a sensible stand-in label ({apple['symbol']})")
+    check(apple["investment_code"] == "118186",
+          "investment_code is carried through for the id join")
+    check(abs(apple["quantity"] * apple["ltp"] - apple["current_native"]) < 1.0,
+          "Apple's units x unit_price also reconciles with market_value")
 
 
 def test_placeholder_pnl_discarded() -> None:
     section("The unknown-cost-basis placeholder P&L is discarded")
 
     holdings, _ = brokers.normalise_indmoney_rows(rows_of("real_networth_holdings_us"))
-    tesla = next(h for h in holdings if h["name"] == "Tesla Inc.")
+    tesla = next(h for h in holdings if h["name"].startswith("Tesla"))
 
     check(tesla["invested_native"] is None and tesla["avg_price"] is None,
           "invested and average price are None for the 'unknown' row")
@@ -226,45 +228,115 @@ class FakeSession:
         return Result(json.dumps(value))
 
 
-def test_ticker_resolution() -> None:
-    section("Tickers resolved from instrument names via lookup_ind_keys")
+def test_ticker_resolution_by_id() -> None:
+    section("Tickers resolved by joining investment_code to mycroft_id")
+
+    index = brokers.build_code_index(SHAPES["real_us_stocks_details"])
+    check(index.get("118186") == "AAPL" and index.get("116683") == "TSLA",
+          f"mycroft_id maps to ticker: {index}")
+
+    holdings, _ = brokers.normalise_indmoney_rows(rows_of("real_networth_holdings_us"))
+    check(all(h.get("investment_code") for h in holdings),
+          "investment_code survives normalisation so the join is possible")
+    check(all(brokers.needs_ticker(h) for h in holdings),
+          "no row has a real ticker before resolution")
+
+    filled, warnings = brokers.resolve_by_code(holdings, index)
+    check(filled == 2 and not warnings, f"two tickers filled by exact id match ({filled})")
+    symbols = {h["symbol"] for h in holdings}
+    check("AAPL" in symbols and "TSLA" in symbols,
+          f"Apple and Tesla resolved without any name matching ({symbols})")
+    aapl = next(h for h in holdings if h["symbol"] == "AAPL")
+    check(any("instrument id" in f for f in aapl["flags"]),
+          "the resolution method is recorded")
+    check(not brokers.needs_ticker(aapl),
+          "the derived-label warning is cleared once a real ticker is known")
+    check(any(brokers.needs_ticker(h) for h in holdings),
+          "SPCX has no quote in this fixture, so it stays unresolved rather than guessed")
+
+    # A name-derived ticker that contradicts the id must be corrected loudly.
+    holdings2, _ = brokers.normalise_indmoney_rows(rows_of("real_networth_holdings_us"))
+    wrong = next(h for h in holdings2 if h["investment_code"] == "118186")
+    brokers._apply_ticker(wrong, "MSFT", "guessed from the name")
+    filled, warnings = brokers.resolve_by_code(holdings2, index)
+    check(wrong["symbol"] == "AAPL" and warnings,
+          "a wrong name-derived ticker is corrected and the mismatch reported")
+    check("belongs to AAPL" in warnings[0], f"the warning names both: {warnings[0][:70]}")
+
+
+def test_lookup_fallback() -> None:
+    section("lookup_ind_keys fallback avoids the HTTP 414 that long names cause")
+
+    long_name = "Space Exploration Technologies Corp. Class A Common Stock"
+    short = brokers.shorten_for_lookup(long_name)
+    check(len(short) < len(long_name) and "Common Stock" not in short,
+          f"boilerplate suffixes are stripped: {short!r} ({len(short)} chars)")
+    check(short == "Space Exploration Technologies", f"expected name kept: {short!r}")
+    check(brokers.shorten_for_lookup("Apple Inc. Common Stock") == "Apple",
+          f"'Apple Inc. Common Stock' -> "
+          f"{brokers.shorten_for_lookup('Apple Inc. Common Stock')!r}")
 
     for label, payload in (("dict keyed by name", SHAPES["lookup_dict_keyed"]),
                            ("list of records", SHAPES["lookup_list_shaped"])):
-        resolved = IndmoneyProvider._parse_lookup(payload)
-        check(bool(resolved), f"a lookup reply shaped as a {label} is parsed")
-
-    resolved = IndmoneyProvider._parse_lookup(SHAPES["lookup_dict_keyed"])
-    key = brokers._canon("Space Exploration Technologies Corp. Class A Common Stock")
-    check(resolved.get(key) == "SPCX", f"the SpaceX name maps to SPCX ({resolved.get(key)})")
+        check(bool(IndmoneyProvider._parse_lookup(payload)),
+              f"a lookup reply shaped as a {label} is parsed")
 
     session = FakeSession({
         "networth_holdings": SHAPES["real_networth_holdings_us"],
         "lookup_ind_keys": SHAPES["lookup_dict_keyed"],
     })
-    provider = IndmoneyProvider(session)
-    holdings, problems = asyncio.run(provider.holdings())
-
+    holdings, problems = asyncio.run(IndmoneyProvider(session).holdings())
     symbols = {h["symbol"] for h in holdings}
-    check("SPCX" in symbols, f"the holding is relabelled SPCX after lookup ({symbols})")
-    check("AAPL" in symbols, "Apple Inc. resolves to AAPL")
-    spcx = next(h for h in holdings if h["symbol"] == "SPCX")
-    check(any("resolved from the instrument name" in f for f in spcx["flags"]),
-          "the resolution is recorded")
-    check(not any("ticker not supplied" in f for f in spcx["flags"]),
-          "the derived-label warning is cleared once a real ticker is known")
-    check(any(call[0] == "lookup_ind_keys" for call in session.calls),
-          "lookup_ind_keys was actually consulted")
+    check("SPCX" in symbols, f"SpaceX resolves via the shortened name ({symbols})")
 
-    # Lookup failure must degrade, not crash.
+    lookup_calls = [c for c in session.calls if c[0] == "lookup_ind_keys"]
+    check(all(len(c[1].get("names", [])) <= 1 for c in lookup_calls if
+              isinstance(c[1].get("names"), list)),
+          "names are sent one per call, which is what avoids the 414")
+    check(all(len(str(c[1].get("names"))) < 60 for c in lookup_calls),
+          "and each request stays short")
+
+    # The real 414 error payload must not be mistaken for a result.
+    session = FakeSession({
+        "networth_holdings": SHAPES["real_networth_holdings_us"],
+        "lookup_ind_keys": SHAPES["lookup_uri_too_long_error"],
+    })
+    holdings, problems = asyncio.run(IndmoneyProvider(session).holdings())
+    check(len(holdings) == 3, "holdings survive a lookup failure")
+    check(any("could not be resolved" in p for p in problems),
+          "the failure is reported in data quality rather than hidden")
+    check(all(brokers.needs_ticker(h) for h in holdings),
+          "an error payload yields no tickers, rather than bogus ones")
+
     session = FakeSession({
         "networth_holdings": SHAPES["real_networth_holdings_us"],
         "lookup_ind_keys": RuntimeError("tool unavailable"),
     })
     holdings, problems = asyncio.run(IndmoneyProvider(session).holdings())
-    check(len(holdings) == 3, "holdings survive a lookup_ind_keys failure")
-    check(any("could not be resolved" in p for p in problems),
-          "the failure is reported in data quality rather than hidden")
+    check(len(holdings) == 3 and any("could not be resolved" in p for p in problems),
+          "an exception is handled the same way")
+
+
+def test_fx_derivation() -> None:
+    section("USD/INR derived from INDmoney's own rupee prices vs its USD quotes")
+
+    holdings, _ = brokers.normalise_indmoney_rows(rows_of("real_networth_holdings_us"))
+    brokers.resolve_by_code(holdings, brokers.build_code_index(SHAPES["real_us_stocks_details"]))
+    quotes = brokers.extract_us_quotes(SHAPES["real_us_stocks_details"])
+
+    rate, note = brokers.derive_usd_inr(holdings, quotes)
+    check(rate is not None and 90 < rate < 100,
+          f"a plausible rate is derived with no external source ({rate:.2f})")
+    check(abs(rate - 29476.19 / 308.91) < 1.0,
+          f"AAPL's rupee unit price over its USD quote gives {29476.19 / 308.91:.2f}")
+    check("derived from INDmoney" in note and "AAPL" in note,
+          f"the derivation is explained: {note[:60]}...")
+
+    check(brokers.derive_usd_inr([], quotes)[0] is None, "no holdings yields no rate")
+    check(brokers.derive_usd_inr(holdings, {})[0] is None, "no quotes yields no rate")
+
+    resolved, _ = resolve_fx(None, rate)
+    check(resolved is not None, "the derived rate passes the sanity band and is accepted")
 
 
 def test_watchlist() -> None:
@@ -304,6 +376,11 @@ def test_us_quotes() -> None:
           "a segments value is attempted, since news is not in the baseline reply")
     check(any("symbols" in call[1] for call in session.calls),
           "the confirmed 'symbols' parameter name is used")
+    check(IndmoneyProvider.NEWS_SEGMENT_CANDIDATES[0] == ["news", "analyst"],
+          "the segments value confirmed by the sweep is tried first")
+    check(all(seg in (["news"], ["news", "analyst"])
+              for seg in IndmoneyProvider.NEWS_SEGMENT_CANDIDATES),
+          "the tokens the server rejected are no longer attempted")
 
 
 def test_us_news() -> None:
@@ -370,7 +447,7 @@ def test_combined_fact_sheet():
     check(usb.count == 3 and usb.uncosted_count == 1,
           f"US book: {usb.count} holdings, {usb.uncosted_count} without cost basis")
 
-    expected = 523.38 + 190800.0 + 82000.0
+    expected = 523.38 + 208889.42 + 82000.0
     check(abs(usb.current - expected) < 0.05,
           f"US subtotal is the plain sum of rupee values ({usb.current:,.2f})")
     check(abs(fs.total_current - (india.current + usb.current)) < 0.05,
@@ -419,7 +496,7 @@ def test_uncosted_reporting():
     section("Uncosted holdings suppress returns rather than inventing them")
 
     fs = build_fact_sheet(india_rows() + us_holdings())
-    tesla = next(h for h in fs.holdings if h.name == "Tesla Inc.")
+    tesla = next(h for h in fs.holdings if (h.name or "").startswith("Tesla"))
 
     check(tesla.pnl_pct is None and tesla.pnl_native is None,
           "P&L and percentage are None, not a 100% gain")
@@ -517,7 +594,9 @@ def test_all():
     test_placeholder_pnl_discarded()
     test_indian_rows_excluded()
     test_alternative_shapes()
-    test_ticker_resolution()
+    test_ticker_resolution_by_id()
+    test_lookup_fallback()
+    test_fx_derivation()
     test_watchlist()
     test_us_quotes()
     test_us_news()

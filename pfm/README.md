@@ -155,16 +155,27 @@ with the figures replaced.
 **US holdings are already in rupees.** This is the opposite of the obvious
 assumption and the single most dangerous detail. For the captured SpaceX row,
 `0.05061407 units × 10340.67 = 523.38 market_value`, and the implied average of
-18,852 per unit only makes sense as ₹ (≈ $214 at 88) — $18,852 a share does not.
+18,852 per unit only makes sense as ₹ (≈ $214) — $18,852 a share does not.
 `get_us_stocks_details`, by contrast, quotes in USD (AAPL at 308.91). Treating
-the holdings as dollars would have multiplied the US book by about 88.
+the holdings as dollars would have multiplied the US book by ~95.
+
+**`investment_code` equals `entity_basic.mycroft_id`.** Apple is `118186` in both
+the holdings row and the quote reply. That turns ticker resolution into an exact
+identifier join rather than a name search, and it doubles as a correctness check:
+if a name-derived ticker disagrees with the id, the id wins and the mismatch is
+reported.
 
 **There is no ticker field.** Rows carry only `investment` (a long name like
 `"Space Exploration Technologies Corp. Class A Common Stock"`) and
-`investment_code`. Tickers are resolved through `lookup_ind_keys`; if that fails,
-a label is derived from the name, **flagged as derived**, and the failure appears
-in the data-quality section — because an unresolved ticker also means news
-matching will miss that holding.
+`investment_code`. Resolution order is: the id join above, then `lookup_ind_keys`,
+then a label derived from the name — **flagged as derived**, with the failure in
+the data-quality section, because an unresolved ticker also means news matching
+will miss that holding.
+
+**`lookup_ind_keys` returns HTTP 414 for long names.** It puts names in a query
+string, and a two-name batch containing the 57-character SpaceX name was rejected
+with `API returned 414: /v4/global-search/`. Names are therefore stripped of
+boilerplate suffixes (`Class A Common Stock`, `Inc.`) and sent one per call.
 
 **An unknown cost basis brings a fake P&L.** `invested_amount` arrives as the
 string `"unknown"`, and INDmoney then fills `total_pnl` with the market value and
@@ -185,9 +196,17 @@ diagnostic naming the fields it saw**, never defaulted to zero.
 ### Currency
 
 Because INDmoney pre-converts, the US book is rupee-denominated and the combined
-total needs no FX rate at all. `portfolio.usd_inr_rate` stays relevant only for a
-genuinely USD-priced row, should the API ever start sending one — and rates
-outside 60–140 are rejected as a misread field rather than a currency crisis.
+total needs no FX rate at all.
+
+A rate is still derived, from the data itself: a holding's `unit_price` is in
+rupees while the live quote for the same ticker is in dollars, so their ratio is
+the rate INDmoney applied. AAPL at 29,476.19 against 308.91 gives 95.42, TSLA
+gives 95.47, and the median across every ticker with both figures is recorded in
+the report. No external rate source, no configured guess.
+
+`portfolio.usd_inr_rate` overrides that, and matters only for a genuinely
+USD-priced row should the API ever start sending one. Rates outside 60–140 are
+rejected as a misread field rather than a currency crisis.
 
 ### Holdings with no cost basis
 
@@ -205,13 +224,19 @@ side as though they described the same set.
 
 ### News and sentiment
 
-`get_us_stocks_details` does **not** return headlines in its baseline reply — the
-confirmed response has only `entity_basic` and `entity_stats`. It takes a
-`segments` parameter whose valid tokens are undocumented, so the provider tries
-several, falls back to the baseline quote, and records in data quality that US
-news came from RSS only. `tools/probe_indmoney.py` sweeps candidate `segments`
-values and tells you which one works; put it at the head of
-`IndmoneyProvider.NEWS_SEGMENT_CANDIDATES`.
+`get_us_stocks_details` does **not** return headlines in its baseline reply — that
+has only `entity_basic` and `entity_stats`. News needs the `segments` parameter,
+whose valid tokens are undocumented. Confirmed by sweep:
+
+| `segments` | Result |
+| --- | --- |
+| `["news","analyst"]` | adds `news` **and** `analyst_forecast` — used |
+| `["news"]` | adds `news` — fallback |
+| `["NEWS"]`, `["all"]`, `["overview","news"]`, `["news","analyst_consensus"]` | rejected |
+
+`tools/probe_indmoney.py` re-runs that sweep if the API changes. If no value
+works, the provider falls back to the baseline quote and records in data quality
+that US news came from RSS only.
 
 The quote reply is still useful: `networth_holdings` has no day-change field for
 US rows, so `day_change_percentage` is taken from the live quote. A percentage

@@ -428,6 +428,8 @@ def normalise_indmoney(
         "source": "indmoney",
         "flags": flags,
         "name": name,
+        # Kept so tickers can be resolved by an exact id join later.
+        "investment_code": _first_str(flat, _IND_FIELDS["code"]),
     }
 
 
@@ -435,6 +437,117 @@ _LABEL_STOPWORDS = {"THE", "LTD", "LIMITED", "INC", "CORP", "CORPORATION", "PLC"
                     "CO", "COMPANY", "CLASS", "COMMON", "STOCK", "SHARES", "SHARE",
                     "HOLDINGS", "GROUP", "TECHNOLOGIES", "TECHNOLOGY", "AND", "OF",
                     "A", "B", "C", "ETF", "FUND", "TRUST", "PLC."}
+
+
+_LOOKUP_SUFFIXES = re.compile(
+    r"\s+(?:class\s+[a-z]\s+)?(?:common\s+stock|ordinary\s+shares?|common\s+shares?|"
+    r"depositary\s+receipts?|adr|shares?)\s*$", re.IGNORECASE)
+
+
+def shorten_for_lookup(name: str, limit: int = 32) -> str:
+    """Trim an instrument name to something a search endpoint will accept.
+
+    ``lookup_ind_keys`` puts names in a query string and answered HTTP 414 (URI
+    Too Long) for the full 57-character SpaceX name, so boilerplate suffixes are
+    stripped and the result is capped at whole words.
+    """
+    trimmed = _LOOKUP_SUFFIXES.sub("", name.strip())
+    trimmed = re.sub(r"\s+(?:inc|corp|corporation|ltd|limited|plc|co)\.?\s*$", "",
+                     trimmed, flags=re.IGNORECASE).strip(" .,")
+    if len(trimmed) <= limit:
+        return trimmed or name[:limit]
+    words = trimmed.split()
+    out: List[str] = []
+    for word in words:
+        if len(" ".join(out + [word])) > limit:
+            break
+        out.append(word)
+    return " ".join(out) or trimmed[:limit]
+
+
+def needs_ticker(holding: Dict[str, Any]) -> bool:
+    return any("ticker not supplied" in f for f in holding.get("flags", []))
+
+
+def _apply_ticker(holding: Dict[str, Any], ticker: str, how: str) -> None:
+    holding["flags"] = [f for f in holding.get("flags", [])
+                        if "ticker not supplied" not in f]
+    holding["flags"].append(f"ticker {ticker.upper()} {how}")
+    holding["symbol"] = ticker.upper()
+
+
+def build_code_index(details: Dict[str, dict]) -> Dict[str, str]:
+    """Map INDmoney's internal instrument id to its ticker.
+
+    ``entity_basic.mycroft_id`` in a quote reply equals ``investment_code`` in a
+    holdings row - AAPL is 118186 in both. That makes ticker resolution an exact
+    identifier join rather than a fuzzy name search.
+    """
+    index: Dict[str, str] = {}
+    for symbol, row in details.items():
+        flat = _flatten(row)
+        for key in ("mycroft_id", "investment_code", "entity_id", "instrument_id"):
+            value = _lookup(flat, key)
+            if value not in (None, ""):
+                index[str(value).strip()] = symbol.upper()
+    return index
+
+
+def resolve_by_code(holdings: List[Dict[str, Any]],
+                    code_index: Dict[str, str]) -> Tuple[int, List[str]]:
+    """Fill in tickers by joining investment_code to mycroft_id.
+
+    Also verifies rows whose ticker came from elsewhere: a mismatch means the
+    name lookup attached the wrong company, which is worth knowing loudly.
+    """
+    filled, warnings = 0, []
+    for holding in holdings:
+        code = str(holding.get("investment_code") or "").strip()
+        if not code:
+            continue
+        ticker = code_index.get(code)
+        if not ticker:
+            continue
+        if needs_ticker(holding):
+            _apply_ticker(holding, ticker, "matched on INDmoney's instrument id")
+            filled += 1
+        elif holding.get("symbol") != ticker:
+            warnings.append(
+                f"{holding.get('symbol')} was matched by name but INDmoney's "
+                f"instrument id {code} belongs to {ticker}; using {ticker}."
+            )
+            _apply_ticker(holding, ticker, "corrected via INDmoney's instrument id")
+    return filled, warnings
+
+
+def derive_usd_inr(holdings: List[Dict[str, Any]],
+                   quotes: Dict[str, dict]) -> Tuple[Optional[float], str]:
+    """Derive USD/INR from the data itself, with no external rate source.
+
+    A US holding's ``unit_price`` is in rupees while the live quote for the same
+    ticker is in dollars, so their ratio is the rate INDmoney applied. AAPL at
+    29,476.19 against 308.91 implies 95.42. The median across every ticker with
+    both figures is used, so one stale quote cannot skew it.
+    """
+    ratios: List[Tuple[str, float]] = []
+    for holding in holdings:
+        if holding.get("currency") != "INR" or holding.get("book") != BOOK_US:
+            continue
+        inr_price = holding.get("ltp")
+        quote = quotes.get(str(holding.get("symbol", "")).upper())
+        usd_price = (quote or {}).get("live_price_usd")
+        if inr_price and usd_price and usd_price > 0:
+            ratios.append((holding["symbol"], inr_price / usd_price))
+
+    if not ratios:
+        return None, "unavailable"
+
+    values = sorted(r for _, r in ratios)
+    mid = len(values) // 2
+    median = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+    sources = ", ".join(f"{sym} {ratio:.2f}" for sym, ratio in ratios[:4])
+    return median, (f"derived from INDmoney's own rupee prices vs its USD quotes "
+                    f"({sources})")
 
 
 def derive_label(name: str) -> str:
@@ -558,11 +671,10 @@ class IndmoneyProvider(BrokerProvider):
     ASSET_TYPE_VALUE = "US_STOCK"
     # Confirmed from the tool schema: networth_holdings takes asset_type (required).
     ASSET_TYPE_KEYS = ("asset_type", "assetType", "asset_class", "type", "category")
-    # get_us_stocks_details takes symbols + segments. The valid segment tokens are
-    # not documented; these are tried in order and a rejection is not fatal.
-    NEWS_SEGMENT_CANDIDATES = (
-        ["news", "analyst"], ["news"], ["news_sentiment"], ["NEWS"], ["all"],
-    )
+    # CONFIRMED by sweep on 2026-08-02: segments=["news"] adds a top-level "news"
+    # key, and ["news","analyst"] adds "analyst_forecast" as well. ["NEWS"],
+    # ["all"], ["overview","news"] and ["news","analyst_consensus"] are rejected.
+    NEWS_SEGMENT_CANDIDATES = (["news", "analyst"], ["news"])
 
     async def holdings(self, *, resolve_tickers: bool = True
                        ) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -602,62 +714,57 @@ class IndmoneyProvider(BrokerProvider):
 
     async def _resolve_tickers(self, holdings: List[Dict[str, Any]],
                                problems: List[str]) -> None:
-        """Turn instrument names into real tickers via lookup_ind_keys.
+        """Resolve instrument names to tickers via lookup_ind_keys.
 
-        networth_holdings supplies only a long name ("Space Exploration
-        Technologies Corp. Class A Common Stock") and an internal code, so
-        without this step a holding would be labelled with a derived stand-in and
-        would not match any news keyword.
+        Secondary path only. The reliable route is ``resolve_by_code``, which
+        joins ``investment_code`` to ``entity_basic.mycroft_id`` from a quote
+        reply - an exact identifier match rather than a name search.
+
+        Names are shortened and sent ONE PER CALL: the server puts them in a
+        query string and returned HTTP 414 (URI Too Long) for a two-name batch
+        containing "Space Exploration Technologies Corp. Class A Common Stock".
         """
-        pending = [h for h in holdings
-                   if h.get("name") and any("ticker not supplied" in f
-                                            for f in h.get("flags", []))]
+        pending = [h for h in holdings if needs_ticker(h) and h.get("name")]
         if not pending:
             return
 
-        names = [h["name"] for h in pending]
-        payload = None
-        for args in ({"names": names}, {"names": names, "filter_type": "US_STOCK"}):
-            try:
-                payload = await self.call("lookup_ind_keys", args)
-            except AuthRequired:
-                raise
-            except Exception as exc:
-                log.info("lookup_ind_keys rejected %s (%s)", list(args), exc)
-                continue
+        resolved: Dict[str, str] = {}
+        for holding in pending:
+            short = shorten_for_lookup(holding["name"])
+            payload = None
+            for args in ({"names": [short]}, {"names": short}):
+                try:
+                    payload = await self.call("lookup_ind_keys", args)
+                except AuthRequired:
+                    raise
+                except Exception as exc:
+                    log.info("lookup_ind_keys(%r) failed: %s", short, exc)
+                    continue
+                if payload and not (isinstance(payload, dict) and payload.get("error")):
+                    break
+                payload = None
             if payload:
-                break
-        if not payload:
-            problems.append(
-                "Tickers for the US holdings could not be resolved via "
-                "lookup_ind_keys, so they are labelled from their instrument names. "
-                "News matching for those rows will be unreliable."
-            )
-            return
+                resolved.update(self._parse_lookup(payload))
 
-        resolved = self._parse_lookup(payload)
         for holding in pending:
             key = _canon(holding["name"])
-            ticker = resolved.get(key)
+            short_key = _canon(shorten_for_lookup(holding["name"]))
+            ticker = resolved.get(key) or resolved.get(short_key)
             if not ticker:
-                # Try a looser match on the leading words of the name.
                 for cand_name, cand_ticker in resolved.items():
-                    if cand_name and (cand_name in key or key.startswith(cand_name[:12])):
+                    if cand_name and (cand_name.startswith(short_key[:10])
+                                      or short_key.startswith(cand_name[:10])):
                         ticker = cand_ticker
                         break
             if ticker:
-                holding["flags"] = [f for f in holding["flags"]
-                                    if "ticker not supplied" not in f]
-                holding["flags"].append(f"ticker {ticker} resolved from the instrument name")
-                holding["symbol"] = ticker.upper()
+                _apply_ticker(holding, ticker, "resolved from the instrument name")
 
-        still = [h["symbol"] for h in pending
-                 if any("ticker not supplied" in f for f in h.get("flags", []))]
+        still = [h.get("name") or h["symbol"] for h in pending if needs_ticker(h)]
         if still:
             problems.append(
-                "No ticker could be resolved for " + ", ".join(still)
-                + "; these are labelled from their instrument names, so news "
-                  "matching may miss them. Add an entry to tracking.keywords."
+                "A ticker could not be resolved for " + ", ".join(still)
+                + ". These are labelled from their instrument names, so news matching "
+                  "may miss them; add an entry to tracking.keywords in config.json."
             )
 
     @staticmethod

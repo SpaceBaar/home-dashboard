@@ -87,14 +87,13 @@ def make_reports(report_dir: Path, days: int = 4, *, with_us: bool = True) -> Tu
         rows = brokers.extract_rows(shapes["real_networth_holdings_us"],
                                     hint_keys=("holdings",)) or []
         us_rows, _ = brokers.normalise_indmoney_rows(rows)
-        # Stand in for lookup_ind_keys, which needs a live session.
+        # Stand in for the investment_code -> mycroft_id join, which needs a
+        # live quote reply.
+        brokers.resolve_by_code(us_rows, brokers.build_code_index(
+            shapes["real_us_stocks_details"]))
         for row in us_rows:
             if "Space Exploration" in (row.get("name") or ""):
-                row["symbol"] = "SPCX"
-            elif row.get("name") == "Apple Inc.":
-                row["symbol"] = "AAPL"
-            elif row.get("name") == "Tesla Inc.":
-                row["symbol"] = "TSLA"
+                brokers._apply_ticker(row, "SPCX", "fixture")
 
     grouped = {
         "TATAPOWER": [
