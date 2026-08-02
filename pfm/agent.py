@@ -25,6 +25,9 @@ active_mcp_session = None
 last_update_id = 0
 keep_alive=-1
 temperature=0.1
+# qwen2.5-instruct is instruction-tuned (follows structured formats reliably)
+# and at 1.5B loads in ~half the time of llama3.2:3b on the Hailo NPU.
+LLM_MODEL = 'qwen2.5-instruct:1.5b'
 
 # ==========================================
 # TELEGRAM HELPER
@@ -172,7 +175,7 @@ async def analyze_with_ai_and_save(holdings_text, news_intelligence):
     print("📈 AI Analyst Integrated Report:\n" + "="*50)
     # keep_alive=-1 holds the model in Hailo VRAM so it stays warm for this long generation
     async for chunk in await client.generate(
-        model='llama3.2:3b',
+        model=LLM_MODEL,
         prompt=prompt,
         keep_alive=keep_alive,
         options={'temperature': temperature},
@@ -294,7 +297,7 @@ Headlines:
         print("  ⏳ Waiting for Hailo model (cold-load may take a few minutes)...")
         response = await asyncio.wait_for(
             client.generate(
-                model='llama3.2:3b',
+                model=LLM_MODEL,
                 prompt=batch_prompt,
                 keep_alive=keep_alive,
                 options={'temperature': temperature},
@@ -327,7 +330,7 @@ Headlines:
             )
 
     except asyncio.TimeoutError:
-        print("  ⚠️  Batch scoring timed out after 5 minutes. Proceeding without news scores.")
+        print("  ⚠️  Batch scoring timed out after 15 minutes. Proceeding without news scores.")
     except Exception as e:
         print(f"Batch scoring failed: {e}")
 

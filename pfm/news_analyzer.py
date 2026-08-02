@@ -7,6 +7,8 @@ import ollama
 # Keep model loaded in Hailo VRAM between calls to avoid cold-load timeout penalty
 _KEEP_ALIVE = -1
 _TEMPERATURE = 0.1
+# Must match the model used in agent.py
+_LLM_MODEL = 'qwen2.5-instruct:1.5b'
 
 async def fetch_and_score_news(config_path='config.json'):
     print("\n📰 Fetching market news from RSS feeds...")
@@ -71,7 +73,7 @@ async def fetch_and_score_news(config_path='config.json'):
         try:
             response = await asyncio.wait_for(
                 client.generate(
-                    model='llama3.2:3b',
+                    model=_LLM_MODEL,
                     prompt=prompt,
                     keep_alive=_KEEP_ALIVE,
                     options={'temperature': _TEMPERATURE},
