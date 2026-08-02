@@ -388,7 +388,9 @@ async def fetch_and_score_news():
                 combined_text = f"{title} {desc}".upper()
                 for entity in tracked_entities:
                     for keyword in entity['keywords']:
-                        if keyword.upper() in combined_text:
+                        # Use word boundaries (\b) to prevent "LIC" from matching inside "PubLICis" or "poLICe"
+                        pattern = r'\b' + re.escape(keyword.upper()) + r'\b'
+                        if re.search(pattern, combined_text):
                             relevant_articles.append({
                                 "symbol": entity['symbol'],
                                 "title": title,
