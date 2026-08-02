@@ -61,16 +61,24 @@ async def generate_daily_login():
 
 async def probe_session():
     """Checks whether the current Kite token is still valid by attempting get_holdings.
-    Returns the holdings JSON string on success, or None if auth is required.
-    Using get_holdings as the probe means we get the data for free if the session is live."""
+    Returns the raw holdings text on success, or None if auth is required.
+
+    IMPORTANT: Kite MCP returns plain-text error messages (e.g. 'Please log in
+    first using the login tool') rather than raising exceptions for unauth requests.
+    We must validate the content is actual JSON data, not an error string."""
     global active_mcp_session
     if active_mcp_session is None:
         return None
     try:
         result = await active_mcp_session.call_tool("get_holdings", arguments={})
-        return result.content[0].text  # Non-None → session is valid
+        text = result.content[0].text
+        # extract_holdings_json returns None for non-JSON text like auth error messages
+        if extract_holdings_json(text) is not None:
+            return text  # Real holdings data — session is live
+        print(f"  ℹ️  Kite responded: '{text[:80]}' — treating as auth required.")
+        return None
     except Exception:
-        return None  # Auth error or any failure → need a fresh login
+        return None  # Any failure → need a fresh login
 
 def extract_holdings_json(text):
     """Robustly extract a holdings list from MCP tool output.
