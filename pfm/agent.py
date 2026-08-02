@@ -69,6 +69,44 @@ async def probe_session():
     except Exception:
         return None  # Auth error or any failure → need a fresh login
 
+def extract_holdings_json(text):
+    """Robustly extract a holdings list from MCP tool output.
+    Kite MCP may return JSON directly, wrapped in a code fence, or embedded in prose."""
+    if not text:
+        return None
+
+    # 1. Try direct parse
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and 'data' in result:
+            return result['data']  # Some MCP wrappers use {"data": [...]}
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip Markdown code fences (```json ... ``` or ``` ... ```)
+    fenced = re.search(r'```(?:json)?\s*([\s\S]+?)\s*```', text)
+    if fenced:
+        try:
+            result = json.loads(fenced.group(1))
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Find the first bare JSON array embedded anywhere in the text
+    array_match = re.search(r'(\[\s*\{[\s\S]*?\}\s*\])', text)
+    if array_match:
+        try:
+            result = json.loads(array_match.group(1))
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
 # ==========================================
 # MASTER LOGIC: SNAPSHOT & SYNTHESIS
 # ==========================================
@@ -76,10 +114,10 @@ async def analyze_with_ai_and_save(holdings_text, news_intelligence):
     """Blends portfolio numbers and news analysis, generates markdown summary, and updates Telegram"""
     print("\n🧠 Synthesizing metrics and market news...")
     
-    try:
-        holdings_list = json.loads(holdings_text)
-    except json.JSONDecodeError:
-        print("Could not parse JSON payload.")
+    holdings_list = extract_holdings_json(holdings_text)
+    if holdings_list is None:
+        print("❌ Could not parse holdings from MCP response. Raw output:")
+        print(repr(holdings_text[:500]))  # Print first 500 chars to reveal the actual format
         return
 
     summary = []
@@ -262,7 +300,7 @@ Headlines:
                 options={'temperature': temperature},
                 stream=False
             ),
-            timeout=300  # One generous deadline for the entire batch
+            timeout=900  # 15-minute ceiling: hailo cold-load (~7 min) + inference
         )
         print("  ✅ Batch scoring complete.")
         raw_output = response['response'].strip()
