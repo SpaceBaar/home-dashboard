@@ -28,6 +28,10 @@ temperature=0.1
 # qwen2.5-instruct is instruction-tuned (follows structured formats reliably)
 # and at 1.5B loads in ~half the time of llama3.2:3b on the Hailo NPU.
 LLM_MODEL = 'qwen2.5-instruct:1.5b'
+# Articles scored per LLM call — keeps each prompt within the 1.5B context window
+NEWS_BATCH_SIZE = 5
+# Holdings summarised per intermediate LLM call in phase-1 of the analysis
+HOLDINGS_BATCH_SIZE = 8
 
 # ==========================================
 # TELEGRAM HELPER
@@ -119,124 +123,237 @@ def extract_holdings_json(text):
     return None
 
 # ==========================================
+# BATCH SCORING HELPER
+# ==========================================
+async def _score_one_news_batch(batch, batch_label, client):
+    """Score a single batch of articles via one LLM call.
+    Returns a tuple of (full_text_lines, compact_score_lines).
+    Keeping this as a standalone helper makes it easy to reuse for
+    future data sources (IndMoney US stocks, crypto, etc.)."""
+    numbered_headlines = "\n".join(
+        f"{j+1}. {a['symbol']}: \"{a['title']}\""
+        for j, a in enumerate(batch)
+    )
+    prompt = f"""You are a financial market analyst. Respond in English only.
+Rate the market sentiment of each headline below for its stock.
+
+Use exactly one line per headline in this format:
+  N. Score: X/10 - Reason: one short English sentence
+
+Where X is 1 (very bearish) to 10 (very bullish). No other text.
+
+Headlines:
+{numbered_headlines}
+
+Ratings:"""
+
+    try:
+        response = await asyncio.wait_for(
+            client.generate(
+                model=LLM_MODEL,
+                prompt=prompt,
+                keep_alive=keep_alive,
+                options={
+                    'temperature': temperature,
+                    'num_predict': NEWS_BATCH_SIZE * 35,  # ~35 tokens per headline
+                    'repeat_penalty': 1.3,
+                },
+                stream=False
+            ),
+            timeout=900
+        )
+        raw = response['response'].strip()
+        print(f"\n  [RAW {batch_label}]\n{raw}\n")
+    except asyncio.TimeoutError:
+        print(f"  Batch {batch_label} timed out, skipping.")
+        raw = ""
+    except Exception as e:
+        print(f"  Batch {batch_label} failed: {e}")
+        raw = ""
+
+    # Multi-pattern parser — handles common instruction-model output variations
+    patterns = [
+        re.compile(r'^(\d+)[.):]\s*Score:\s*(\d+)(?:/10)?\s*[-\u2013]\s*Reason:\s*(.+)', re.IGNORECASE | re.MULTILINE),
+        re.compile(r'^(\d+)[.):]\s*Score:\s*(\d+)(?:/10)?[,.\s]+(.+)', re.IGNORECASE | re.MULTILINE),
+        re.compile(r'\[(\d+)\]\s*SCORE:\s*(\d+)\s*REASON:\s*(.+)', re.IGNORECASE),
+        re.compile(r'^(\d+)[.):]\s*(\d+)(?:/10)?[,.\s]+(.+)', re.IGNORECASE | re.MULTILINE),
+    ]
+    parsed = {}
+    for pattern in patterns:
+        if parsed:
+            break
+        for m in pattern.finditer(raw):
+            idx = int(m.group(1)) - 1
+            if idx not in parsed:
+                parsed[idx] = (m.group(2), m.group(3).strip())
+
+    full_lines, compact_lines = [], []
+    for j, article in enumerate(batch):
+        if j in parsed:
+            score, reason = parsed[j]
+            ai_eval = f"SCORE: {score}/10\nREASON: {reason}"
+            compact_lines.append(f"{article['symbol']}: {score}/10 \u2014 {reason}")
+        else:
+            ai_eval = "Score unavailable."
+            compact_lines.append(f"{article['symbol']}: unscored")
+        full_lines.append(
+            f"Stock: {article['symbol']} | Source: {article['source']}\n"
+            f"Headline: {article['title']}\n"
+            f"AI Evaluation: {ai_eval}\n"
+            f"Link: {article['link']}\n"
+            f"{_sep}"
+        )
+    return full_lines, compact_lines
+
+# ==========================================
 # MASTER LOGIC: SNAPSHOT & SYNTHESIS
 # ==========================================
-async def analyze_with_ai_and_save(holdings_text, news_intelligence):
-    """Blends portfolio numbers and news analysis, generates markdown summary, and updates Telegram"""
-    print("\n🧠 Synthesizing metrics and market news...")
-    
+async def analyze_with_ai_and_save(holdings_text, news_data):
+    """Map-reduce analysis pipeline.
+    Phase 1 — Map:    Summarise holdings in batches of HOLDINGS_BATCH_SIZE.
+    Phase 2 — Reduce: Synthesise all batch summaries + news into final report.
+    This keeps every LLM call within the 1.5B model's context window regardless
+    of how many holdings or news sources are added in the future."""
+    print("\n🧠 Synthesising metrics and market news...")
+
     holdings_list = extract_holdings_json(holdings_text)
     if holdings_list is None:
         print("❌ Could not parse holdings from MCP response. Raw output:")
-        print(repr(holdings_text[:500]))  # Print first 500 chars to reveal the actual format
+        print(repr(holdings_text[:500]))
         return
 
+    # --- Build per-holding summary lines & portfolio totals ---
     summary = []
     total_investment = 0
     total_current = 0
-    
     for item in holdings_list:
-        symbol = item.get('tradingsymbol', 'Unknown')
-        qty = item.get('quantity', 0)
+        symbol    = item.get('tradingsymbol', 'Unknown')
+        qty       = item.get('quantity', 0)
         avg_price = item.get('average_price', 0)
-        ltp = item.get('last_price', 0)
-        pnl = item.get('pnl', 0)
-        day_change_pct = item.get('day_change_percentage', 0)
-        
-        invested = qty * avg_price
-        current_val = qty * ltp
+        ltp       = item.get('last_price', 0)
+        pnl       = item.get('pnl', 0)
+        day_pct   = item.get('day_change_percentage', 0)
+        invested  = qty * avg_price
+        current   = qty * ltp
         total_investment += invested
-        total_current += current_val
-        
+        total_current    += current
+        overall_pct = ((current - invested) / invested * 100) if invested else 0
         summary.append(
-            f"- {symbol}: Qty {qty}, Invested: ₹{invested:.2f}, "
-            f"Current: ₹{current_val:.2f}, P&L: ₹{pnl:.2f} ({day_change_pct:.2f}% Today)"
+            f"{symbol}: P&L \u20b9{pnl:+.0f} ({overall_pct:+.1f}% overall, {day_pct:+.2f}% today)"
         )
-
     overall_pnl = total_current - total_investment
-    
-    # Core prompt blending context together
-    prompt = f"""
-    You are an expert financial analyst. Review the following daily portfolio summary alongside today's AI-scored market news intelligence.
-    Provide a brief, professional 3-paragraph analysis. 
-    
-    In your analysis:
-    - Detail the overall financial health of the portfolio.
-    - Directly correlate any major stock price movements or portfolio P&L variance with the provided news summaries.
-    - Maintain an objective, institutional tone.
 
-    Total Invested: ₹{total_investment:.2f}
-    Total Current Value: ₹{total_current:.2f}
-    Overall P&L: ₹{overall_pnl:.2f}
-
-    Holdings Breakdown:
-    {chr(10).join(summary)}
-
-    Recent Scored News Intelligence:
-    {news_intelligence}
-    """
-    
-    print("Streaming master report generation from Hailo-Ollama...\n")
+    # --- Phase 1: Batch-summarise all holdings ---
+    # Each batch of HOLDINGS_BATCH_SIZE holdings is condensed into a short paragraph
+    # by the LLM. This lets us handle any number of holdings (Indian + US + future)
+    # without ever overflowing the context window in Phase 2.
     client = ollama.AsyncClient(host='http://127.0.0.1:8000')
-    
+    holding_summaries = []
+    total_h_batches = -(-len(holdings_list) // HOLDINGS_BATCH_SIZE)  # ceiling division
+    print(f"Phase 1: Summarising {len(holdings_list)} holdings in {total_h_batches} batch(es)...")
+
+    for b_num, i in enumerate(range(0, len(holdings_list), HOLDINGS_BATCH_SIZE), 1):
+        batch_lines = summary[i:i + HOLDINGS_BATCH_SIZE]
+        h_prompt = f"""You are a financial analyst. Respond in English only.
+Summarise these stock holdings in 2 concise English sentences.
+Focus on the key gainers, losers, and any notable patterns.
+
+Holdings:
+{chr(10).join(batch_lines)}
+
+Summary:"""
+        try:
+            r = await asyncio.wait_for(
+                client.generate(
+                    model=LLM_MODEL, prompt=h_prompt, keep_alive=keep_alive,
+                    options={'temperature': temperature, 'num_predict': 80, 'repeat_penalty': 1.3},
+                    stream=False
+                ),
+                timeout=300
+            )
+            holding_summaries.append(r['response'].strip())
+            print(f"  Holdings batch {b_num}/{total_h_batches} ✅")
+        except Exception as e:
+            print(f"  Holdings batch {b_num} failed ({e}), using raw lines.")
+            holding_summaries.append("\n".join(batch_lines))
+
+    # --- Phase 2: Final synthesis ---
+    # The prompt only contains compact intermediate summaries + compact news scores,
+    # so it stays small regardless of portfolio size.
+    combined_holdings = "\n\n".join(holding_summaries)
+    # compact one-liner scores, capped so the prompt stays well under context limit
+    news_compact = news_data.get('compact', '') if isinstance(news_data, dict) else str(news_data)
+    news_for_prompt = news_compact[:1500] + ('...' if len(news_compact) > 1500 else '')
+
+    final_prompt = f"""You are a financial analyst. Respond in English only.
+Write a 2-paragraph portfolio analysis based on the data below.
+
+Portfolio: Invested \u20b9{total_investment:.0f} | Current \u20b9{total_current:.0f} | P&L \u20b9{overall_pnl:+.0f}
+
+Holdings summary:
+{combined_holdings}
+
+News sentiment scores:
+{news_for_prompt}
+
+Analysis (2 paragraphs, English only):"""
+
+    print("\nPhase 2: Streaming final report...\n")
     full_response = ""
     print("📈 AI Analyst Integrated Report:\n" + "="*50)
-    # keep_alive=-1 holds the model in Hailo VRAM so it stays warm for this long generation
     async for chunk in await client.generate(
-        model=LLM_MODEL,
-        prompt=prompt,
-        keep_alive=keep_alive,
-        options={'temperature': temperature},
+        model=LLM_MODEL, prompt=final_prompt, keep_alive=keep_alive,
+        options={'temperature': temperature, 'num_predict': 350, 'repeat_penalty': 1.3},
         stream=True
     ):
         print(chunk['response'], end='', flush=True)
         full_response += chunk['response']
     print("\n" + "="*50)
 
-    # Save Markdown file locally
+    # --- Persist full report to markdown ---
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"portfolio_analysis_{date_str}.md"
-    
+    news_full = news_data.get('full', '') if isinstance(news_data, dict) else str(news_data)
     with open(filename, "w", encoding="utf-8") as f:
         f.write(f"# Portfolio Integrated Analysis - {date_str}\n\n")
-        f.write(f"**Total Invested:** ₹{total_investment:.2f}\n")
-        f.write(f"**Current Value:** ₹{total_current:.2f}\n")
-        f.write(f"**Overall P&L:** ₹{overall_pnl:.2f}\n\n")
+        f.write(f"**Total Invested:** \u20b9{total_investment:.2f}\n")
+        f.write(f"**Current Value:** \u20b9{total_current:.2f}\n")
+        f.write(f"**Overall P&L:** \u20b9{overall_pnl:.2f}\n\n")
         f.write("## Holdings Breakdown\n")
         for line in summary:
             f.write(f"{line}\n")
         f.write("\n## Contextual News Scored\n")
-        f.write(news_intelligence)
+        f.write(news_full)
         f.write("\n\n## AI Analysis & Insights\n\n")
         f.write(full_response)
-        
-    print(f"\n💾 Integrated report saved locally to: {filename}")
-    
-    status_msg = (
-        f"📉 Daily Integrated Analysis Complete!\n"
-        f"Total Portfolio Value: ₹{total_current:.2f}\n"
-        f"Overall P&L: ₹{overall_pnl:.2f}\n\n"
-        f"Check your local directory for the comprehensive markdown dossier."
+    print(f"\n💾 Integrated report saved: {filename}")
+
+    send_telegram_message(
+        f"📉 Daily Analysis Complete!\n"
+        f"Portfolio: \u20b9{total_current:.2f} | P&L: \u20b9{overall_pnl:+.2f}\n"
+        f"Full report saved to {filename}"
     )
-    send_telegram_message(status_msg)
 
 # ==========================================
 # NEWS PROCESSING PIPELINE
 # ==========================================
 async def fetch_and_score_news():
-    """Scrapes RSS feeds from config.json, filters by keywords, and scores sentiment via Qwen2"""
+    """Scrapes all configured RSS feeds, filters by portfolio keywords, then scores
+    EVERY matching article via batched LLM calls (NEWS_BATCH_SIZE articles per call).
+    Returns a dict with:
+      'full'    — verbose formatted text written to the markdown report
+      'compact' — one-liner scores used in the analysis prompt
+    """
     print("\n📰 Scraping market news from RSS feeds...")
-    
+
     with open('config.json', 'r') as f:
         config = json.load(f)
-        
     tracked_entities = config['tracking']['stocks']
-    news_sources = config['news_sources']
-    
+    news_sources     = config['news_sources']
     relevant_articles = []
     client = ollama.AsyncClient(host='http://127.0.0.1:8000')
 
-    # 1. Fetch and Filter RSS Feeds
+    # 1. Fetch and filter all RSS feeds
     for source in news_sources:
         print(f"Scanning {source['name']}...")
         try:
@@ -244,16 +361,12 @@ async def fetch_and_score_news():
             response = requests.get(source['rss_url'], headers=headers, timeout=10)
             if response.status_code != 200:
                 continue
-                
             root = ET.fromstring(response.content)
             for item in root.findall('.//item'):
                 title = item.find('title').text if item.find('title') is not None else ""
-                desc = item.find('description').text if item.find('description') is not None else ""
-                link = item.find('link').text if item.find('link') is not None else ""
-                
+                desc  = item.find('description').text if item.find('description') is not None else ""
+                link  = item.find('link').text if item.find('link') is not None else ""
                 combined_text = f"{title} {desc}".upper()
-                
-                # Verify match against keyword mappings
                 for entity in tracked_entities:
                     for keyword in entity['keywords']:
                         if keyword.upper() in combined_text:
@@ -266,83 +379,32 @@ async def fetch_and_score_news():
                             break
                     else:
                         continue
-                    break # Break outer loop if keyword matched
+                    break
         except Exception as e:
             print(f"  -> Error parsing {source['name']}: {e}")
 
-    print(f"Found {len(relevant_articles)} articles matching your portfolio keywords today.")
-    
-    if not relevant_articles:
-        return "No significant news found for your holdings today."
+    total = len(relevant_articles)
+    print(f"Found {total} article(s) matching portfolio keywords.")
+    if not total:
+        return {'full': 'No significant news found today.', 'compact': ''}
 
-    # 2. Score all relevant articles in a SINGLE batched LLM call.
-    # Batching is the key fix for Hailo: the model cold-loads exactly once,
-    # then the NPU generates all scores in one continuous inference pass
-    # instead of reloading for each article. Total latency drops from
-    # (N × cold-load time) to (1 cold-load + 1 inference).
-    articles_to_score = relevant_articles[:5]
-    print(f"Evaluating {len(articles_to_score)} article(s) via Hailo-Ollama (single batched call)...")
+    # 2. Score ALL articles in batches of NEWS_BATCH_SIZE
+    total_batches = -(-total // NEWS_BATCH_SIZE)  # ceiling division
+    print(f"Scoring {total} article(s) across {total_batches} batch(es) of ≤{NEWS_BATCH_SIZE}...")
 
-    # Build a numbered list of headlines for the batch prompt
-    numbered_headlines = "\n".join(
-        f"{i+1}. [{a['symbol']}] \"{a['title']}\""
-        for i, a in enumerate(articles_to_score)
-    )
+    all_full, all_compact = [], []
+    for b_num, i in enumerate(range(0, total, NEWS_BATCH_SIZE), 1):
+        batch = relevant_articles[i:i + NEWS_BATCH_SIZE]
+        label = f"{b_num}/{total_batches}"
+        print(f"  Batch {label}: {len(batch)} article(s)")
+        full_lines, compact_lines = await _score_one_news_batch(batch, label, client)
+        all_full.extend(full_lines)
+        all_compact.extend(compact_lines)
 
-    batch_prompt = f"""You are a financial analyst. Score the market sentiment of each headline below.
-
-For EACH headline respond on its own line in this exact format (no extra text):
-[N] SCORE: <1-10> REASON: <one short sentence>
-
-Where N is the headline number, 1 = deeply bearish, 10 = deeply bullish.
-
-Headlines:
-{numbered_headlines}
-"""
-
-    scored_news_summary = []
-    try:
-        print("  ⏳ Waiting for Hailo model (cold-load may take a few minutes)...")
-        response = await asyncio.wait_for(
-            client.generate(
-                model=LLM_MODEL,
-                prompt=batch_prompt,
-                keep_alive=keep_alive,
-                options={'temperature': temperature},
-                stream=False
-            ),
-            timeout=900  # 15-minute ceiling: hailo cold-load (~7 min) + inference
-        )
-        print("  ✅ Batch scoring complete.")
-        raw_output = response['response'].strip()
-
-        # Parse "[N] SCORE: X REASON: ..." lines back into per-article results
-        line_pattern = re.compile(
-            r'\[(\d+)\]\s*SCORE:\s*(\d+)\s*REASON:\s*(.+)', re.IGNORECASE
-        )
-        parsed = {}
-        for line in raw_output.splitlines():
-            m = line_pattern.search(line)
-            if m:
-                idx, score, reason = int(m.group(1)) - 1, m.group(2), m.group(3).strip()
-                parsed[idx] = f"SCORE: {score}\nREASON: {reason}"
-
-        for i, article in enumerate(articles_to_score):
-            ai_output = parsed.get(i, "Could not parse score from model output.")
-            scored_news_summary.append(
-                f"Stock: {article['symbol']} | Source: {article['source']}\n"
-                f"Headline: {article['title']}\n"
-                f"AI Evaluation: {ai_output}\n"
-                f"Link: {article['link']}\n"
-                f"{'-'*40}"
-            )
-
-    except asyncio.TimeoutError:
-        print("  ⚠️  Batch scoring timed out after 15 minutes. Proceeding without news scores.")
-    except Exception as e:
-        print(f"Batch scoring failed: {e}")
-
-    return "\n".join(scored_news_summary)
+    return {
+        'full':    "\n".join(all_full),
+        'compact': "\n".join(all_compact),
+    }
 
 async def run_nightly_analysis(holdings_text=None):
     """Main daemon pipeline loop wrapper.
