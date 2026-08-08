@@ -86,6 +86,31 @@ cp ../.env.example .env   # then set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
 
 Optional environment variables (`pfm/.env`):
 
+## Daily schedule
+
+Kite access tokens do not survive the day, so the login link is pushed **shortly
+before the analysis**, not in the morning:
+
+| Time | What happens |
+| --- | --- |
+| `22:45` | Probe the Kite session. If it is dead, push the login link with the deadline. If it is still alive, do nothing — no pointless notification. |
+| `23:00` | Run the analysis. If the login has not happened yet, poll every 2 minutes for up to 20 minutes rather than losing the night. |
+
+Controlled by `agent_settings`:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `analysis_time` | `23:00` | when the report runs |
+| `login_lead_minutes` | `15` | how far ahead of the run to prompt |
+| `auth_grace_minutes` | `20` | how long the run waits for a late login |
+| `auth_retry_interval_minutes` | `2` | how often it re-probes while waiting |
+| `login_time` | `null` | optional extra morning link; `null` disables it |
+
+`login_lead_minutes` is subtracted from `analysis_time` and wraps correctly over
+midnight, so an analysis at `00:10` prompts at `23:55` the previous evening.
+
+## Environment
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `TELEGRAM_TOKEN` | — | bot token |

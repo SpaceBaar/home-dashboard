@@ -112,6 +112,41 @@ async def probe_session() -> Optional[str]:
     return None
 
 
+async def wait_for_kite_session() -> Optional[str]:
+    """Probe for a valid Kite session, retrying through a short grace window.
+
+    The login prompt goes out a few minutes before the run, so the token often
+    lands moments after the analysis starts. Rather than abort and lose the night,
+    poll for ``auth_grace_minutes`` and continue the moment it appears.
+    """
+    holdings = await probe_session()
+    if holdings is not None:
+        return holdings
+
+    grace = int(CFG.agent.get("auth_grace_minutes", 20) or 0)
+    interval = max(1, int(CFG.agent.get("auth_retry_interval_minutes", 2) or 2))
+    if grace <= 0:
+        return None
+
+    attempts = max(1, grace // interval)
+    log.warning("No Kite session at analysis time; polling every %d min for up to "
+                "%d min.", interval, grace)
+    if TG:
+        TG.send(f"Waiting for your Zerodha login. The analysis will start "
+                f"automatically once you have tapped the link, any time in the "
+                f"next {grace} minutes.")
+
+    for attempt in range(1, attempts + 1):
+        await asyncio.sleep(interval * 60)
+        holdings = await probe_session()
+        if holdings is not None:
+            log.info("Kite session became valid after %d minute(s); continuing.",
+                     attempt * interval)
+            return holdings
+        log.info("Still no session (%d/%d).", attempt, attempts)
+    return None
+
+
 async def send_login_link() -> None:
     if _session is None:
         log.error("No MCP session; cannot generate a login link.")
@@ -143,12 +178,13 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
         log.info("=== Analysis run starting ===")
 
         if holdings_text is None:
-            holdings_text = await probe_session()
+            holdings_text = await wait_for_kite_session()
         if holdings_text is None:
             log.error("No valid Kite session; aborting.")
             if TG:
-                TG.alert("Nightly analysis aborted: the Zerodha session has expired. "
-                         "Use the morning login link before the 23:00 run.")
+                TG.alert("Nightly analysis aborted: no valid Zerodha session. "
+                         "The login link was sent before the run; tap it and the "
+                         "next scheduled run will pick up from there.")
             return None
 
         holdings_raw = extract_holdings_json(holdings_text)
@@ -476,9 +512,50 @@ async def dry_run(fixture: Optional[str], use_llm: bool) -> int:
     return 0 if result else 1
 
 
-def _schedule_jobs(loop: asyncio.AbstractEventLoop) -> None:
-    login_time = CFG.agent.get("login_time", "09:00")
+def shift_time(hhmm: str, minutes: int) -> str:
+    """Offset an HH:MM clock time, wrapping around midnight.
+
+    Used to place the login prompt shortly before the analysis rather than in the
+    morning: a token issued at 09:00 is routinely dead by 23:00.
+    """
+    hour, minute = (int(part) for part in hhmm.strip().split(":")[:2])
+    total = (hour * 60 + minute + minutes) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+async def prompt_login_before_analysis() -> None:
+    """Ask for a fresh Kite login only if the current session is actually dead.
+
+    Runs a few minutes before the analysis. Probing first means no pointless
+    Telegram message on the nights when the token is still good.
+    """
     analysis_time = CFG.agent.get("analysis_time", "23:00")
+    lead = int(CFG.agent.get("login_lead_minutes", 15) or 15)
+
+    holdings = await probe_session()
+    if holdings is not None:
+        log.info("Kite session is still valid; no login link needed before the "
+                 "%s run.", analysis_time)
+        return
+
+    log.info("Kite session is expired; sending the login link %d minutes ahead of "
+             "the %s run.", lead, analysis_time)
+    if TG:
+        grace = int(CFG.agent.get("auth_grace_minutes", 20) or 0)
+        deadline = (f" It will keep retrying for up to {grace} minutes after that "
+                    f"if you are late." if grace else "")
+        TG.send(
+            f"Zerodha login needed before tonight's analysis.\n\n"
+            f"The run starts at {analysis_time}, in about {lead} minutes.{deadline}\n\n"
+            f"Tap the link below, complete the login, and nothing else is required."
+        )
+    await send_login_link()
+
+
+def _schedule_jobs(loop: asyncio.AbstractEventLoop) -> None:
+    analysis_time = CFG.agent.get("analysis_time", "23:00")
+    lead = int(CFG.agent.get("login_lead_minutes", 15) or 15)
+    morning_time = CFG.agent.get("login_time") or None
 
     def job(coro_factory, name: str):
         def runner():
@@ -495,9 +572,24 @@ def _schedule_jobs(loop: asyncio.AbstractEventLoop) -> None:
             task.add_done_callback(_done)
         return runner
 
-    schedule.every().day.at(login_time).do(job(send_login_link, "morning login"))
+    try:
+        prompt_time = shift_time(analysis_time, -lead)
+    except (ValueError, IndexError):
+        log.error("analysis_time %r is not HH:MM; defaulting to 23:00 with a "
+                  "22:45 login prompt.", analysis_time)
+        analysis_time, prompt_time = "23:00", "22:45"
+
+    schedule.every().day.at(prompt_time).do(
+        job(prompt_login_before_analysis, "pre-analysis login prompt"))
     schedule.every().day.at(analysis_time).do(job(run_analysis, "nightly analysis"))
-    log.info("Scheduled: login at %s, analysis at %s (Pi local time).", login_time, analysis_time)
+
+    # An extra morning link is optional and off unless login_time is set.
+    if morning_time:
+        schedule.every().day.at(morning_time).do(job(send_login_link, "morning login"))
+
+    log.info("Scheduled (Pi local time): login prompt at %s, analysis at %s%s.",
+             prompt_time, analysis_time,
+             f", extra morning link at {morning_time}" if morning_time else "")
 
 
 @asynccontextmanager

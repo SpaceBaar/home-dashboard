@@ -32,8 +32,11 @@ log = logging.getLogger("pfm.config")
 # ---------------------------------------------------------------------------
 DEFAULTS: Dict[str, Any] = {
     "agent_settings": {
-        "login_time": "09:00",
         "analysis_time": "23:00",
+        "login_lead_minutes": 15,
+        "auth_grace_minutes": 20,
+        "auth_retry_interval_minutes": 2,
+        "login_time": None,          # optional extra morning link
         "storage_backend": "markdown",
         "cloud_api_endpoint": None,
     },

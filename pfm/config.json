@@ -1,10 +1,13 @@
 {
   "agent_settings": {
-    "login_time": "09:00",
     "analysis_time": "23:00",
+    "login_lead_minutes": 15,
+    "auth_grace_minutes": 20,
+    "auth_retry_interval_minutes": 2,
+    "login_time": null,
     "storage_backend": "markdown",
     "cloud_api_endpoint": null,
-    "_note": "Times are local to the Pi (set the Pi to Asia/Kolkata). Kite access tokens expire around 06:00 IST, so analysis_time must be before midnight for the token issued at login_time to still be valid."
+    "_note": "Times are local to the Pi (set the Pi to Asia/Kolkata). The Zerodha login link is pushed login_lead_minutes before analysis_time, and only when the existing session has actually expired - a token issued in the morning is usually dead by night. If the login has not happened by analysis_time, the run polls every auth_retry_interval_minutes for up to auth_grace_minutes rather than giving up. Set login_time to an HH:MM string to also get an extra link at that hour; null disables it."
   },
 
   "llm": {

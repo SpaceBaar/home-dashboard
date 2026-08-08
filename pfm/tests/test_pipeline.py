@@ -409,6 +409,48 @@ def test_language_guard(fs, grouped, tmp_dir: Path):
 
 
 # ===========================================================================
+# 5c. Scheduling: the login link goes out just before the analysis
+# ===========================================================================
+def test_schedule():
+    section("Login prompt is scheduled just before the analysis, not in the morning")
+
+    import agent
+
+    cases = [
+        ("23:00", -15, "22:45"),
+        ("23:00", -10, "22:50"),
+        ("00:10", -15, "23:55"),      # wraps back over midnight
+        ("00:00", -1, "23:59"),
+        ("09:05", -15, "08:50"),
+        ("23:00", -60, "22:00"),
+        ("12:00", 15, "12:15"),       # positive offsets work too
+    ]
+    for base, offset, expected in cases:
+        got = agent.shift_time(base, offset)
+        check(got == expected,
+              f"shift_time({base!r}, {offset}) -> {got} (expected {expected})")
+
+    check(agent.shift_time("23:00", -15) != "09:00",
+          "the prompt no longer lands in the morning, when the token would expire "
+          "long before the run")
+
+    defaults = CFG.agent
+    check(defaults.get("login_time") in (None, ""),
+          "the morning link is off by default")
+    lead = int(defaults.get("login_lead_minutes", 0))
+    check(10 <= lead <= 15,
+          f"the lead time is in the requested 10-15 minute range ({lead} min)")
+    check(int(defaults.get("auth_grace_minutes", 0)) > 0,
+          f"a grace window exists for a late login "
+          f"({defaults.get('auth_grace_minutes')} min)")
+
+    analysis = defaults.get("analysis_time", "23:00")
+    check(agent.shift_time(analysis, -lead) == "22:45",
+          f"with analysis at {analysis} the prompt fires at "
+          f"{agent.shift_time(analysis, -lead)}")
+
+
+# ===========================================================================
 # 6. End-to-end report
 # ===========================================================================
 def test_end_to_end(fs, grouped, tmp_dir: Path):
@@ -469,6 +511,7 @@ def test_all():
         scores = test_scoring(grouped, tmp / "cache")
         test_validator(fs, scores)
         test_language_guard(fs, grouped, tmp / "lang")
+        test_schedule()
         report_path = test_end_to_end(fs, grouped, tmp / "reports")
         preview = report_path.read_text(encoding="utf-8")
     assert not _failures, f"{len(_failures)} check(s) failed:\n" + "\n".join(_failures)
