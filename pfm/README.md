@@ -233,10 +233,29 @@ reported.
 
 **There is no ticker field.** Rows carry only `investment` (a long name like
 `"Space Exploration Technologies Corp. Class A Common Stock"`) and
-`investment_code`. Resolution order is: the id join above, then `lookup_ind_keys`,
-then a label derived from the name — **flagged as derived**, with the failure in
-the data-quality section, because an unresolved ticker also means news matching
-will miss that holding.
+`investment_code`. Four resolution paths run in order, each independent of the
+last, so no single failure can leave a holding unidentified:
+
+1. **`investment_code` → `mycroft_id`** from the quote reply. An exact id match.
+2. **Instrument name → `entity_basic.name`**, both reduced to a stem —
+   `"Apple Inc. Common Stock"` and `"Apple Inc."` both become `Apple`. Uses data
+   already fetched, so it costs nothing and covers the case where the quote batch
+   arrived without ids.
+3. **`lookup_ind_keys`** with the shortened name, one per call.
+4. **`tracking.instrument_tickers`** in `config.json` — manual name-fragment
+   overrides, for instruments no API knows. SpaceX is private-market and absent
+   from `get_us_stocks_details`, so it will always need this.
+
+Anything still unresolved keeps a label derived from its name, is **flagged as
+derived**, and is named in the data-quality section — an unresolved ticker also
+means news matching will miss that holding.
+
+**Quote batches are retried per symbol on failure.** `get_us_stocks_details`
+takes up to ten symbols, and one unrecognised ticker fails the entire call. That
+is how a genuine US holding disappeared: `SPCX` poisoned the batch, `AAPL`'s
+`mycroft_id` went with it, and Apple was left labelled `APPLE` rather than
+`AAPL` — present in the data but invisible to anyone scanning for the ticker.
+Known-Indian tickers are also kept out of the US endpoint entirely.
 
 **`lookup_ind_keys` returns HTTP 414 for long names.** It puts names in a query
 string, and a two-name batch containing the 57-character SpaceX name was rejected

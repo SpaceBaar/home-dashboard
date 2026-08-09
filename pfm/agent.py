@@ -385,18 +385,32 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                     except Exception as exc:
                         log.info("INDmoney watchlist unavailable: %s", exc)
                     candidates |= {h["symbol"] for h in us_rows if not brokers.needs_ticker(h)}
+                    # Never send a ticker we know to be Indian to the US quote
+                    # endpoint; the batch it lands in can fail as a whole.
+                    indian_symbols = ({h.get("symbol") for h in holdings_raw
+                                       if isinstance(h, dict)}
+                                      | set(CFG.keyword_map)) - _US_LIKE
+                    candidates -= {s for s in indian_symbols if s}
 
                     details = await provider.us_details(sorted(candidates))
-                    code_index = brokers.build_code_index(details)
-                    filled, warnings = brokers.resolve_by_code(us_rows, code_index)
-                    us_problems.extend(warnings)
-                    if filled:
-                        log.info("Resolved %d US ticker(s) via INDmoney's instrument ids.",
-                                 filled)
 
-                    # Anything still unnamed falls back to the search endpoint.
+                    # Three independent resolution paths, cheapest first.
+                    by_code, warnings = brokers.resolve_by_code(
+                        us_rows, brokers.build_code_index(details))
+                    us_problems.extend(warnings)
+                    by_name, _ = brokers.resolve_by_name(us_rows, details)
+                    log.info("Resolved US tickers: %d by instrument id, %d by name.",
+                             by_code, by_name)
+
+                    # Anything still unnamed falls back to the search endpoint, then
+                    # to the manual overrides in config.json.
                     if any(brokers.needs_ticker(h) for h in us_rows):
                         await provider._resolve_tickers(us_rows, us_problems)
+                    by_config = brokers.resolve_from_config(
+                        us_rows, CFG.tracking.get("instrument_tickers") or {})
+                    if by_config:
+                        log.info("Resolved %d US ticker(s) from "
+                                 "tracking.instrument_tickers.", by_config)
 
                     # Fetch details for tickers discovered after the first call so
                     # their news and quotes are available too.

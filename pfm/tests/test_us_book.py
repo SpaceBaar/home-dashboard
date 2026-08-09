@@ -439,6 +439,127 @@ def test_fx_derivation() -> None:
     check(resolved is not None, "the derived rate passes the sanity band and is accepted")
 
 
+REAL_NAMES = [
+    ("118186", "Apple Inc. Common Stock"),
+    ("116683", "Tesla, Inc. Common Stock"),
+    ("115382", "NVIDIA Corporation Common Stock"),
+    ("114025", "Alphabet Inc. Class C Capital Stock"),
+    ("203532", "Space Exploration Technologies Corp. Class A Common Stock"),
+]
+
+LIVE_QUOTES = {
+    "AAPL": {"entity_basic": {"name": "Apple Inc.", "symbol": "AAPL",
+                              "mycroft_id": "118186"}},
+    "TSLA": {"entity_basic": {"name": "Tesla Inc.", "symbol": "TSLA",
+                              "mycroft_id": "116683"}},
+    "NVDA": {"entity_basic": {"name": "NVIDIA Corporation", "symbol": "NVDA",
+                              "mycroft_id": "115382"}},
+    "GOOG": {"entity_basic": {"name": "Alphabet Inc.", "symbol": "GOOG",
+                              "mycroft_id": "114025"}},
+}
+
+
+def live_us_rows() -> List[dict]:
+    rows = [{"investment_code": code, "investment": name, "asset_type": "US_STOCK",
+             "assetclass_l2": "Global Equity", "broker": "INDmoney",
+             "market_value": 1000.0, "total_units": 1.0, "unit_price": 1000.0,
+             "invested_amount": 900.0}
+            for code, name in REAL_NAMES]
+    holdings, _ = brokers.normalise_indmoney_rows(rows)
+    return holdings
+
+
+def test_ticker_resolution_paths() -> None:
+    section("Three resolution paths, so one failure cannot hide a US holding")
+
+    check(brokers.shorten_for_lookup("Alphabet Inc. Class C Capital Stock") == "Alphabet",
+          "'Class C Capital Stock' is stripped for lookup")
+    check(brokers.derive_label("Alphabet Inc. Class C Capital Stock") == "ALPHABET",
+          f"and the derived label is readable "
+          f"({brokers.derive_label('Alphabet Inc. Class C Capital Stock')})")
+    check(brokers.shorten_for_lookup("Tesla, Inc. Common Stock") == "Tesla",
+          "a comma before Inc. is handled")
+
+    base = live_us_rows()
+    check(len(base) == 5 and all(brokers.needs_ticker(h) for h in base),
+          "all five live rows start with derived labels, as INDmoney sends no ticker")
+
+    # Path 1: the id join.
+    rows = live_us_rows()
+    by_code, _ = brokers.resolve_by_code(rows, brokers.build_code_index(LIVE_QUOTES))
+    check(by_code == 4, f"the instrument-id join resolves four ({by_code})")
+    check([h["symbol"] for h in rows][:4] == ["AAPL", "TSLA", "NVDA", "GOOG"],
+          f"to the right tickers ({[h['symbol'] for h in rows][:4]})")
+
+    # Path 2: the name join, which works even when the id join gets nothing.
+    rows = live_us_rows()
+    brokers.resolve_by_code(rows, {})          # simulate quotes lost
+    by_name, _ = brokers.resolve_by_name(rows, LIVE_QUOTES)
+    check(by_name == 4,
+          f"the name join independently resolves the same four ({by_name}), so a lost "
+          f"quote batch no longer hides Apple")
+    check("AAPL" in [h["symbol"] for h in rows], "Apple is present either way")
+
+    # Path 3: manual overrides for what no API knows.
+    rows = live_us_rows()
+    brokers.resolve_by_code(rows, brokers.build_code_index(LIVE_QUOTES))
+    spacex = next(h for h in rows if "Space" in h["name"])
+    check(brokers.needs_ticker(spacex),
+          "SpaceX is not in the US quote endpoint, so it stays unresolved")
+    filled = brokers.resolve_from_config(
+        rows, CFG.tracking.get("instrument_tickers") or {})
+    check(filled == 1 and spacex["symbol"] == "SPCX",
+          f"the config override pins it to SPCX ({spacex['symbol']})")
+    check(any("instrument_tickers" in f for f in spacex["flags"]),
+          "and records where the ticker came from")
+    check(not any(brokers.needs_ticker(h) for h in rows),
+          "with all three paths, every live holding has a real ticker")
+
+
+def test_batch_resilience() -> None:
+    section("One unrecognised ticker cannot cost the whole quote batch")
+
+    class PickySession(FakeSession):
+        """Rejects any batch containing a symbol it does not know."""
+
+        def __init__(self, known):
+            super().__init__({})
+            self.known = set(known)
+
+        async def call_tool(self, name, arguments=None):
+            args = dict(arguments or {})
+            self.calls.append((name, args))
+            symbols = [s.upper() for s in (args.get("symbols") or [])]
+            unknown = [s for s in symbols if s not in self.known]
+            if unknown:
+                raise RuntimeError(f"unknown symbol(s): {', '.join(unknown)}")
+            payload = {s: LIVE_QUOTES[s] for s in symbols if s in LIVE_QUOTES}
+
+            class Block:
+                def __init__(self, text): self.text = text
+
+            class Result:
+                def __init__(self, text): self.content = [Block(text)]
+
+            return Result(json.dumps(payload))
+
+    # SPCX is not recognised; it used to poison the batch and lose AAPL with it.
+    session = PickySession(LIVE_QUOTES)
+    provider = IndmoneyProvider(session)
+    got = asyncio.run(provider.us_details(["AAPL", "TSLA", "NVDA", "GOOG", "SPCX"],
+                                          with_news=False))
+    check(set(got) == {"AAPL", "TSLA", "NVDA", "GOOG"},
+          f"the four good symbols survive ({sorted(got)})")
+    check("AAPL" in got, "Apple specifically is not lost to a bad neighbour")
+    check(any(len(c[1].get("symbols", [])) == 1 for c in session.calls),
+          "because the failed batch is retried one symbol at a time")
+
+    # And the mycroft ids survive, so resolution still works.
+    rows = live_us_rows()
+    by_code, _ = brokers.resolve_by_code(rows, brokers.build_code_index(got))
+    check(by_code == 4, f"resolution still gets four tickers ({by_code})")
+
+
 def test_watchlist() -> None:
     section("Watchlist tickers from nested watchlists[].stocks[]")
 
@@ -698,6 +819,8 @@ def test_all():
     test_alternative_shapes()
     test_ticker_resolution_by_id()
     test_lookup_fallback()
+    test_ticker_resolution_paths()
+    test_batch_resilience()
     test_fx_derivation()
     test_watchlist()
     test_us_quotes()

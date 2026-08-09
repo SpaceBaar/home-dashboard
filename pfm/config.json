@@ -95,9 +95,18 @@
       "AAPL": ["APPLE INC", "APPLE"],
       "TSLA": ["TESLA INC", "TESLA", "TSLA", "Tesla, Inc. Common Stock"],
       "NVDA": ["NVIDIA CORP", "NVIDIA", "NVDA", "NVIDIA Corporation Common Stock"],
-      "SPCX": ["SPACEX", "SPCX", "XAI", "SPACEEXPLORA", "Space Exploration Technologies Corp. Class A Common Stock"],
-      "ALPHABETCAPI": ["ALPHABETCAPI", "Alphabet Inc.", "Google", "YouTube", "Alphabet Inc. Class C Capital Stock"]
+      "SPCX": ["SPACEX", "SPCX", "XAI", "Space Exploration Technologies"],
+      "GOOG": ["ALPHABET", "GOOGLE", "YOUTUBE", "GOOG", "GOOGL"]
     },
+
+    "instrument_tickers": {
+      "_note": "Manual name-fragment to ticker overrides. INDmoney holdings arrive with a long instrument name and no ticker; these are the last resort for anything the automatic paths cannot resolve. SpaceX is a private-market holding that get_us_stocks_details does not know, so it will always need this. Matching is a case-insensitive substring of the instrument name.",
+      "SPACE EXPLORATION": "SPCX",
+      "ALPHABET": "GOOG"
+    },
+
+    "watchlist": ["AAPL", "TSLA", "NVDA", "GOOG", "SPCX"],
+
     "exclude_phrases": {
       "_note": "Phrases removed from the article text before keyword matching, so sibling listed companies are not mis-attributed - e.g. an SBI Cards story must not count as SBIN news.",
       "SBIN": ["SBI CARDS", "SBI CARD", "SBI LIFE", "SBI GENERAL", "SBI MUTUAL FUND", "SBI FUNDS", "SBI AMC", "SBI SECURITIES"],

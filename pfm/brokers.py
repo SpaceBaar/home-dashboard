@@ -326,6 +326,9 @@ _ASSET_TYPE_BOOK = {
     "FD": BOOK_IND, "RD": BOOK_IND, "SAVINGS": BOOK_IND, "GOLD": BOOK_IND,
     "SGB": BOOK_IND, "REAL_ESTATE": BOOK_IND, "PMS": BOOK_IND, "AIF": BOOK_IND,
     "CRYPTO": BOOK_IND, "INSURANCE": BOOK_IND, "COMMODITY": BOOK_IND,
+    # Cash balances, seen in networth_snapshot. Recognised so they never trigger
+    # an "unrecognised asset_type" diagnostic; they carry no holdings rows.
+    "US_STOCK_WALLET": BOOK_US, "SA": BOOK_IND, "SAVING_ACCOUNT": BOOK_IND,
 }
 
 _US_ASSET_HINTS = tuple(k for k, v in _ASSET_TYPE_BOOK.items() if v == BOOK_US)
@@ -458,12 +461,14 @@ def normalise_indmoney(
 _LABEL_STOPWORDS = {"THE", "LTD", "LIMITED", "INC", "CORP", "CORPORATION", "PLC",
                     "CO", "COMPANY", "CLASS", "COMMON", "STOCK", "SHARES", "SHARE",
                     "HOLDINGS", "GROUP", "TECHNOLOGIES", "TECHNOLOGY", "AND", "OF",
-                    "A", "B", "C", "ETF", "FUND", "TRUST", "PLC."}
+                    "A", "B", "C", "ETF", "FUND", "TRUST", "PLC.", "CAPITAL",
+                    "ORDINARY", "DEPOSITARY", "RECEIPTS", "ADR"}
 
 
 _LOOKUP_SUFFIXES = re.compile(
-    r"\s+(?:class\s+[a-z]\s+)?(?:common\s+stock|ordinary\s+shares?|common\s+shares?|"
-    r"depositary\s+receipts?|adr|shares?)\s*$", re.IGNORECASE)
+    r"(?:,?\s+class\s+[a-z])?"
+    r"(?:\s+(?:common\s+stock|capital\s+stock|ordinary\s+shares?|common\s+shares?|"
+    r"depositary\s+receipts?|adr|shares?|stock))+\s*$", re.IGNORECASE)
 
 
 def shorten_for_lookup(name: str, limit: int = 32) -> str:
@@ -539,6 +544,64 @@ def resolve_by_code(holdings: List[Dict[str, Any]],
                 f"instrument id {code} belongs to {ticker}; using {ticker}."
             )
             _apply_ticker(holding, ticker, "corrected via INDmoney's instrument id")
+    return filled, warnings
+
+
+def resolve_from_config(holdings: List[Dict[str, Any]],
+                        mapping: Dict[str, str]) -> int:
+    """Apply manual name-fragment -> ticker overrides from config.json.
+
+    The escape hatch for instruments the API cannot resolve. SpaceX, for example,
+    is a private-market holding that ``get_us_stocks_details`` does not know, so
+    no automatic path will ever find its ticker.
+    """
+    if not mapping:
+        return 0
+    filled = 0
+    for holding in holdings:
+        if not needs_ticker(holding):
+            continue
+        haystack = f"{holding.get('name') or ''} {holding.get('symbol') or ''}".upper()
+        for fragment, ticker in mapping.items():
+            if fragment and str(fragment).upper() in haystack:
+                _apply_ticker(holding, str(ticker), "set by tracking.instrument_tickers")
+                filled += 1
+                break
+    return filled
+
+
+def resolve_by_name(holdings: List[Dict[str, Any]],
+                    details: Dict[str, dict]) -> Tuple[int, List[str]]:
+    """Fill in tickers by matching instrument names against the quote reply.
+
+    A second, independent path to the same answer, using data already fetched.
+    ``"Apple Inc. Common Stock"`` and ``entity_basic.name`` of ``"Apple Inc."``
+    both reduce to ``"Apple"``, so the two join without another network call and
+    without depending on ``mycroft_id`` being present.
+    """
+    index: Dict[str, str] = {}
+    for symbol, row in details.items():
+        flat = _flatten(row)
+        for key in ("name", "display_name", "short_name"):
+            value = _first_str(flat, [key])
+            if value:
+                index.setdefault(_canon(shorten_for_lookup(value)), symbol.upper())
+
+    filled, warnings = 0, []
+    for holding in holdings:
+        if not needs_ticker(holding) or not holding.get("name"):
+            continue
+        key = _canon(shorten_for_lookup(holding["name"]))
+        ticker = index.get(key)
+        if not ticker:
+            for cand_key, cand_ticker in index.items():
+                if cand_key and len(cand_key) >= 4 and (
+                        key.startswith(cand_key) or cand_key.startswith(key)):
+                    ticker = cand_ticker
+                    break
+        if ticker:
+            _apply_ticker(holding, ticker, "matched on the instrument name")
+            filled += 1
     return filled, warnings
 
 
@@ -885,40 +948,62 @@ class IndmoneyProvider(BrokerProvider):
 
         for start in range(0, len(symbols), 10):        # documented cap: 10 per call
             batch = symbols[start:start + 10]
-            payload = None
+            payload = await self._fetch_us_batch(batch, with_news=with_news)
 
-            if with_news:
-                for segments in self.NEWS_SEGMENT_CANDIDATES:
-                    try:
-                        payload = await self.call("get_us_stocks_details",
-                                                  {"symbols": batch, "segments": segments})
-                    except AuthRequired:
-                        raise
-                    except Exception:
+            if payload is None:
+                # One unrecognised ticker can fail the whole batch, and losing the
+                # batch loses the mycroft_id that identifies a real holding - which
+                # is how a US holding ends up labelled from its name and looks
+                # missing. Retry one at a time so a bad symbol costs only itself.
+                log.warning("Batch of %d failed; retrying %s individually.",
+                            len(batch), ", ".join(batch))
+                for symbol in batch:
+                    single = await self._fetch_us_batch([symbol], with_news=with_news)
+                    if single is None:
+                        log.info("  %s is not recognised by get_us_stocks_details.", symbol)
                         continue
-                    if payload and _has_news(payload):
-                        log.info("get_us_stocks_details returned news with segments=%s",
-                                 segments)
-                        break
-                    payload = payload or None
+                    self._absorb(single, [symbol], collected)
+                continue
 
-            if payload is None or not _has_news(payload):
+            self._absorb(payload, batch, collected)
+
+        missing = [s for s in symbols if s not in collected]
+        if missing:
+            log.info("No US quote for: %s", ", ".join(missing))
+        return collected
+
+    async def _fetch_us_batch(self, batch: Sequence[str], *, with_news: bool):
+        """One get_us_stocks_details call, or None if every attempt failed."""
+        payload = None
+        if with_news:
+            for segments in self.NEWS_SEGMENT_CANDIDATES:
                 try:
-                    baseline = await self.call("get_us_stocks_details", {"symbols": batch})
-                    payload = payload or baseline
+                    payload = await self.call("get_us_stocks_details",
+                                              {"symbols": list(batch), "segments": segments})
                 except AuthRequired:
                     raise
-                except Exception as exc:
-                    log.warning("get_us_stocks_details failed for %s: %s",
-                                ", ".join(batch), exc)
+                except Exception:
                     continue
+                if payload and _has_news(payload):
+                    return payload
+                payload = payload or None
 
-            if not isinstance(payload, dict):
-                continue
-            for key, value in payload.items():
-                if isinstance(value, dict) and key.upper() in set(batch):
-                    collected[key.upper()] = value
-        return collected
+        if payload is None:
+            try:
+                payload = await self.call("get_us_stocks_details", {"symbols": list(batch)})
+            except AuthRequired:
+                raise
+            except Exception as exc:
+                log.debug("get_us_stocks_details failed for %s: %s", ", ".join(batch), exc)
+                return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _absorb(payload: dict, batch: Sequence[str], collected: Dict[str, dict]) -> None:
+        wanted = {s.upper() for s in batch}
+        for key, value in payload.items():
+            if isinstance(value, dict) and key.upper() in wanted:
+                collected[key.upper()] = value
 
     async def watchlist(self) -> List[str]:
         """Tickers from the user's INDmoney watchlists.

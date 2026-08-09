@@ -66,10 +66,13 @@ PROBES: List[Dict[str, Any]] = [
      "why": "watchlist tickers; type is required"},
     {"tool": "get_us_stocks_details", "args": {"symbols": ["AAPL", "TSLA"]},
      "why": "baseline US quotes (confirmed: no news in the baseline reply)"},
-    {"tool": "lookup_ind_keys",
-     "args": {"names": ["Space Exploration Technologies Corp. Class A Common Stock",
-                        "Apple Inc."]},
-     "why": "resolve instrument names to tickers - networth_holdings has no ticker field"},
+    # Shortened, one name per call - exactly what brokers.py does. Sending the
+    # full 57-character SpaceX name returns HTTP 414, so probing with the long
+    # form measures the probe's own mistake rather than the agent's behaviour.
+    {"tool": "lookup_ind_keys", "args": {"names": ["Space Exploration Technologies"]},
+     "why": "resolve an instrument name to a ticker, shortened as brokers.py sends it"},
+    {"tool": "lookup_ind_keys", "args": {"names": ["Alphabet"]},
+     "why": "the same, for a name that should resolve to GOOG"},
 ]
 
 # The `segments` tokens that turn on news and analyst data are not documented.
