@@ -364,6 +364,78 @@ def test_ticker_resolution_by_id() -> None:
     check("belongs to AAPL" in warnings[0], f"the warning names both: {warnings[0][:70]}")
 
 
+def test_ticker_shape_guard() -> None:
+    section("An Indian instrument key can never be applied as a US ticker")
+
+    for good in ("AAPL", "GOOG", "TSLA", "T", "BRK.B", "SPCX"):
+        check(brokers.looks_like_us_ticker(good), f"{good} is a valid US ticker")
+    for bad in ("INDS02693", "INDI00012", "INDS27659", "SPACEEXPLORA",
+                "TOOLONGTICKER", "ABC123", "", None):
+        check(not brokers.looks_like_us_ticker(bad), f"{bad!r} is rejected")
+
+    holding = {"symbol": "SPACEEXPLORA", "name": "Space Exploration Technologies "
+                                                 "Corp. Class A Common Stock",
+               "flags": ["ticker not supplied by INDmoney; label derived"]}
+    applied = brokers._apply_ticker(holding, "INDS02693", "bad lookup")
+    check(applied is False, "applying an INDS key is refused")
+    check(holding["symbol"] == "SPACEEXPLORA" and brokers.needs_ticker(holding),
+          "the derived label is kept, and the row still reports as unresolved")
+    check(brokers._apply_ticker(holding, "SPCX", "config override") is True
+          and holding["symbol"] == "SPCX",
+          "a real ticker applies normally")
+
+
+def test_lookup_is_an_indian_search() -> None:
+    section("lookup_ind_keys is an INDIAN search and must not resolve US holdings")
+
+    # Verbatim replies captured from the live endpoint.
+    spacex_reply = {"results": [
+        {"ind_key": "INDS02693", "name": "Space Incubatrics Technologies"},
+        {"ind_key": "INDS03339", "name": "Paras Defence and Space Technologies"},
+        {"ind_key": "INDS04102", "name": "Spacenet Enterprises India"}]}
+    alphabet_reply = {"results": [
+        {"ind_key": "INDS27659", "name": "Mirae Nifty200Alpha30"},
+        {"ind_key": "INDI00012", "name": "NIFTY 50"},
+        {"ind_key": "INDS02705", "name": "Godrej Consumer Products"}]}
+
+    parsed = IndmoneyProvider._parse_lookup(spacex_reply)
+    check(parsed and all(not brokers.looks_like_us_ticker(v) for v in parsed.values()),
+          "nothing the endpoint returns for a US name is a US ticker")
+
+    # Off by default.
+    rows = live_us_rows()
+    session = FakeSession({"lookup_ind_keys": spacex_reply})
+    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, []))
+    check(not session.calls, "the lookup is not called at all by default")
+    check(all(brokers.needs_ticker(h) for h in rows), "so no row is touched")
+
+    # Even when enabled, no Indian key can land on a holding.
+    rows = live_us_rows()
+    problems: List[str] = []
+    session = FakeSession({"lookup_ind_keys": spacex_reply})
+    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, problems, enabled=True))
+    check(all(brokers.needs_ticker(h) for h in rows),
+          "with it enabled, the irrelevant Indian matches are still all rejected")
+    check(not any(h["symbol"].startswith("INDS") for h in rows),
+          "no holding is labelled with an INDS key")
+    check(any("could not be resolved" in p for p in problems),
+          "and the failure is reported honestly instead of faked")
+
+    rows = live_us_rows()
+    session = FakeSession({"lookup_ind_keys": alphabet_reply})
+    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, [], enabled=True))
+    check(not any(h["symbol"] in {"INDS27659", "INDI00012", "INDS02705"} for h in rows),
+          "'Alphabet' -> Mirae Nifty200Alpha30 is not accepted for GOOG")
+
+    # A genuinely close name with a real ticker still works.
+    rows = live_us_rows()
+    session = FakeSession({"lookup_ind_keys": {"results": [
+        {"name": "Apple", "ind_key": "AAPL"}]}})
+    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, [], enabled=True))
+    check(any(h["symbol"] == "AAPL" for h in rows),
+          "an exact name match returning a real ticker is still accepted")
+
+
 def test_lookup_fallback() -> None:
     section("lookup_ind_keys fallback avoids the HTTP 414 that long names cause")
 
@@ -381,39 +453,47 @@ def test_lookup_fallback() -> None:
         check(bool(IndmoneyProvider._parse_lookup(payload)),
               f"a lookup reply shaped as a {label} is parsed")
 
+    # The lookup path is opt-in now, so holdings() must not call it.
     session = FakeSession({
         "networth_holdings": SHAPES["real_networth_holdings_us"],
         "lookup_ind_keys": SHAPES["lookup_dict_keyed"],
     })
     holdings, problems = asyncio.run(IndmoneyProvider(session).holdings())
-    symbols = {h["symbol"] for h in holdings}
-    check("SPCX" in symbols, f"SpaceX resolves via the shortened name ({symbols})")
+    check(not any(c[0] == "lookup_ind_keys" for c in session.calls),
+          "holdings() does not consult the Indian search endpoint")
+    check(len(holdings) == 3, "and still returns every US row")
 
+    # When explicitly enabled, requests stay short - that is what avoids the 414.
+    rows = live_us_rows()
+    session = FakeSession({"lookup_ind_keys": {"results": [
+        {"name": "Space Exploration Technologies", "ind_key": "SPCX"}]}})
+    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, [], enabled=True))
     lookup_calls = [c for c in session.calls if c[0] == "lookup_ind_keys"]
-    check(all(len(c[1].get("names", [])) <= 1 for c in lookup_calls if
-              isinstance(c[1].get("names"), list)),
-          "names are sent one per call, which is what avoids the 414")
+    check(bool(lookup_calls), "with enabled=True the endpoint is consulted")
+    check(all(len(c[1].get("names", [])) <= 1 for c in lookup_calls
+              if isinstance(c[1].get("names"), list)),
+          "names are sent one per call")
     check(all(len(str(c[1].get("names"))) < 60 for c in lookup_calls),
           "and each request stays short")
+    check(any(h["symbol"] == "SPCX" for h in rows),
+          "a real ticker from a matching name is applied")
 
     # The real 414 error payload must not be mistaken for a result.
-    session = FakeSession({
-        "networth_holdings": SHAPES["real_networth_holdings_us"],
-        "lookup_ind_keys": SHAPES["lookup_uri_too_long_error"],
-    })
-    holdings, problems = asyncio.run(IndmoneyProvider(session).holdings())
-    check(len(holdings) == 3, "holdings survive a lookup failure")
+    rows = live_us_rows()
+    problems: List[str] = []
+    session = FakeSession({"lookup_ind_keys": SHAPES["lookup_uri_too_long_error"]})
+    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, problems, enabled=True))
+    check(all(brokers.needs_ticker(h) for h in rows),
+          "an error payload yields no tickers, rather than bogus ones")
     check(any("could not be resolved" in p for p in problems),
           "the failure is reported in data quality rather than hidden")
-    check(all(brokers.needs_ticker(h) for h in holdings),
-          "an error payload yields no tickers, rather than bogus ones")
 
-    session = FakeSession({
-        "networth_holdings": SHAPES["real_networth_holdings_us"],
-        "lookup_ind_keys": RuntimeError("tool unavailable"),
-    })
-    holdings, problems = asyncio.run(IndmoneyProvider(session).holdings())
-    check(len(holdings) == 3 and any("could not be resolved" in p for p in problems),
+    rows = live_us_rows()
+    problems = []
+    session = FakeSession({"lookup_ind_keys": RuntimeError("tool unavailable")})
+    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, problems, enabled=True))
+    check(all(brokers.needs_ticker(h) for h in rows)
+          and any("could not be resolved" in p for p in problems),
           "an exception is handled the same way")
 
 
@@ -818,6 +898,8 @@ def test_all():
     test_indian_rows_excluded()
     test_alternative_shapes()
     test_ticker_resolution_by_id()
+    test_ticker_shape_guard()
+    test_lookup_is_an_indian_search()
     test_lookup_fallback()
     test_ticker_resolution_paths()
     test_batch_resilience()

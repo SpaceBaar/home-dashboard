@@ -402,10 +402,15 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                     log.info("Resolved US tickers: %d by instrument id, %d by name.",
                              by_code, by_name)
 
-                    # Anything still unnamed falls back to the search endpoint, then
-                    # to the manual overrides in config.json.
+                    # lookup_ind_keys is an INDIAN instrument search - it answers
+                    # "Alphabet" with Mirae Nifty200Alpha30 - so it is off unless
+                    # explicitly enabled, and its results still have to pass the
+                    # US ticker shape check.
                     if any(brokers.needs_ticker(h) for h in us_rows):
-                        await provider._resolve_tickers(us_rows, us_problems)
+                        await provider._resolve_tickers(
+                            us_rows, us_problems,
+                            enabled=bool(CFG.raw.get("indmoney", {})
+                                         .get("use_lookup_for_us", False)))
                     by_config = brokers.resolve_from_config(
                         us_rows, CFG.tracking.get("instrument_tickers") or {})
                     if by_config:

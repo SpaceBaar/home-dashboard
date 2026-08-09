@@ -70,6 +70,8 @@
   "indmoney": {
     "enabled": true,
     "mcp_url": "https://mcp.indmoney.com/mcp",
+    "use_lookup_for_us": false,
+    "_lookup_note": "lookup_ind_keys searches INDIAN instruments. Asked about 'Alphabet' it returns Mirae Nifty200Alpha30 and NIFTY 50; asked about 'Space Exploration Technologies' it returns Space Incubatrics Technologies. The keys it returns (INDS02693, INDI00012) are not tickers, so it is not used for the US book. US tickers come from the investment_code to mycroft_id join, the instrument-name match against the quote reply, and tracking.instrument_tickers.",
     "_note": "Read-only MCP server for the US book. OAuth 2.1 + PKCE, handled by mcp-remote; sign in once with 'python tools/probe_indmoney.py --list-only' and the token is cached under ~/.mcp-auth. Set enabled to false, or pass --no-us, to report Indian holdings only."
   },
 

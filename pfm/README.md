@@ -241,10 +241,29 @@ last, so no single failure can leave a holding unidentified:
    `"Apple Inc. Common Stock"` and `"Apple Inc."` both become `Apple`. Uses data
    already fetched, so it costs nothing and covers the case where the quote batch
    arrived without ids.
-3. **`lookup_ind_keys`** with the shortened name, one per call.
-4. **`tracking.instrument_tickers`** in `config.json` — manual name-fragment
+3. **`tracking.instrument_tickers`** in `config.json` — manual name-fragment
    overrides, for instruments no API knows. SpaceX is private-market and absent
    from `get_us_stocks_details`, so it will always need this.
+4. **`lookup_ind_keys`** — present but **disabled by default**, see below.
+
+**`lookup_ind_keys` searches Indian instruments only, and is not used.** Asked
+about `"Alphabet"` it returns *Mirae Nifty200Alpha30*, *NIFTY 50* and *Godrej
+Consumer Products*; asked about `"Space Exploration Technologies"` it returns
+*Space Incubatrics Technologies* and *Paras Defence*. The identifiers it hands
+back — `INDS02693`, `INDI00012` — are INDmoney's internal Indian keys, not
+tickers. A fuzzy match against those would have stamped `INDS02693` onto SpaceX,
+which is worse than a derived label: the label is visibly provisional, an
+instrument key looks authoritative.
+
+So there are two hard guards, independent of that endpoint:
+
+- Any candidate ticker must match `^[A-Z]{1,5}(\.[A-Z])?$` and must not begin
+  `INDS`/`INDI`/`INDM`, or it is refused and logged.
+- Name matching requires ≥ 90% similarity. The earlier prefix comparison accepted
+  companies that merely began with the same few letters.
+
+Set `indmoney.use_lookup_for_us` to `true` only if `filter_type` ever starts
+restricting that search to US instruments; the probe re-tests it each run.
 
 Anything still unresolved keeps a label derived from its name, is **flagged as
 derived**, and is named in the data-quality section — an unresolved ticker also
@@ -490,6 +509,7 @@ portfolio. Root causes and fixes:
 | AAPL/TSLA news scored despite not being held | News driven by `config.json` alone | Driven by live holdings; the watchlist is separate and labelled |
 | Feeds silently contributing nothing | Only `<item>` was parsed; failures were swallowed | Atom support, retries, and a feed-health line in the data-quality section |
 | Zerodha Gold ETF (`GOLDCASE`) filed under US stocks | The book was decided by the first populated field among `asset_type`, `asset_class`, `assetclass_l2` — so a row with an empty `asset_type` fell through to `assetclass_l2`, and `GLOBAL EQUITY` was in the US match list. A missing `asset_type` also defaulted to US | Only `asset_type` decides, matched exactly. Unknown or absent means excluded and reported, never assumed. Plus a cross-book guard so one symbol cannot appear in both, with Kite winning |
+| A US holding at risk of being labelled `INDS02693` | `lookup_ind_keys` searches *Indian* instruments and returns internal keys, not tickers; a loose prefix match accepted them | The endpoint is off by default; candidates must match a US ticker shape and clear a 90% name-similarity bar |
 | A US holding missing from the report entirely | Rows filtered out by the book check were dropped with a bare `continue` — no log, no data-quality line. A holding could also appear under a derived label (`APPLE`) rather than its ticker (`AAPL`) and read as absent | Every exclusion is named in data quality with its reason; unresolved tickers are called out explicitly; the probe prints all rows and the decision for each, instead of only element `[0]` |
 | Commentary published in Chinese | qwen2.5 is a Chinese-origin model and ignores an English instruction now and then | Non-Latin script is a validation failure like any other: retry with a stricter prompt, then fall back to the deterministic template. Score rationales get the same treatment — the number survives, the prose does not. The rejection notice names the script rather than quoting the characters, so the diagnostic cannot reintroduce them |
 | Bot token written to `journalctl` | Exception text contains the request URL | Redacted before logging |

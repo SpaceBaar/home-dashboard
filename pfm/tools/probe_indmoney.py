@@ -66,13 +66,16 @@ PROBES: List[Dict[str, Any]] = [
      "why": "watchlist tickers; type is required"},
     {"tool": "get_us_stocks_details", "args": {"symbols": ["AAPL", "TSLA"]},
      "why": "baseline US quotes (confirmed: no news in the baseline reply)"},
-    # Shortened, one name per call - exactly what brokers.py does. Sending the
-    # full 57-character SpaceX name returns HTTP 414, so probing with the long
-    # form measures the probe's own mistake rather than the agent's behaviour.
+    # Shortened, one name per call. The full 57-character SpaceX name returns
+    # HTTP 414. CONFIRMED USELESS FOR US HOLDINGS: this endpoint searches INDIAN
+    # instruments, so it answers "Alphabet" with Mirae Nifty200Alpha30 and returns
+    # INDS/INDI keys rather than tickers. Kept in the probe to detect if that ever
+    # changes, e.g. via filter_type.
     {"tool": "lookup_ind_keys", "args": {"names": ["Space Exploration Technologies"]},
-     "why": "resolve an instrument name to a ticker, shortened as brokers.py sends it"},
-    {"tool": "lookup_ind_keys", "args": {"names": ["Alphabet"]},
-     "why": "the same, for a name that should resolve to GOOG"},
+     "why": "expected to return irrelevant INDIAN matches, not SPCX"},
+    {"tool": "lookup_ind_keys",
+     "args": {"names": ["Alphabet"], "filter_type": "US_STOCK"},
+     "why": "does filter_type restrict the search to US instruments?"},
 ]
 
 # The `segments` tokens that turn on news and analyst data are not documented.
@@ -370,15 +373,25 @@ Already confirmed from the 2026-08-02 capture, and encoded in brokers.py:
     filled with the market value while pnl_per is 0. Both are placeholders and
     are discarded.
   * Indian rows come back with asset_type 'STOCK', which is what keeps INDmoney's
-    mirror of your Zerodha holdings out of the US book.
+    mirror of your Zerodha holdings out of the US book. The book is decided by
+    asset_type alone; assetclass_l2 is a sector label and is never consulted.
   * get_us_stocks_details is keyed by symbol at the top level, with numbers under
-    entity_stats and identity under entity_basic.
+    entity_stats and identity under entity_basic. investment_code equals
+    entity_basic.mycroft_id, which is how US tickers are resolved.
+  * segments=["news"] and ["news","analyst"] return headlines. Everything else
+    tried is rejected.
+  * lookup_ind_keys searches INDIAN instruments only. It answers "Alphabet" with
+    Mirae Nifty200Alpha30 and returns INDS/INDI keys, not tickers, so it is NOT
+    used for the US book. Any candidate ticker must match ^[A-Z]{1,5}(\\.[A-Z])?$
+    before it can be applied.
 
 Worth re-checking if something looks wrong:
 
-  1. Whether a `segments` value now returns news (see the sweep above).
-  2. Whether lookup_ind_keys resolved every holding name to a ticker.
-  3. Whether any new asset_type values need adding to _US_ASSET_HINTS.
+  1. Whether a `segments` value still returns news (see the sweep above).
+  2. Whether the classification table put every holding in the right book.
+  3. Whether any holding is still marked [derived label] - if so, add it to
+     tracking.instrument_tickers in config.json.
+  4. Whether filter_type has started restricting lookup_ind_keys to US names.
 
 Paste the file contents back if the parser needs adjusting.
 """)

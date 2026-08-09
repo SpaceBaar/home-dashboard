@@ -25,6 +25,7 @@ which propagates as a suppressed percentage rather than a fabricated one.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -496,11 +497,37 @@ def needs_ticker(holding: Dict[str, Any]) -> bool:
     return any("ticker not supplied" in f for f in holding.get("flags", []))
 
 
-def _apply_ticker(holding: Dict[str, Any], ticker: str, how: str) -> None:
+# A US ticker is one to five letters, optionally with a class suffix (BRK.B).
+# INDmoney's own instrument keys look like INDS02693 or INDI00012 and must never
+# be mistaken for one - lookup_ind_keys searches INDIAN instruments, so asking it
+# about "Alphabet" returns Mirae Nifty200Alpha30 and friends.
+_US_TICKER_RE = re.compile(r"^[A-Z]{1,5}(?:\.[A-Z])?$")
+
+
+def looks_like_us_ticker(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    candidate = str(value).strip().upper()
+    if candidate.startswith(("INDS", "INDI", "INDM")):
+        return False
+    return bool(_US_TICKER_RE.match(candidate))
+
+
+def _apply_ticker(holding: Dict[str, Any], ticker: str, how: str) -> bool:
+    """Attach a ticker, refusing anything that is not shaped like one.
+
+    Returns True when applied. A wrong ticker is worse than a derived label: the
+    label is visibly provisional, whereas 'INDS02693' looks authoritative.
+    """
+    if not looks_like_us_ticker(ticker):
+        log.warning("Refusing to label %r with %r - not a US ticker (%s).",
+                    holding.get("name") or holding.get("symbol"), ticker, how)
+        return False
     holding["flags"] = [f for f in holding.get("flags", [])
                         if "ticker not supplied" not in f]
     holding["flags"].append(f"ticker {ticker.upper()} {how}")
     holding["symbol"] = ticker.upper()
+    return True
 
 
 def build_code_index(details: Dict[str, dict]) -> Dict[str, str]:
@@ -536,8 +563,8 @@ def resolve_by_code(holdings: List[Dict[str, Any]],
         if not ticker:
             continue
         if needs_ticker(holding):
-            _apply_ticker(holding, ticker, "matched on INDmoney's instrument id")
-            filled += 1
+            if _apply_ticker(holding, ticker, "matched on INDmoney's instrument id"):
+                filled += 1
         elif holding.get("symbol") != ticker:
             warnings.append(
                 f"{holding.get('symbol')} was matched by name but INDmoney's "
@@ -564,8 +591,9 @@ def resolve_from_config(holdings: List[Dict[str, Any]],
         haystack = f"{holding.get('name') or ''} {holding.get('symbol') or ''}".upper()
         for fragment, ticker in mapping.items():
             if fragment and str(fragment).upper() in haystack:
-                _apply_ticker(holding, str(ticker), "set by tracking.instrument_tickers")
-                filled += 1
+                if _apply_ticker(holding, str(ticker),
+                                 "set by tracking.instrument_tickers"):
+                    filled += 1
                 break
     return filled
 
@@ -599,8 +627,7 @@ def resolve_by_name(holdings: List[Dict[str, Any]],
                         key.startswith(cand_key) or cand_key.startswith(key)):
                     ticker = cand_ticker
                     break
-        if ticker:
-            _apply_ticker(holding, ticker, "matched on the instrument name")
+        if ticker and _apply_ticker(holding, ticker, "matched on the instrument name"):
             filled += 1
     return filled, warnings
 
@@ -849,17 +876,26 @@ class IndmoneyProvider(BrokerProvider):
         return holdings, problems
 
     async def _resolve_tickers(self, holdings: List[Dict[str, Any]],
-                               problems: List[str]) -> None:
+                               problems: List[str], *, enabled: bool = False) -> None:
         """Resolve instrument names to tickers via lookup_ind_keys.
 
-        Secondary path only. The reliable route is ``resolve_by_code``, which
-        joins ``investment_code`` to ``entity_basic.mycroft_id`` from a quote
-        reply - an exact identifier match rather than a name search.
+        **Off by default, and for good reason.** ``lookup_ind_keys`` searches
+        INDIAN instruments. Asked about "Space Exploration Technologies" it
+        returns Space Incubatrics Technologies and Paras Defence; asked about
+        "Alphabet" it returns Mirae Nifty200Alpha30 and NIFTY 50. The keys it
+        hands back (``INDS02693``, ``INDI00012``) are not tickers at all, so a
+        loose match here would stamp an Indian instrument key onto a US holding -
+        worse than leaving the derived label, which at least looks provisional.
 
-        Names are shortened and sent ONE PER CALL: the server puts them in a
-        query string and returned HTTP 414 (URI Too Long) for a two-name batch
-        containing "Space Exploration Technologies Corp. Class A Common Stock".
+        It is kept because a future ``filter_type`` may make it useful, but every
+        result must survive an exact-or-near name match AND the US ticker shape
+        check in :func:`_apply_ticker`.
+
+        Names are shortened and sent ONE PER CALL: the endpoint puts them in a
+        query string and returned HTTP 414 for the full SpaceX name.
         """
+        if not enabled:
+            return
         pending = [h for h in holdings if needs_ticker(h) and h.get("name")]
         if not pending:
             return
@@ -887,11 +923,18 @@ class IndmoneyProvider(BrokerProvider):
             short_key = _canon(shorten_for_lookup(holding["name"]))
             ticker = resolved.get(key) or resolved.get(short_key)
             if not ticker:
+                # Near-exact only. Prefix matching previously accepted wildly
+                # different companies that merely began with the same letters.
+                best, best_ratio = None, 0.0
                 for cand_name, cand_ticker in resolved.items():
-                    if cand_name and (cand_name.startswith(short_key[:10])
-                                      or short_key.startswith(cand_name[:10])):
-                        ticker = cand_ticker
-                        break
+                    ratio = difflib.SequenceMatcher(None, short_key, cand_name).ratio()
+                    if ratio > best_ratio:
+                        best, best_ratio = cand_ticker, ratio
+                if best and best_ratio >= 0.90:
+                    ticker = best
+                elif best:
+                    log.info("Best lookup match for %r was only %.0f%% similar; "
+                             "ignoring it.", holding["name"], best_ratio * 100)
             if ticker:
                 _apply_ticker(holding, ticker, "resolved from the instrument name")
 
