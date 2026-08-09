@@ -301,12 +301,34 @@ _IND_FIELDS = {
     "xirr": ["xirr", "annualised_return", "annualized_return"],
 }
 
-# Confirmed: US rows arrive with asset_type 'US_STOCK'. Indian rows arrive with
-# asset_type 'STOCK' (not 'IND_STOCK'), which is what keeps them out of the US
-# book - important, because INDmoney also mirrors the Zerodha holdings that Kite
-# already reports, and counting them twice would inflate the portfolio.
-_US_ASSET_HINTS = ("US_STOCK", "US_STOCKS", "USSTOCK", "USSTOCKS",
-                   "US EQUITY", "US_EQUITY", "GLOBAL EQUITY", "GLOBAL_EQUITY")
+# The book is decided by asset_type ALONE, matched exactly against this table.
+#
+# Two rules learned the hard way:
+#   * Never fall back to assetclass_l2. It is a sector-ish label - 'Gold',
+#     'Global Equity', 'Retirement' - and matching it put an Indian gold ETF in
+#     the US book.
+#   * Never default to US. An unrecognised asset_type is excluded and reported,
+#     not guessed at. The previous version classified any row lacking an
+#     asset_type as US with no evidence at all.
+#
+# Confirmed values: US holdings arrive as 'US_STOCK'; Indian equity and ETFs
+# arrive as 'STOCK' (not 'IND_STOCK'). That distinction is what keeps INDmoney's
+# mirror of the Zerodha holdings - which Kite already reports - out of the US book.
+_ASSET_TYPE_BOOK = {
+    # United States
+    "US_STOCK": BOOK_US, "US_STOCKS": BOOK_US, "USSTOCK": BOOK_US,
+    "US_ETF": BOOK_US, "US_EQUITY": BOOK_US, "USEQUITY": BOOK_US,
+    # India, and everything else INDmoney aggregates. Kite is authoritative for
+    # Indian equity, so these are deliberately excluded from the US book.
+    "STOCK": BOOK_IND, "IND_STOCK": BOOK_IND, "INDSTOCK": BOOK_IND,
+    "EQUITY": BOOK_IND, "ETF": BOOK_IND, "MF": BOOK_IND, "MUTUAL_FUND": BOOK_IND,
+    "BOND": BOOK_IND, "NPS": BOOK_IND, "EPF": BOOK_IND, "PPF": BOOK_IND,
+    "FD": BOOK_IND, "RD": BOOK_IND, "SAVINGS": BOOK_IND, "GOLD": BOOK_IND,
+    "SGB": BOOK_IND, "REAL_ESTATE": BOOK_IND, "PMS": BOOK_IND, "AIF": BOOK_IND,
+    "CRYPTO": BOOK_IND, "INSURANCE": BOOK_IND, "COMMODITY": BOOK_IND,
+}
+
+_US_ASSET_HINTS = tuple(k for k, v in _ASSET_TYPE_BOOK.items() if v == BOOK_US)
 
 # CONFIRMED, and the opposite of the obvious assumption: networth_holdings
 # reports US positions ALREADY CONVERTED TO RUPEES. For the captured SpaceX row,
@@ -562,14 +584,41 @@ def derive_label(name: str) -> str:
     return label or re.sub(r"[^A-Z0-9]", "", name.upper())[:12] or "UNKNOWN"
 
 
-def is_us_row(item: Dict[str, Any]) -> bool:
-    """Heuristic: does this INDmoney row belong to the US book?"""
+def classify_book(item: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """Which book does this INDmoney row belong to, and on what evidence?
+
+    Returns ``(book, reason)`` where book is ``BOOK_US``, ``BOOK_IND`` or None.
+    None means the row could not be classified and must be excluded rather than
+    assumed - a wrong book puts an Indian holding into the US section, or hides a
+    US holding entirely.
+    """
     flat = _flatten(item)
-    asset = (_first_str(flat, _IND_FIELDS["asset_class"]) or "").upper().replace("-", "_")
-    if any(hint in asset for hint in _US_ASSET_HINTS):
-        return True
+    raw = _first_str(flat, ["asset_type", "assetType", "asset_class"])
+    label = _first_str(flat, _IND_FIELDS["name"]) or "unnamed row"
+
+    if raw:
+        key = re.sub(r"[^A-Z0-9]", "_", raw.upper()).strip("_")
+        book = _ASSET_TYPE_BOOK.get(key)
+        if book:
+            return book, f"asset_type {raw!r}"
+        # An unknown asset_type is a data question, not something to guess at.
+        return None, (f"unrecognised asset_type {raw!r} on {label!r}; add it to "
+                      f"_ASSET_TYPE_BOOK in brokers.py")
+
+    # No asset_type at all. Currency is weak but unambiguous evidence when USD.
     currency = (_first_str(flat, _IND_FIELDS["currency"]) or "").upper()
-    return "USD" in currency
+    if "USD" in currency:
+        return BOOK_US, "no asset_type, but the row is priced in USD"
+    if "INR" in currency:
+        return BOOK_IND, "no asset_type, but the row is priced in INR"
+
+    return None, (f"no asset_type and no currency on {label!r}, so the book cannot "
+                  f"be determined")
+
+
+def is_us_row(item: Dict[str, Any]) -> bool:
+    """True only when the row is positively identified as a US holding."""
+    return classify_book(item)[0] == BOOK_US
 
 
 def normalise_indmoney_rows(
@@ -577,23 +626,47 @@ def normalise_indmoney_rows(
     *,
     us_only: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Normalise many rows, returning (holdings, diagnostics)."""
+    """Normalise many rows, returning (holdings, diagnostics).
+
+    Fail-closed: a row is kept for the US book only when it is positively
+    identified as one. Rows belonging to another book are dropped silently (that
+    is routine), but rows that cannot be classified at all are dropped *loudly*,
+    because silence there is how a holding goes missing from the report.
+    """
     out: List[Dict[str, Any]] = []
     problems: List[str] = []
+
     for index, row in enumerate(rows):
-        if us_only and not is_us_row(row) and _first_str(_flatten(row), _IND_FIELDS["asset_class"]):
-            continue
-        normalised = normalise_indmoney(row)
+        book, reason = classify_book(row)
+        name = _first_str(_flatten(row), _IND_FIELDS["name"]) or f"row {index}"
+
+        if us_only:
+            if book is None:
+                problems.append(
+                    f"INDmoney holding {name!r} was excluded because its book could "
+                    f"not be determined: {reason}."
+                )
+                log.warning("Unclassifiable INDmoney row %d (%s): %s", index, name, reason)
+                continue
+            if book != BOOK_US:
+                # Routine: Kite is authoritative for the Indian book.
+                log.debug("Skipping non-US INDmoney row %s (%s)", name, reason)
+                continue
+
+        normalised = normalise_indmoney(row, book=book or BOOK_US)
         if normalised is None:
             keys = ", ".join(sorted(str(k) for k in row.keys())[:12])
             problems.append(
-                f"INDmoney row {index} could not be interpreted and was excluded "
+                f"INDmoney holding {name!r} could not be interpreted and was excluded "
                 f"(fields present: {keys}). Run tools/probe_indmoney.py and update "
                 f"_IND_FIELDS in brokers.py."
             )
             log.warning("Unparseable INDmoney row %d: %s", index, keys)
             continue
+
+        normalised["book_reason"] = reason
         out.append(normalised)
+
     return out, problems
 
 

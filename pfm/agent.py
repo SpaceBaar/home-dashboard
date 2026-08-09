@@ -23,12 +23,22 @@ Usage
     python agent.py --dry-run       run offline against fixture holdings
     python agent.py --preflight     check the LLM runtime and config, then exit
     python agent.py --no-llm        deterministic report only, no model calls
+    python agent.py --force         run even on an unchanged non-trading day
+    python agent.py --show-state    print the last run and the weekend decision
+
+Scheduling
+----------
+The Kite login link goes out ``login_lead_minutes`` before ``analysis_time``,
+because a token issued in the morning is usually dead by night, and only when the
+existing session has actually expired. On a non-trading day the run short-circuits
+once it has confirmed the portfolio has not moved, before any news or model work.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -60,6 +70,17 @@ _ind_session = None   # INDmoney mcp.ClientSession, or None when the US book is 
 # the wrong event loop on Python 3.9 and then fails at the first await.
 _run_lock: Optional[asyncio.Lock] = None
 _OFFSET_FILE = STATE_DIR / "telegram_offset.json"
+_LAST_RUN_FILE = STATE_DIR / "last_run.json"
+
+
+class _Skipped:
+    """Sentinel: the run was deliberately skipped, which is not a failure."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def __bool__(self) -> bool:      # so `if result:` reads naturally
+        return True
 
 
 # Tickers treated as US names when they appear on the watchlist. Anything not
@@ -68,6 +89,134 @@ _OFFSET_FILE = STATE_DIR / "telegram_offset.json"
 _US_LIKE = {"AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "GOOG", "META", "NFLX",
             "AMD", "AVGO", "CRM", "ADBE", "UBER", "WMT", "NOW", "INTC", "MU", "QCOM",
             "PLTR", "COIN", "SPY", "QQQ", "VOO"}
+
+
+def holdings_fingerprint(fact_sheet) -> str:
+    """Hash of what is held and at what price.
+
+    Compared alongside the total value, because a total can coincidentally match
+    while the positions behind it have changed - a buy and a sell that happen to
+    net out, or T+1 quantities settling over the weekend.
+    """
+    parts = [
+        f"{h.symbol}|{h.quantity:.6f}|{(h.ltp or 0):.4f}|{h.current_native:.2f}"
+        for h in sorted(fact_sheet.holdings, key=lambda x: x.symbol)
+    ]
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def load_last_run() -> dict:
+    try:
+        return json.loads(_LAST_RUN_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_last_run(fact_sheet, *, status: str, report: Optional[str] = None) -> None:
+    """Record the outcome of a run.
+
+    The comparison baseline is kept separate from the latest status, and is only
+    replaced by a successful run. That matters for chaining: after a Saturday skip
+    the last *run* was a skip, but the figures to compare Sunday against are still
+    Friday's, so Sunday can skip too.
+    """
+    now = datetime.now()
+    state = load_state()
+    state["last_run"] = {
+        "date": now.strftime("%Y-%m-%d"),
+        "at": now.isoformat(timespec="seconds"),
+        "weekday": now.strftime("%A"),
+        "status": status,
+    }
+    if status == "success" and fact_sheet is not None:
+        state["baseline"] = {
+            "date": now.strftime("%Y-%m-%d"),
+            "weekday": now.strftime("%A"),
+            "total_current": round(fact_sheet.total_current, 2),
+            "total_invested": round(fact_sheet.total_invested, 2),
+            "holdings_count": len(fact_sheet.holdings),
+            "fingerprint": holdings_fingerprint(fact_sheet),
+            "report": report,
+        }
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _LAST_RUN_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.replace(_LAST_RUN_FILE)
+    except OSError as exc:
+        log.warning("Could not record the run state: %s", exc)
+
+
+def load_state() -> dict:
+    try:
+        state = json.loads(_LAST_RUN_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def load_last_run() -> dict:
+    """The most recent run's outcome, whatever it was."""
+    return load_state().get("last_run") or {}
+
+
+def load_baseline() -> dict:
+    """The figures from the most recent *successful* run."""
+    return load_state().get("baseline") or {}
+
+
+def weekend_skip_reason(fact_sheet, *, now: Optional[datetime] = None) -> Optional[str]:
+    """Should tonight's run be skipped? Returns the reason, or None to proceed.
+
+    All of these must hold:
+      1. today is configured as a non-trading day,
+      2. a previous run succeeded, giving us figures to compare against,
+      3. the last run did not fail - a failure is retried rather than skipped,
+      4. neither the total value nor the holdings fingerprint has moved.
+
+    Only Sunday is reliably flat. A Saturday 23:00 IST run sees Friday's US
+    closing prices, whereas the Friday run saw that session still open, so
+    Saturday usually does differ and will still produce a report. That is why this
+    compares values instead of skipping weekends outright.
+    """
+    now = now or datetime.now()
+    if not CFG.agent.get("skip_unchanged_weekends", True):
+        return None
+
+    non_trading = {str(d).strip().lower()
+                   for d in (CFG.agent.get("weekend_days")
+                             or ["saturday", "sunday"])}
+    if now.strftime("%A").lower() not in non_trading:
+        return None
+
+    baseline = load_baseline()
+    if not baseline or baseline.get("total_current") is None:
+        log.info("Weekend, but no successful run is on record to compare against; "
+                 "running.")
+        return None
+
+    status = (load_last_run() or {}).get("status")
+    if status == "failed":
+        log.info("Weekend, but the previous run failed; running.")
+        return None
+
+    current_total = round(fact_sheet.total_current, 2)
+    previous_total = float(baseline["total_current"])
+    if abs(current_total - previous_total) >= 0.01:
+        log.info("Weekend, but the total moved from %s to %s; running.",
+                 f"{previous_total:,.2f}", f"{current_total:,.2f}")
+        return None
+
+    if baseline.get("fingerprint") and \
+            baseline["fingerprint"] != holdings_fingerprint(fact_sheet):
+        log.info("Weekend and the total is unchanged, but the holdings themselves "
+                 "differ; running.")
+        return None
+
+    return (f"{now:%A} with the markets closed, and the portfolio is unchanged "
+            f"since the {baseline.get('weekday', 'previous')} run on "
+            f"{baseline.get('date', 'an earlier date')} "
+            f"(Rs {current_total:,.0f}).")
 
 
 def _num_or_none(value) -> Optional[float]:
@@ -167,7 +316,13 @@ async def send_login_link() -> None:
 # ---------------------------------------------------------------------------
 # The analysis run
 # ---------------------------------------------------------------------------
-async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = True) -> Optional[Path]:
+async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = True,
+                       force: bool = False):
+    """Run the nightly pipeline.
+
+    Returns the report path on success, a :class:`_Skipped` marker when the
+    weekend rule short-circuits it, or None on failure.
+    """
     lock = _get_run_lock()
     if lock.locked():
         log.warning("An analysis run is already in progress; skipping this trigger.")
@@ -181,6 +336,9 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
             holdings_text = await wait_for_kite_session()
         if holdings_text is None:
             log.error("No valid Kite session; aborting.")
+            # Recorded as a failure so a weekend does not skip on the strength of
+            # an older successful run.
+            save_last_run(None, status="failed")
             if TG:
                 TG.alert("Nightly analysis aborted: no valid Zerodha session. "
                          "The login link was sent before the run; tap it and the "
@@ -190,6 +348,7 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
         holdings_raw = extract_holdings_json(holdings_text)
         if not holdings_raw:
             log.error("Could not parse holdings. First 400 chars: %r", holdings_text[:400])
+            save_last_run(None, status="failed")
             if TG:
                 TG.alert("Nightly analysis aborted: the holdings payload could not be parsed.")
             return None
@@ -206,7 +365,14 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
             provider = IndmoneyProvider(_ind_session)
             try:
                 us_rows, us_problems = await provider.holdings()
-                log.info("INDmoney returned %d US holding(s).", len(us_rows))
+                log.info("INDmoney: %d holding(s) kept for the US book%s.",
+                         len(us_rows),
+                         f", {len(us_problems)} excluded" if us_problems else "")
+                if not us_rows:
+                    us_problems.append(
+                        "INDmoney returned no usable US holdings. Run "
+                        "tools/probe_indmoney.py to see how each row was classified."
+                    )
 
                 # Resolve tickers by exact id join before anything else uses the
                 # symbols. investment_code equals entity_basic.mycroft_id, so a
@@ -241,6 +407,20 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
 
                     us_quotes = brokers.extract_us_quotes(details)
                     broker_sentiment = brokers.extract_us_news(details)
+
+                    # A holding still carrying a derived label means neither the id
+                    # join nor the name lookup identified it. Say so in the report:
+                    # a stand-in like APPLE instead of AAPL looks like a missing
+                    # holding to anyone scanning for the ticker.
+                    unresolved = [h.get("name") or h["symbol"]
+                                  for h in us_rows if brokers.needs_ticker(h)]
+                    if unresolved:
+                        us_problems.append(
+                            "These US holdings are shown under a label derived from "
+                            "their name rather than a real ticker, because INDmoney "
+                            "supplies no ticker and neither lookup resolved one: "
+                            + ", ".join(unresolved) + "."
+                        )
 
                     # The rate INDmoney itself applied, read back out of the data.
                     snapshot_fx, fx_note = brokers.derive_usd_inr(us_rows, us_quotes)
@@ -288,6 +468,22 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                     filled += 1
         if filled:
             log.info("Filled the day change for %d US holding(s) from live quotes.", filled)
+
+        # 1c. Weekend short-circuit. Placed here deliberately: holdings are cheap
+        #     to fetch, whereas the news scan and the per-stock LLM calls are the
+        #     expensive part, so the decision is made on real figures but before
+        #     any of that work is done.
+        if not force:
+            reason = weekend_skip_reason(fact_sheet)
+            if reason:
+                log.info("=== Analysis skipped: %s ===", reason)
+                # status only; the baseline stays as the last successful run so a
+                # Saturday skip does not force Sunday to run.
+                save_last_run(None, status="skipped")
+                if TG and CFG.agent.get("notify_on_skip", True):
+                    TG.send("No analysis tonight: " + reason
+                            + "\n\nThe last report is still the current one.")
+                return _Skipped(reason)
         log.info("Parsed %d holdings. Value Rs %s, P&L Rs %s (%+.1f%%).",
                  len(fact_sheet.holdings), f"{fact_sheet.total_current:,.0f}",
                  f"{fact_sheet.total_pnl:+,.0f}", fact_sheet.total_pnl_pct)
@@ -384,6 +580,8 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
 
         if TG:
             TG.send(report_mod.telegram_summary(fact_sheet, scores, path))
+
+        save_last_run(fact_sheet, status="success", report=path.name)
 
         elapsed = (datetime.now() - started).total_seconds()
         rated = sum(1 for s in scores if s.score is not None)
@@ -499,7 +697,8 @@ async def preflight(use_llm: bool = True) -> bool:
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
-async def dry_run(fixture: Optional[str], use_llm: bool) -> int:
+async def dry_run(fixture: Optional[str], use_llm: bool,
+                  force: bool = False) -> int:
     path = Path(fixture) if fixture else BASE_DIR / "tests" / "fixtures" / "holdings.json"
     if not path.exists():
         log.error("Fixture not found: %s", path)
@@ -508,7 +707,8 @@ async def dry_run(fixture: Optional[str], use_llm: bool) -> int:
     if use_llm and LLM is not None and not await preflight(use_llm=True):
         log.warning("Continuing the dry run without the LLM.")
         use_llm = False
-    result = await run_analysis(path.read_text(encoding="utf-8"), use_llm=use_llm)
+    result = await run_analysis(path.read_text(encoding="utf-8"), use_llm=use_llm,
+                                force=force)
     return 0 if result else 1
 
 
@@ -581,7 +781,8 @@ def _schedule_jobs(loop: asyncio.AbstractEventLoop) -> None:
 
     schedule.every().day.at(prompt_time).do(
         job(prompt_login_before_analysis, "pre-analysis login prompt"))
-    schedule.every().day.at(analysis_time).do(job(run_analysis, "nightly analysis"))
+    schedule.every().day.at(analysis_time).do(
+        job(lambda: run_analysis(force=False), "nightly analysis"))
 
     # An extra morning link is optional and off unless login_time is set.
     if morning_time:
@@ -636,8 +837,24 @@ async def main_loop(args: argparse.Namespace) -> int:
 
     use_llm = not args.no_llm
 
+    if args.show_state:
+        state = load_state()
+        if not state:
+            print(f"No run state recorded yet ({_LAST_RUN_FILE}).")
+            return 0
+        print(json.dumps(state, indent=2))
+        today = datetime.now().strftime("%A")
+        non_trading = [str(d).lower() for d in (CFG.agent.get("weekend_days") or [])]
+        print(f"\nToday is {today}; non-trading days are {non_trading or 'none'}.")
+        if today.lower() in non_trading:
+            print("Tonight's run would be skipped if the portfolio still matches the "
+                  "baseline above.")
+        else:
+            print("Tonight's run will go ahead: it is a trading day.")
+        return 0
+
     if args.dry_run:
-        return await dry_run(args.fixture, use_llm)
+        return await dry_run(args.fixture, use_llm, force=args.force)
 
     # Imported here so that --dry-run works on a machine without the MCP client.
     from mcp import ClientSession, StdioServerParameters
@@ -676,7 +893,9 @@ async def main_loop(args: argparse.Namespace) -> int:
                         await send_login_link()
                         log.error("No valid session. Log in via the Telegram link and re-run.")
                         return 1
-                    return 0 if await run_analysis(holdings, use_llm=use_llm) else 1
+                    result = await run_analysis(holdings, use_llm=use_llm,
+                                                force=args.force)
+                    return 0 if result else 1
 
                 if not args.daemon:
                     answer = input("Run an on-demand analysis now? (y/n): ").strip().lower()
@@ -690,7 +909,7 @@ async def main_loop(args: argparse.Namespace) -> int:
                         if holdings is None:
                             log.error("Still no valid session; skipping the on-demand run.")
                         else:
-                            await run_analysis(holdings, use_llm=use_llm)
+                            await run_analysis(holdings, use_llm=use_llm, force=True)
 
                 _schedule_jobs(asyncio.get_running_loop())
                 asyncio.create_task(listen_for_expenses())
@@ -708,6 +927,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="run one analysis and exit")
     parser.add_argument("--dry-run", action="store_true",
                         help="run offline against fixture holdings (no Kite connection)")
+    parser.add_argument("--show-state", action="store_true",
+                        help="print the recorded run state and weekend decision, then exit")
     parser.add_argument("--fixture", help="path to a holdings JSON fixture for --dry-run")
     parser.add_argument("--preflight", action="store_true",
                         help="verify the runtime, model and config, then exit")
@@ -715,6 +936,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="skip all model calls; produce the deterministic report only")
     parser.add_argument("--no-us", action="store_true",
                         help="skip the INDmoney US book; report Indian holdings only")
+    parser.add_argument("--force", action="store_true",
+                        help="run even on a non-trading day with an unchanged portfolio")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return parser.parse_args(argv)
 

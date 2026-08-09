@@ -451,6 +451,120 @@ def test_schedule():
 
 
 # ===========================================================================
+# 5d. Weekend skip
+# ===========================================================================
+def test_weekend_skip(fs, tmp_dir: Path):
+    section("Weekends are skipped only when nothing has actually changed")
+
+    import agent
+    from datetime import datetime as _dt
+
+    agent.CFG = CFG
+    state_dir = tmp_dir / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    original_file, original_dir = agent._LAST_RUN_FILE, agent.STATE_DIR
+    agent._LAST_RUN_FILE = state_dir / "last_run.json"
+    agent.STATE_DIR = state_dir
+
+    SAT = _dt(2026, 8, 8, 23, 0)     # Saturday
+    SUN = _dt(2026, 8, 9, 23, 0)     # Sunday
+    FRI = _dt(2026, 8, 7, 23, 0)     # Friday
+    check(SAT.strftime("%A") == "Saturday" and SUN.strftime("%A") == "Sunday"
+          and FRI.strftime("%A") == "Friday", "the test dates are the days claimed")
+
+    try:
+        # No history at all -> must run, since "unchanged" cannot be established.
+        agent._LAST_RUN_FILE.unlink(missing_ok=True)
+        check(agent.weekend_skip_reason(fs, now=SAT) is None,
+              "a weekend with no previous run still runs")
+
+        # A successful run with the same figures -> skip.
+        agent.save_last_run(fs, status="success", report="portfolio_analysis_2026-08-07.md")
+        check(agent.load_last_run()["status"] == "success",
+              "the run state records the latest status")
+        check(agent.load_baseline()["fingerprint"]
+              and agent.load_baseline()["total_current"],
+              "and a separate baseline holds the figures to compare against")
+
+        reason = agent.weekend_skip_reason(fs, now=SAT)
+        check(reason is not None, f"an unchanged Saturday is skipped: {str(reason)[:60]}...")
+        check("markets closed" in (reason or ""), "and the reason explains why")
+        check(agent.weekend_skip_reason(fs, now=SUN) is not None,
+              "an unchanged Sunday is skipped too")
+
+        # A weekday is never skipped, however flat the portfolio is.
+        check(agent.weekend_skip_reason(fs, now=FRI) is None,
+              "a weekday always runs, even with identical figures")
+
+        # Skips must chain: Saturday skipping cannot force Sunday to run.
+        agent.save_last_run(None, status="skipped")
+        check(agent.load_last_run()["status"] == "skipped",
+              "a skip updates the status")
+        check(agent.load_baseline().get("total_current") is not None,
+              "but leaves the baseline intact")
+        check(agent.weekend_skip_reason(fs, now=SUN) is not None,
+              "so Sunday still skips after a Saturday skip, rather than running "
+              "off a stale status")
+
+        # A failed previous run -> retry regardless.
+        agent.save_last_run(None, status="failed")
+        check(agent.weekend_skip_reason(fs, now=SAT) is None,
+              "a weekend after a FAILED run still runs")
+        check(agent.load_baseline().get("total_current") is not None,
+              "and a failure does not destroy the baseline either")
+
+        # The value moved -> run. This is the Saturday case, where the US book
+        # picks up Friday's close after Friday's run saw it mid-session.
+        agent.save_last_run(fs, status="success")
+        moved = build_fact_sheet(
+            extract_holdings_json((FIXTURES / "holdings.json").read_text(encoding="utf-8")))
+        moved.holdings[0].current_inr += 5000
+        moved.total_current += 5000
+        check(agent.weekend_skip_reason(moved, now=SAT) is None,
+              "a changed total runs, which is why Saturday usually still reports")
+
+        # Even a one-paisa move counts.
+        tiny = build_fact_sheet(
+            extract_holdings_json((FIXTURES / "holdings.json").read_text(encoding="utf-8")))
+        tiny.total_current += 0.02
+        check(agent.weekend_skip_reason(tiny, now=SAT) is None,
+              "a two-paisa move is still a move")
+
+        # Same total, different holdings -> run. A buy and a sell that net out, or
+        # T+1 quantities settling over the weekend.
+        reshuffled = build_fact_sheet(
+            extract_holdings_json((FIXTURES / "holdings.json").read_text(encoding="utf-8")))
+        a, b = reshuffled.holdings[0], reshuffled.holdings[1]
+        shift = 100.0
+        a.current_native += shift
+        b.current_native -= shift
+        check(abs(reshuffled.total_current - fs.total_current) < 0.01,
+              "the reshuffled portfolio has the same total")
+        check(agent.weekend_skip_reason(reshuffled, now=SAT) is None,
+              "but different holdings behind it, so it runs anyway")
+
+        # The switch turns it off.
+        agent.CFG.agent["skip_unchanged_weekends"] = False
+        check(agent.weekend_skip_reason(fs, now=SAT) is None,
+              "skip_unchanged_weekends=false disables the rule entirely")
+        agent.CFG.agent["skip_unchanged_weekends"] = True
+
+        # weekend_days is configurable, e.g. for a market with a different week.
+        agent.CFG.agent["weekend_days"] = ["friday", "saturday"]
+        check(agent.weekend_skip_reason(fs, now=FRI) is not None
+              and agent.weekend_skip_reason(fs, now=SUN) is None,
+              "weekend_days is honoured, so a Friday/Saturday week works")
+        agent.CFG.agent["weekend_days"] = ["saturday", "sunday"]
+
+        check(agent.holdings_fingerprint(fs) == agent.holdings_fingerprint(fs),
+              "the fingerprint is stable for identical input")
+        check(agent.holdings_fingerprint(fs) != agent.holdings_fingerprint(reshuffled),
+              "and differs when the positions differ")
+    finally:
+        agent._LAST_RUN_FILE, agent.STATE_DIR = original_file, original_dir
+
+
+# ===========================================================================
 # 6. End-to-end report
 # ===========================================================================
 def test_end_to_end(fs, grouped, tmp_dir: Path):
@@ -512,6 +626,7 @@ def test_all():
         test_validator(fs, scores)
         test_language_guard(fs, grouped, tmp / "lang")
         test_schedule()
+        test_weekend_skip(fs, tmp / "weekend")
         report_path = test_end_to_end(fs, grouped, tmp / "reports")
         preview = report_path.read_text(encoding="utf-8")
     assert not _failures, f"{len(_failures)} check(s) failed:\n" + "\n".join(_failures)

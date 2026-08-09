@@ -286,6 +286,38 @@ def build_fact_sheet(
             name=row.get("name"), flags=flags,
         ))
 
+    # -- cross-book duplicate guard ----------------------------------------
+    # INDmoney aggregates the same Zerodha account Kite reports directly, so a
+    # misclassified row would show one holding in both books and double-count it.
+    # Kite wins for anything Indian: it is the primary source, with a real ticker
+    # and a real cost basis.
+    by_symbol: Dict[str, List[Holding]] = {}
+    for holding in holdings:
+        by_symbol.setdefault(holding.symbol, []).append(holding)
+
+    duplicates = {sym: rows for sym, rows in by_symbol.items() if len(rows) > 1}
+    if duplicates:
+        keep: List[Holding] = []
+        for holding in holdings:
+            rows = duplicates.get(holding.symbol)
+            if not rows:
+                keep.append(holding)
+                continue
+            # Prefer Kite, then the row that actually has a cost basis.
+            best = min(rows, key=lambda h: (h.source != "kite", not h.has_cost_basis))
+            if holding is best:
+                keep.append(holding)
+        for symbol, rows in duplicates.items():
+            sources = ", ".join(sorted({f"{h.source or 'unknown'}/{h.book}" for h in rows}))
+            data_quality.append(
+                f"{symbol} was reported by more than one source ({sources}). Only the "
+                f"Zerodha/Kite row is counted, so the holding is not double-counted "
+                f"and does not appear under the wrong book."
+            )
+            log.warning("Duplicate holding %s across books (%s); kept the Kite row.",
+                        symbol, sources)
+        holdings = keep
+
     # Sort by rupee value where known, otherwise push to the end.
     holdings.sort(key=lambda h: (h.current_inr if h.current_inr is not None else -1),
                   reverse=True)

@@ -258,6 +258,9 @@
   },
 
   "shape_f_unusable": {
-    "holdings": [{ "some_id": 4412, "note": "no name, no value, nothing usable" }]
+    "_note": "Correctly classified as US, but carries no name and no value, so normalisation must reject it. Kept distinct from the unclassifiable case, which fails earlier.",
+    "holdings": [
+      { "asset_type": "US_STOCK", "some_id": 4412, "note": "no name, no value" }
+    ]
   }
 }

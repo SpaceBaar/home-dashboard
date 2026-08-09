@@ -105,8 +105,13 @@ def redact(obj: Any, *, enabled: bool = True, depth: int = 0) -> Any:
     return obj
 
 
-def describe(obj: Any, *, prefix: str = "", depth: int = 0, max_depth: int = 5) -> List[str]:
-    """Render a compact type/shape outline - the part you actually need to read."""
+def describe(obj: Any, *, prefix: str = "", depth: int = 0, max_depth: int = 5,
+             max_items: int = 8) -> List[str]:
+    """Render a compact type/shape outline - the part you actually need to read.
+
+    Lists show up to ``max_items`` elements, not just the first. Only printing
+    element [0] previously hid the very rows that were being misclassified.
+    """
     lines: List[str] = []
     if depth > max_depth:
         return [f"{prefix}: ..."]
@@ -115,7 +120,8 @@ def describe(obj: Any, *, prefix: str = "", depth: int = 0, max_depth: int = 5) 
         for key, value in list(obj.items())[:40]:
             path = f"{prefix}.{key}" if prefix else key
             if isinstance(value, (dict, list)):
-                lines.extend(describe(value, prefix=path, depth=depth + 1, max_depth=max_depth))
+                lines.extend(describe(value, prefix=path, depth=depth + 1,
+                                      max_depth=max_depth, max_items=max_items))
             else:
                 kind = type(value).__name__
                 shown = repr(value)
@@ -124,11 +130,58 @@ def describe(obj: Any, *, prefix: str = "", depth: int = 0, max_depth: int = 5) 
                 lines.append(f"{path}: {kind} = {shown}")
     elif isinstance(obj, list):
         lines.append(f"{prefix}: list[{len(obj)}]")
-        if obj:
-            lines.extend(describe(obj[0], prefix=f"{prefix}[0]",
-                                  depth=depth + 1, max_depth=max_depth))
+        for index, item in enumerate(obj[:max_items]):
+            lines.extend(describe(item, prefix=f"{prefix}[{index}]", depth=depth + 1,
+                                  max_depth=max_depth, max_items=max_items))
+        if len(obj) > max_items:
+            lines.append(f"{prefix}: ... and {len(obj) - max_items} more")
     else:
         lines.append(f"{prefix}: {type(obj).__name__} = {obj!r}")
+    return lines
+
+
+def classification_table(payload: Any) -> List[str]:
+    """Show, per holding row, which book it lands in and on what evidence.
+
+    This is the answer to "why is X in the wrong section" or "where did Y go".
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import brokers
+    except ImportError:
+        return []
+
+    rows = brokers.extract_rows(payload, hint_keys=("holdings",))
+    if not rows:
+        return []
+
+    lines = ["", f"  --- book classification for {len(rows)} row(s) ---",
+             f"  {'instrument':<40} {'asset_type':<14} {'l2':<14} {'broker':<10} book"]
+    kept = 0
+    for row in rows:
+        flat = brokers._flatten(row)
+        name = (brokers._first_str(flat, brokers._IND_FIELDS["name"]) or "?")[:38]
+        asset = (brokers._first_str(flat, ["asset_type", "assetType"]) or "-")[:12]
+        l2 = (brokers._first_str(flat, ["assetclass_l2"]) or "-")[:12]
+        broker_name = (brokers._first_str(flat, ["broker"]) or "-")[:8]
+        book, reason = brokers.classify_book(row)
+        if book == brokers.BOOK_US:
+            kept += 1
+        marker = {"US": "US  <- kept", "IND": "IND (Kite owns it)"}.get(book, "?? EXCLUDED")
+        lines.append(f"  {name:<40} {asset:<14} {l2:<14} {broker_name:<10} {marker}")
+        if book is None:
+            lines.append(f"      reason: {reason}")
+
+    normalised, problems = brokers.normalise_indmoney_rows(rows)
+    lines.append(f"  => {kept} row(s) classified US, {len(normalised)} survived "
+                 f"normalisation")
+    for problem in problems:
+        lines.append(f"     ! {problem}")
+    if normalised:
+        lines.append("  symbols after normalisation (before ticker resolution):")
+        for holding in normalised:
+            flag = " [derived label]" if brokers.needs_ticker(holding) else ""
+            lines.append(f"     {holding['symbol']:<16} {holding.get('name', '')[:44]}{flag}")
     return lines
 
 
@@ -250,8 +303,11 @@ async def main() -> int:
 
                 safe = redact(payload, enabled=do_redact)
                 captured["results"][key] = safe
-                for line in describe(safe)[:80]:
+                for line in describe(safe)[:160]:
                     print(f"  {line}")
+                if name == "networth_holdings":
+                    for line in classification_table(payload):
+                        print(line)
 
             # --- sweep for the segments value that enables news ------------
             available = {t.name for t in listed.tools}

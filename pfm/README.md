@@ -109,6 +109,47 @@ Controlled by `agent_settings`:
 `login_lead_minutes` is subtracted from `analysis_time` and wraps correctly over
 midnight, so an analysis at `00:10` prompts at `23:55` the previous evening.
 
+### Non-trading days
+
+NSE, BSE and the US markets are all shut at the weekend, so a Saturday or Sunday
+run would mostly reproduce the previous report. The run is skipped when **all** of
+these hold:
+
+1. today is in `weekend_days`,
+2. a previous run succeeded, giving figures to compare against,
+3. the last run did not fail — a failure is retried, not skipped,
+4. neither the total value **nor** the holdings fingerprint has moved.
+
+Holdings are still fetched, because that is the only way to check condition 4 —
+two MCP calls. What is avoided is the RSS scan and the per-stock LLM calls, which
+are the fifteen expensive minutes.
+
+Two details worth knowing:
+
+- **Saturday will often still run.** A 23:00 IST Saturday sees Friday's US
+  *closing* prices, whereas Friday at 23:00 IST saw that session still open. So
+  the US book legitimately moves overnight and a report gets produced. Sunday is
+  the reliably flat one. Skipping on the value rather than on the calendar is what
+  makes this come out right.
+- **The fingerprint is checked as well as the total.** A buy and a sell that
+  happen to net out, or T+1 quantities settling over the weekend, leave the total
+  unchanged while the positions behind it differ. That runs.
+
+State lives in `state/last_run.json`, which keeps the latest status and the
+baseline separately — a Saturday skip must not make Sunday run just because the
+most recent *run* was a skip rather than a success.
+
+```bash
+python agent.py --show-state   # what is recorded, and tonight's decision
+python agent.py --once --force # run anyway
+```
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `skip_unchanged_weekends` | `true` | the whole rule; `false` restores nightly runs |
+| `weekend_days` | `["saturday","sunday"]` | which days qualify |
+| `notify_on_skip` | `true` | one short Telegram line, so silence is never a mystery |
+
 ## Environment
 
 | Variable | Default | Purpose |
@@ -210,6 +251,35 @@ discarded.
 **Indian rows carry `asset_type: "STOCK"`**, not `IND_STOCK`. That is what keeps
 INDmoney's mirror of your Zerodha holdings out of the US book — otherwise every
 Indian position would be counted twice.
+
+### How the book is decided
+
+`asset_type` alone, matched exactly against `_ASSET_TYPE_BOOK` in `brokers.py`.
+Two rules, both learned from a real misfiling:
+
+- **`assetclass_l2` is never consulted.** It is a sector-ish label — `Gold`,
+  `Global Equity`, `Retirement` — and matching it put the Zerodha Gold ETF
+  (`GOLDCASE`) in the US section.
+- **An unrecognised or absent `asset_type` is excluded, never assumed to be US.**
+  The earlier version defaulted to US whenever the field was missing, which both
+  imported Indian holdings into the US book and, because exclusions were silent,
+  let a genuine US holding disappear without a word.
+
+Every exclusion now produces a line in the report's data-quality section naming
+the instrument and the reason, so a missing holding is visible rather than
+inferred. On top of that, `portfolio.build_fact_sheet` refuses to let one symbol
+appear in both books: Kite wins, the value is counted once, and the collision is
+disclosed.
+
+To see the decision for each row from live data:
+
+```bash
+python tools/probe_indmoney.py
+```
+
+It prints a per-row table of instrument, `asset_type`, `assetclass_l2`, broker and
+resulting book, flags rows carrying a derived label instead of a real ticker, and
+dumps every row rather than only the first.
 
 **Quotes are keyed by symbol**, not returned as a list: `{"AAPL": {entity_basic:
 {…}, entity_stats: {…}}}`.
@@ -400,6 +470,8 @@ portfolio. Root causes and fixes:
 | `SBI Cards` counted as SBIN | Substring matching, first-match-wins | Word-boundary matching, exclusion phrases, multi-symbol attribution |
 | AAPL/TSLA news scored despite not being held | News driven by `config.json` alone | Driven by live holdings; the watchlist is separate and labelled |
 | Feeds silently contributing nothing | Only `<item>` was parsed; failures were swallowed | Atom support, retries, and a feed-health line in the data-quality section |
+| Zerodha Gold ETF (`GOLDCASE`) filed under US stocks | The book was decided by the first populated field among `asset_type`, `asset_class`, `assetclass_l2` — so a row with an empty `asset_type` fell through to `assetclass_l2`, and `GLOBAL EQUITY` was in the US match list. A missing `asset_type` also defaulted to US | Only `asset_type` decides, matched exactly. Unknown or absent means excluded and reported, never assumed. Plus a cross-book guard so one symbol cannot appear in both, with Kite winning |
+| A US holding missing from the report entirely | Rows filtered out by the book check were dropped with a bare `continue` — no log, no data-quality line. A holding could also appear under a derived label (`APPLE`) rather than its ticker (`AAPL`) and read as absent | Every exclusion is named in data quality with its reason; unresolved tickers are called out explicitly; the probe prints all rows and the decision for each, instead of only element `[0]` |
 | Commentary published in Chinese | qwen2.5 is a Chinese-origin model and ignores an English instruction now and then | Non-Latin script is a validation failure like any other: retry with a stricter prompt, then fall back to the deterministic template. Score rationales get the same treatment — the number survives, the prose does not. The rejection notice names the script rather than quoting the characters, so the diagnostic cannot reintroduce them |
 | Bot token written to `journalctl` | Exception text contains the request URL | Redacted before logging |
 | Overlapping scheduled runs, swallowed exceptions | `asyncio.create_task` with no guard or error handling | Run lock, done-callbacks, Telegram alerts on failure |

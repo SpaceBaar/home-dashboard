@@ -160,6 +160,106 @@ def test_placeholder_pnl_discarded() -> None:
           "no return percentage is produced for it")
 
 
+def test_book_classification() -> None:
+    section("Book classification is fail-closed and ignores assetclass_l2")
+
+    gold = {"investment_code": "INDS29570", "investment": "Zerodha Gold ETF",
+            "asset_type": "STOCK", "assetclass_l2": "Gold", "broker": "Zerodha",
+            "market_value": 1650.2, "total_units": 74, "unit_price": 22.3,
+            "invested_amount": "unknown", "total_pnl": 1650.2, "pnl_per": 0}
+    apple = {"investment_code": "118186", "investment": "Apple Inc. Common Stock",
+             "asset_type": "US_STOCK", "assetclass_l2": "Global Equity",
+             "market_value": 208889.42, "total_units": 7.08671654,
+             "unit_price": 29476.19, "invested_amount": 143705.38}
+
+    book, reason = brokers.classify_book(gold)
+    check(book == BOOK_IND, f"the Zerodha Gold ETF is Indian, not US ({book})")
+    check("asset_type" in reason, f"decided on asset_type: {reason}")
+    book, _ = brokers.classify_book(apple)
+    check(book == BOOK_US, f"Apple is US ({book})")
+
+    # assetclass_l2 must not influence the decision. 'Gold' and 'Global Equity'
+    # are sector labels; treating them as book evidence is what misfiled the ETF.
+    check(brokers.classify_book(dict(gold, assetclass_l2="Global Equity"))[0] == BOOK_IND,
+          "an Indian row labelled 'Global Equity' in l2 is still Indian")
+    check(brokers.classify_book(dict(apple, assetclass_l2="Gold"))[0] == BOOK_US,
+          "a US row labelled 'Gold' in l2 is still US")
+
+    # Fail closed. The old code classified anything without an asset_type as US.
+    unknown = {"investment": "Mystery Holding", "market_value": 500,
+               "total_units": 5, "unit_price": 100}
+    book, reason = brokers.classify_book(unknown)
+    check(book is None, "a row with no asset_type is NOT assumed to be US")
+    check("cannot" in reason or "no asset_type" in reason,
+          f"and the reason says why: {reason[:60]}")
+
+    book, reason = brokers.classify_book(dict(unknown, asset_type="US_SOMETHING_NEW"))
+    check(book is None, "an unrecognised asset_type is excluded, not guessed")
+    check("_ASSET_TYPE_BOOK" in reason, "and the fix is named in the diagnostic")
+
+    # Currency is acceptable evidence only when there is no asset_type.
+    check(brokers.classify_book(dict(unknown, currency="USD"))[0] == BOOK_US,
+          "an explicit USD currency identifies a US row when asset_type is absent")
+    check(brokers.classify_book(dict(unknown, currency="INR"))[0] == BOOK_IND,
+          "and INR identifies an Indian one")
+
+    # Every non-US asset class INDmoney aggregates stays out of the US book.
+    for asset_type in ("STOCK", "MF", "BOND", "NPS", "EPF", "PPF", "FD", "GOLD",
+                       "SGB", "REAL_ESTATE", "CRYPTO", "ETF"):
+        got, _ = brokers.classify_book(dict(unknown, asset_type=asset_type))
+        check(got == BOOK_IND, f"asset_type {asset_type!r} is not the US book ({got})")
+
+    # And the exclusions are reported rather than silent.
+    kept, problems = brokers.normalise_indmoney_rows([apple, gold, unknown])
+    check([h["symbol"] for h in kept] and all(h["book"] == BOOK_US for h in kept),
+          "only the US row is kept")
+    check(len(kept) == 1, f"exactly one row survives ({len(kept)})")
+    check(any("Mystery Holding" in p for p in problems),
+          "the unclassifiable row is reported, so a missing holding is visible")
+    check(not any("Zerodha Gold ETF" in p for p in problems),
+          "but a correctly-Indian row is not reported as a problem - that is routine")
+    check(kept[0].get("book_reason"), "the kept row records why it was classified US")
+
+
+def test_cross_book_duplicate_guard() -> None:
+    section("The same instrument cannot appear in both books")
+
+    # Kite reports GOLDCASE directly; INDmoney mirrors the same Zerodha account.
+    # If a row ever leaks into the US book, the total must not be double-counted.
+    kite_row = {"tradingsymbol": "GOLDCASE", "exchange": "NSE", "quantity": 74,
+                "average_price": 20.0, "last_price": 22.3, "pnl": 170.2}
+    leaked = dict(brokers.normalise_indmoney(
+        {"investment": "Zerodha Gold ETF", "asset_type": "US_STOCK",
+         "market_value": 1650.2, "total_units": 74, "unit_price": 22.3,
+         "invested_amount": "unknown"}, book=BOOK_US), symbol="GOLDCASE")
+
+    fs = build_fact_sheet([kite_row, leaked])
+    check(len(fs.holdings) == 1, f"the duplicate is collapsed to one row ({len(fs.holdings)})")
+    kept = fs.holdings[0]
+    check(kept.book == BOOK_IND and kept.source == "kite",
+          f"the Kite row wins ({kept.source}/{kept.book})")
+    check(BOOK_US not in fs.books,
+          "so no spurious US book is created for an Indian holding")
+    check(kept.has_cost_basis,
+          "and the surviving row keeps the cost basis Kite provides")
+    check(any("more than one source" in q for q in fs.data_quality),
+          "the collision is disclosed in the data-quality section")
+
+    expected = 74 * 22.3
+    check(abs(fs.total_current - expected) < 0.01,
+          f"the value is counted once ({fs.total_current:,.2f}, not {expected * 2:,.2f})")
+
+    # A genuine US holding alongside an Indian one is untouched.
+    fs2 = build_fact_sheet([kite_row, brokers.normalise_indmoney(
+        {"investment": "Apple Inc. Common Stock", "asset_type": "US_STOCK",
+         "market_value": 208889.42, "total_units": 7.08671654,
+         "unit_price": 29476.19, "invested_amount": 143705.38}, book=BOOK_US)])
+    check(len(fs2.holdings) == 2 and set(fs2.books) == {BOOK_IND, BOOK_US},
+          "distinct holdings in different books are both kept")
+    check(not any("more than one source" in q for q in fs2.data_quality),
+          "and no false duplicate warning is raised")
+
+
 def test_indian_rows_excluded() -> None:
     section("INDmoney's Indian rows stay out of the US book")
 
@@ -592,6 +692,8 @@ def test_all():
     test_number_parsing()
     test_real_us_shape()
     test_placeholder_pnl_discarded()
+    test_book_classification()
+    test_cross_book_duplicate_guard()
     test_indian_rows_excluded()
     test_alternative_shapes()
     test_ticker_resolution_by_id()
