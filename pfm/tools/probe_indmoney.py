@@ -66,16 +66,13 @@ PROBES: List[Dict[str, Any]] = [
      "why": "watchlist tickers; type is required"},
     {"tool": "get_us_stocks_details", "args": {"symbols": ["AAPL", "TSLA"]},
      "why": "baseline US quotes (confirmed: no news in the baseline reply)"},
-    # Shortened, one name per call. The full 57-character SpaceX name returns
-    # HTTP 414. CONFIRMED USELESS FOR US HOLDINGS: this endpoint searches INDIAN
-    # instruments, so it answers "Alphabet" with Mirae Nifty200Alpha30 and returns
-    # INDS/INDI keys rather than tickers. Kept in the probe to detect if that ever
-    # changes, e.g. via filter_type.
+    # Canary only. CONFIRMED USELESS FOR US HOLDINGS: this endpoint searches
+    # INDIAN instruments, answering "Space Exploration Technologies" with Space
+    # Incubatrics Technologies and returning INDS keys rather than tickers.
+    # filter_type="US_STOCK" is rejected as an invalid value, so it cannot be
+    # narrowed either. Kept purely to notice if that ever changes.
     {"tool": "lookup_ind_keys", "args": {"names": ["Space Exploration Technologies"]},
      "why": "expected to return irrelevant INDIAN matches, not SPCX"},
-    {"tool": "lookup_ind_keys",
-     "args": {"names": ["Alphabet"], "filter_type": "US_STOCK"},
-     "why": "does filter_type restrict the search to US instruments?"},
 ]
 
 # The `segments` tokens that turn on news and analyst data are not documented.
@@ -384,8 +381,13 @@ Already confirmed from the 2026-08-02 capture, and encoded in brokers.py:
     tried is rejected.
   * lookup_ind_keys searches INDIAN instruments only. It answers "Alphabet" with
     Mirae Nifty200Alpha30 and returns INDS/INDI keys, not tickers, so it is NOT
-    used for the US book. Any candidate ticker must match ^[A-Z]{1,5}(\\.[A-Z])?$
-    before it can be applied.
+    used at all. filter_type="US_STOCK" is rejected as an invalid value, so it
+    cannot be narrowed to US names either. Any candidate ticker must match
+    ^[A-Z]{1,5}(\\.[A-Z])?$ before it can be applied.
+  * INDmoney reports THREE different US totals: the sum of the per-position rows,
+    the networth_snapshot US_STOCK figure, and the allocation breakdown - around
+    1% apart. The report uses the row sum, because that is what the holdings table
+    adds up to, and discloses the gap in the data-quality section.
 
 Worth re-checking if something looks wrong:
 

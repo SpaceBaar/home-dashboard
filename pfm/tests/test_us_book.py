@@ -461,6 +461,75 @@ def test_batch_resilience() -> None:
     check(by_code == 4, f"resolution still gets four tickers ({by_code})")
 
 
+def test_auth_error_detection() -> None:
+    section("A price containing 403 is not an authentication failure")
+
+    # This was a real bug: the snapshot total 344407.4034270012 contains "403",
+    # which the old substring check read as HTTP 403 and turned into an auth
+    # failure, aborting the US book.
+    data_payloads = [
+        json.dumps({"investments": [{"asset_type": "US_STOCK",
+                                     "current_value": 344407.4034270012}]}),
+        json.dumps({"holdings": [{"unit_price": 401.5, "market_value": 403.2}]}),
+        json.dumps([{"ind_key": "INDS02693", "name": "Space Incubatrics"}]),
+        json.dumps({"AAPL": {"entity_stats": {"live_price": 403.11}}}),
+    ]
+    for payload in data_payloads:
+        check(not brokers.looks_like_auth_error(payload),
+              f"data is not an auth error: {payload[:52]}")
+
+    prose = ["Please log in first using the login tool",
+             "Error: unauthorized",
+             "Your session expired, please re-authenticate",
+             "Request failed with error 403 Forbidden",
+             json.dumps({"error": "unauthorized", "message": "token expired"})]
+    for payload in prose:
+        check(brokers.looks_like_auth_error(payload),
+              f"genuine auth complaint detected: {payload[:52]}")
+
+    check(not brokers.looks_like_auth_error(""), "empty text is not an auth error")
+    check(not brokers.looks_like_auth_error(None), "None is not an auth error")
+
+
+def test_snapshot_cross_check() -> None:
+    section("INDmoney's own US totals disagree, and that is surfaced")
+
+    # Figures as returned live on 2026-08-09.
+    snapshot = {"investments": [
+        {"asset_type": "PPF", "current_value": 957700},
+        {"asset_type": "US_STOCK", "invested_value": 255335.88107025146,
+         "current_value": 344407.4034270012},
+        {"asset_type": "STOCK", "current_value": 177787.04},
+        {"asset_type": "US_STOCK_WALLET", "current_value": 5212.7638330078125},
+    ]}
+
+    session = FakeSession({"networth_snapshot": snapshot})
+    total = asyncio.run(IndmoneyProvider(session).snapshot_asset_total("US_STOCK"))
+    check(total is not None and abs(total - 344407.40) < 0.01,
+          f"the US_STOCK asset-class total is read ({total:,.2f})")
+    check(asyncio.run(IndmoneyProvider(
+              FakeSession({"networth_snapshot": snapshot})
+          ).snapshot_asset_total("MF")) is None,
+          "an absent asset class returns None rather than a wrong number")
+    check(asyncio.run(IndmoneyProvider(
+              FakeSession({"networth_snapshot": RuntimeError("nope")})
+          ).snapshot_asset_total()) is None,
+          "a failed snapshot call degrades to None")
+
+    # The row sum from the same capture.
+    row_sum = 554.1008705812405 + 214781.63435881483 + 102448.89775425511 \
+        + 10074.637810849594 + 12810.797523534748
+    gap = total - row_sum
+    check(abs(gap) > max(1.0, row_sum * 0.005),
+          f"the real gap of Rs {gap:+,.0f} exceeds the 0.5% tolerance and would "
+          f"be reported")
+    check(abs(gap) / row_sum < 0.02,
+          f"but it is small enough to be a freshness artefact, not a parse error "
+          f"({abs(gap) / row_sum * 100:.2f}%)")
+    check(abs(row_sum - 340670.07) < 0.05,
+          f"the row sum is what the holdings table adds up to ({row_sum:,.2f})")
+
+
 def test_watchlist() -> None:
     section("Watchlist tickers from nested watchlists[].stocks[]")
 
@@ -721,6 +790,8 @@ def test_all():
     test_ticker_resolution_by_id()
     test_ticker_shape_guard()
     test_batch_resilience()
+    test_auth_error_detection()
+    test_snapshot_cross_check()
     test_watchlist()
     test_us_quotes()
     test_us_news()

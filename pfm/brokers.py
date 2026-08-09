@@ -187,21 +187,47 @@ def parse_tool_payload(text: Optional[str]) -> Any:
     return None
 
 
+_AUTH_SIGNAL_RE = re.compile(
+    r"\b(?:log\s?in|login|unauthenticated|unauthori[sz]ed|authenticate|"
+    r"re-?auth(?:enticate|orise|orize)?|session\s+expired|token\s+expired|"
+    r"invalid\s+token|not\s+connected|please\s+connect)\b",
+    re.IGNORECASE,
+)
+# Bare HTTP status codes only count next to error wording. "403" appears inside
+# perfectly good numbers - 344407.403 is a rupee total, not an auth failure - and
+# treating that as one aborted the whole US book.
+_AUTH_STATUS_RE = re.compile(r"\b(?:401|403)\b(?![\d.])", re.IGNORECASE)
+
+
 def looks_like_auth_error(text: Optional[str]) -> bool:
     """True when a tool result is really an authentication complaint.
 
-    Both servers answer unauthenticated calls with prose instead of raising, so
-    this is the only reliable liveness test.
+    Both servers answer unauthenticated calls with plain prose instead of raising,
+    so this is the only reliable liveness test. Two guards against false positives:
+
+    * Anything that parses as JSON is data, not an error sentence - unless it is
+      an object carrying an explicit ``error`` key.
+    * Status codes are matched only as standalone words and only alongside error
+      wording, because digits like ``403`` occur inside legitimate figures.
     """
     if not text:
         return False
     if len(text) > 2000:          # a real payload, not an error sentence
         return False
-    lowered = text.lower()
-    signals = ("log in", "login", "unauthenticated", "unauthorized", "unauthorised",
-               "authenticate", "session expired", "token expired", "not connected",
-               "invalid token", "please connect", "re-auth", "403", "401")
-    return any(signal in lowered for signal in signals)
+
+    parsed = parse_tool_payload(text)
+    if parsed is not None and not isinstance(parsed, str):
+        if isinstance(parsed, dict):
+            blob = " ".join(str(parsed.get(key, "")) for key in
+                            ("error", "message", "detail", "status"))
+            return bool(_AUTH_SIGNAL_RE.search(blob)) or (
+                bool(_AUTH_STATUS_RE.search(blob)) and bool(blob.strip()))
+        return False              # a list payload is data
+
+    if _AUTH_SIGNAL_RE.search(text):
+        return True
+    return bool(_AUTH_STATUS_RE.search(text)) and bool(
+        re.search(r"\b(?:error|denied|forbidden|failed)\b", text, re.IGNORECASE))
 
 
 # ===========================================================================
@@ -845,6 +871,34 @@ class IndmoneyProvider(BrokerProvider):
         for key, value in payload.items():
             if isinstance(value, dict) and key.upper() in wanted:
                 collected[key.upper()] = value
+
+    async def snapshot_asset_total(self, asset_type: str = "US_STOCK"
+                                   ) -> Optional[float]:
+        """The asset-class total INDmoney reports in ``networth_snapshot``.
+
+        Used purely as a cross-check against the sum of the per-position rows.
+        INDmoney has been observed to report three different US totals - the row
+        sum, this snapshot figure, and the allocation breakdown - differing by
+        around 1%, most likely cache freshness. The report uses the row sum,
+        because that is what the holdings table itself adds up to, and discloses
+        the gap rather than quietly choosing one.
+        """
+        try:
+            payload = await self.call("networth_snapshot", {})
+        except AuthRequired:
+            raise
+        except Exception as exc:
+            log.info("networth_snapshot unavailable for cross-check: %s", exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        for row in payload.get("investments") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("asset_type", "")).upper() == asset_type.upper():
+                return _num(row.get("current_value"))
+        return None
 
     async def watchlist(self) -> List[str]:
         """Tickers from the user's INDmoney watchlists.

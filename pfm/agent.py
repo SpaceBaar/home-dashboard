@@ -417,6 +417,25 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                     snapshot_fx, fx_note = brokers.derive_usd_inr(us_rows, us_quotes)
                     if snapshot_fx:
                         log.info("Implied USD/INR %.2f (%s)", snapshot_fx, fx_note)
+
+                    # Cross-check the row sum against INDmoney's own asset-class
+                    # total. The two have been seen to differ by about 1%.
+                    row_sum = sum(h.get("current_native") or 0.0 for h in us_rows)
+                    snapshot_total = await provider.snapshot_asset_total("US_STOCK")
+                    if snapshot_total and row_sum:
+                        gap = snapshot_total - row_sum
+                        if abs(gap) > max(1.0, row_sum * 0.005):
+                            us_problems.append(
+                                f"INDmoney's US holdings add up to Rs {row_sum:,.0f}, "
+                                f"but its own portfolio summary reports "
+                                f"Rs {snapshot_total:,.0f} for the same asset class "
+                                f"(a difference of Rs {gap:+,.0f}). The row-level sum "
+                                f"is used, because that is what the holdings table "
+                                f"adds up to. The gap is usually cache freshness or "
+                                f"an idle USD cash balance."
+                            )
+                            log.warning("US total mismatch: rows Rs %s vs snapshot Rs %s",
+                                        f"{row_sum:,.0f}", f"{snapshot_total:,.0f}")
             except AuthRequired as exc:
                 log.warning("INDmoney needs re-authentication: %s", exc)
                 us_problems.append(
