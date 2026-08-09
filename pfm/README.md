@@ -231,39 +231,43 @@ identifier join rather than a name search, and it doubles as a correctness check
 if a name-derived ticker disagrees with the id, the id wins and the mismatch is
 reported.
 
-**There is no ticker field.** Rows carry only `investment` (a long name like
+### Identifiers are never invented
+
+`networth_holdings` carries no ticker — only `investment` (a long name like
 `"Space Exploration Technologies Corp. Class A Common Stock"`) and
-`investment_code`. Four resolution paths run in order, each independent of the
-last, so no single failure can leave a holding unidentified:
+`investment_code`. There is exactly **one** ticker source:
 
-1. **`investment_code` → `mycroft_id`** from the quote reply. An exact id match.
-2. **Instrument name → `entity_basic.name`**, both reduced to a stem —
-   `"Apple Inc. Common Stock"` and `"Apple Inc."` both become `Apple`. Uses data
-   already fetched, so it costs nothing and covers the case where the quote batch
-   arrived without ids.
-3. **`tracking.instrument_tickers`** in `config.json` — manual name-fragment
-   overrides, for instruments no API knows. SpaceX is private-market and absent
-   from `get_us_stocks_details`, so it will always need this.
-4. **`lookup_ind_keys`** — present but **disabled by default**, see below.
+> INDmoney's own `entity_basic.symbol`, joined on its own `investment_code` ==
+> `mycroft_id`. Apple is `118186` in both, so the match is an exact identifier
+> join, not a guess.
 
-**`lookup_ind_keys` searches Indian instruments only, and is not used.** Asked
+Where that join finds nothing, the holding keeps **INDmoney's instrument code**
+as its identifier and is displayed under **INDmoney's instrument name**. Nothing
+is abbreviated, inferred or filled in from a config guess. So SpaceX appears as:
+
+```
+| Space Exploration Technologies Corp. Class A Common Stock | 0.0506 | … |
+```
+
+and the data-quality section says INDmoney supplied no ticker for it.
+
+Earlier versions invented `SPACEEXPLORA` and `ALPHABETCAPI` as stand-in symbols
+and carried a `tracking.instrument_tickers` table of hand-written guesses. Both
+are gone: a fabricated symbol looks authoritative, and the first thing it breaks
+is your ability to tell whether a holding is actually missing.
+
+**`lookup_ind_keys` is not used at all.** It searches *Indian* instruments: asked
 about `"Alphabet"` it returns *Mirae Nifty200Alpha30*, *NIFTY 50* and *Godrej
 Consumer Products*; asked about `"Space Exploration Technologies"` it returns
-*Space Incubatrics Technologies* and *Paras Defence*. The identifiers it hands
-back — `INDS02693`, `INDI00012` — are INDmoney's internal Indian keys, not
-tickers. A fuzzy match against those would have stamped `INDS02693` onto SpaceX,
-which is worse than a derived label: the label is visibly provisional, an
-instrument key looks authoritative.
+*Space Incubatrics Technologies*. The identifiers it hands back — `INDS02693`,
+`INDI00012` — are internal Indian keys, not tickers.
 
-So there are two hard guards, independent of that endpoint:
+One guard remains as a backstop: any candidate ticker must match
+`^[A-Z]{1,5}(\.[A-Z])?$` and must not begin `INDS`/`INDI`/`INDM`, or it is
+refused and logged.
 
-- Any candidate ticker must match `^[A-Z]{1,5}(\.[A-Z])?$` and must not begin
-  `INDS`/`INDI`/`INDM`, or it is refused and logged.
-- Name matching requires ≥ 90% similarity. The earlier prefix comparison accepted
-  companies that merely began with the same few letters.
-
-Set `indmoney.use_lookup_for_us` to `true` only if `filter_type` ever starts
-restricting that search to US instruments; the probe re-tests it each run.
+Keywords in `tracking.keywords` are **news search terms only**. They never define
+an identifier.
 
 Anything still unresolved keeps a label derived from its name, is **flagged as
 derived**, and is named in the data-quality section — an unresolved ticker also
@@ -316,8 +320,8 @@ python tools/probe_indmoney.py
 ```
 
 It prints a per-row table of instrument, `asset_type`, `assetclass_l2`, broker and
-resulting book, flags rows carrying a derived label instead of a real ticker, and
-dumps every row rather than only the first.
+resulting book, flags rows for which INDmoney supplies no ticker, and dumps every
+row rather than only the first.
 
 **Quotes are keyed by symbol**, not returned as a list: `{"AAPL": {entity_basic:
 {…}, entity_stats: {…}}}`.
@@ -509,7 +513,8 @@ portfolio. Root causes and fixes:
 | AAPL/TSLA news scored despite not being held | News driven by `config.json` alone | Driven by live holdings; the watchlist is separate and labelled |
 | Feeds silently contributing nothing | Only `<item>` was parsed; failures were swallowed | Atom support, retries, and a feed-health line in the data-quality section |
 | Zerodha Gold ETF (`GOLDCASE`) filed under US stocks | The book was decided by the first populated field among `asset_type`, `asset_class`, `assetclass_l2` — so a row with an empty `asset_type` fell through to `assetclass_l2`, and `GLOBAL EQUITY` was in the US match list. A missing `asset_type` also defaulted to US | Only `asset_type` decides, matched exactly. Unknown or absent means excluded and reported, never assumed. Plus a cross-book guard so one symbol cannot appear in both, with Kite winning |
-| A US holding at risk of being labelled `INDS02693` | `lookup_ind_keys` searches *Indian* instruments and returns internal keys, not tickers; a loose prefix match accepted them | The endpoint is off by default; candidates must match a US ticker shape and clear a 90% name-similarity bar |
+| Invented symbols (`SPACEEXPLORA`, `ALPHABETCAPI`) and hand-written ticker guesses in config | I filled the gap where INDmoney supplies no ticker instead of reporting it | Removed. The only ticker source is INDmoney's own `entity_basic.symbol` joined on its own `investment_code`; otherwise the holding shows INDmoney's instrument name and the gap is reported |
+| A US holding at risk of being labelled `INDS02693` | `lookup_ind_keys` searches *Indian* instruments and returns internal keys, not tickers | That endpoint is not used at all; any candidate must still match a US ticker shape |
 | A US holding missing from the report entirely | Rows filtered out by the book check were dropped with a bare `continue` — no log, no data-quality line. A holding could also appear under a derived label (`APPLE`) rather than its ticker (`AAPL`) and read as absent | Every exclusion is named in data quality with its reason; unresolved tickers are called out explicitly; the probe prints all rows and the decision for each, instead of only element `[0]` |
 | Commentary published in Chinese | qwen2.5 is a Chinese-origin model and ignores an English instruction now and then | Non-Latin script is a validation failure like any other: retry with a stricter prompt, then fall back to the deterministic template. Score rationales get the same treatment — the number survives, the prose does not. The rejection notice names the script rather than quoting the characters, so the diagnostic cannot reintroduce them |
 | Bot token written to `journalctl` | Exception text contains the request URL | Redacted before logging |

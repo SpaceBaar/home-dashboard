@@ -122,18 +122,19 @@ def test_real_us_shape() -> None:
     check(all(h["currency"] == "INR" for h in holdings),
           "every US holding row is rupee-denominated")
 
-    check(spacex["symbol"] and spacex["symbol"] != "UNKNOWN",
-          f"a label is derived when no ticker is supplied ({spacex['symbol']})")
-    check(any("ticker not supplied" in f for f in spacex["flags"]),
-          "the derived label is flagged, so it is never mistaken for a real ticker")
+    # No ticker is invented. The identifier is INDmoney's own instrument code.
+    check(spacex["symbol"] == spacex["investment_code"] == "203532",
+          f"identified by INDmoney's own instrument code ({spacex['symbol']})")
+    check(brokers.needs_ticker(spacex),
+          "and flagged as having no ticker from INDmoney")
     check(spacex["name"] == "Space Exploration Technologies Corp. Class A Common Stock",
-          "the full instrument name is retained for lookup and display")
+          "INDmoney's own instrument name is retained for display")
+    check(not brokers.looks_like_us_ticker(spacex["symbol"]),
+          "the code is not mistakable for a ticker")
 
     apple = next(h for h in holdings if h["name"].startswith("Apple"))
-    check(apple["symbol"].startswith("APPLE"),
-          f"a name yields a sensible stand-in label ({apple['symbol']})")
-    check(apple["investment_code"] == "118186",
-          "investment_code is carried through for the id join")
+    check(apple["symbol"] == "118186" and apple["investment_code"] == "118186",
+          f"Apple likewise starts as its INDmoney code ({apple['symbol']})")
     check(abs(apple["quantity"] * apple["ltp"] - apple["current_native"]) < 1.0,
           "Apple's units x unit_price also reconciles with market_value")
 
@@ -373,150 +374,17 @@ def test_ticker_shape_guard() -> None:
                 "TOOLONGTICKER", "ABC123", "", None):
         check(not brokers.looks_like_us_ticker(bad), f"{bad!r} is rejected")
 
-    holding = {"symbol": "SPACEEXPLORA", "name": "Space Exploration Technologies "
-                                                 "Corp. Class A Common Stock",
-               "flags": ["ticker not supplied by INDmoney; label derived"]}
+    holding = {"symbol": "203532", "name": "Space Exploration Technologies "
+                                           "Corp. Class A Common Stock",
+               "flags": ["no ticker supplied by INDmoney; identified by its "
+                         "instrument code"]}
     applied = brokers._apply_ticker(holding, "INDS02693", "bad lookup")
     check(applied is False, "applying an INDS key is refused")
-    check(holding["symbol"] == "SPACEEXPLORA" and brokers.needs_ticker(holding),
-          "the derived label is kept, and the row still reports as unresolved")
+    check(holding["symbol"] == "203532" and brokers.needs_ticker(holding),
+          "INDmoney's own code is kept, and the row still reports as unresolved")
     check(brokers._apply_ticker(holding, "SPCX", "config override") is True
           and holding["symbol"] == "SPCX",
           "a real ticker applies normally")
-
-
-def test_lookup_is_an_indian_search() -> None:
-    section("lookup_ind_keys is an INDIAN search and must not resolve US holdings")
-
-    # Verbatim replies captured from the live endpoint.
-    spacex_reply = {"results": [
-        {"ind_key": "INDS02693", "name": "Space Incubatrics Technologies"},
-        {"ind_key": "INDS03339", "name": "Paras Defence and Space Technologies"},
-        {"ind_key": "INDS04102", "name": "Spacenet Enterprises India"}]}
-    alphabet_reply = {"results": [
-        {"ind_key": "INDS27659", "name": "Mirae Nifty200Alpha30"},
-        {"ind_key": "INDI00012", "name": "NIFTY 50"},
-        {"ind_key": "INDS02705", "name": "Godrej Consumer Products"}]}
-
-    parsed = IndmoneyProvider._parse_lookup(spacex_reply)
-    check(parsed and all(not brokers.looks_like_us_ticker(v) for v in parsed.values()),
-          "nothing the endpoint returns for a US name is a US ticker")
-
-    # Off by default.
-    rows = live_us_rows()
-    session = FakeSession({"lookup_ind_keys": spacex_reply})
-    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, []))
-    check(not session.calls, "the lookup is not called at all by default")
-    check(all(brokers.needs_ticker(h) for h in rows), "so no row is touched")
-
-    # Even when enabled, no Indian key can land on a holding.
-    rows = live_us_rows()
-    problems: List[str] = []
-    session = FakeSession({"lookup_ind_keys": spacex_reply})
-    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, problems, enabled=True))
-    check(all(brokers.needs_ticker(h) for h in rows),
-          "with it enabled, the irrelevant Indian matches are still all rejected")
-    check(not any(h["symbol"].startswith("INDS") for h in rows),
-          "no holding is labelled with an INDS key")
-    check(any("could not be resolved" in p for p in problems),
-          "and the failure is reported honestly instead of faked")
-
-    rows = live_us_rows()
-    session = FakeSession({"lookup_ind_keys": alphabet_reply})
-    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, [], enabled=True))
-    check(not any(h["symbol"] in {"INDS27659", "INDI00012", "INDS02705"} for h in rows),
-          "'Alphabet' -> Mirae Nifty200Alpha30 is not accepted for GOOG")
-
-    # A genuinely close name with a real ticker still works.
-    rows = live_us_rows()
-    session = FakeSession({"lookup_ind_keys": {"results": [
-        {"name": "Apple", "ind_key": "AAPL"}]}})
-    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, [], enabled=True))
-    check(any(h["symbol"] == "AAPL" for h in rows),
-          "an exact name match returning a real ticker is still accepted")
-
-
-def test_lookup_fallback() -> None:
-    section("lookup_ind_keys fallback avoids the HTTP 414 that long names cause")
-
-    long_name = "Space Exploration Technologies Corp. Class A Common Stock"
-    short = brokers.shorten_for_lookup(long_name)
-    check(len(short) < len(long_name) and "Common Stock" not in short,
-          f"boilerplate suffixes are stripped: {short!r} ({len(short)} chars)")
-    check(short == "Space Exploration Technologies", f"expected name kept: {short!r}")
-    check(brokers.shorten_for_lookup("Apple Inc. Common Stock") == "Apple",
-          f"'Apple Inc. Common Stock' -> "
-          f"{brokers.shorten_for_lookup('Apple Inc. Common Stock')!r}")
-
-    for label, payload in (("dict keyed by name", SHAPES["lookup_dict_keyed"]),
-                           ("list of records", SHAPES["lookup_list_shaped"])):
-        check(bool(IndmoneyProvider._parse_lookup(payload)),
-              f"a lookup reply shaped as a {label} is parsed")
-
-    # The lookup path is opt-in now, so holdings() must not call it.
-    session = FakeSession({
-        "networth_holdings": SHAPES["real_networth_holdings_us"],
-        "lookup_ind_keys": SHAPES["lookup_dict_keyed"],
-    })
-    holdings, problems = asyncio.run(IndmoneyProvider(session).holdings())
-    check(not any(c[0] == "lookup_ind_keys" for c in session.calls),
-          "holdings() does not consult the Indian search endpoint")
-    check(len(holdings) == 3, "and still returns every US row")
-
-    # When explicitly enabled, requests stay short - that is what avoids the 414.
-    rows = live_us_rows()
-    session = FakeSession({"lookup_ind_keys": {"results": [
-        {"name": "Space Exploration Technologies", "ind_key": "SPCX"}]}})
-    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, [], enabled=True))
-    lookup_calls = [c for c in session.calls if c[0] == "lookup_ind_keys"]
-    check(bool(lookup_calls), "with enabled=True the endpoint is consulted")
-    check(all(len(c[1].get("names", [])) <= 1 for c in lookup_calls
-              if isinstance(c[1].get("names"), list)),
-          "names are sent one per call")
-    check(all(len(str(c[1].get("names"))) < 60 for c in lookup_calls),
-          "and each request stays short")
-    check(any(h["symbol"] == "SPCX" for h in rows),
-          "a real ticker from a matching name is applied")
-
-    # The real 414 error payload must not be mistaken for a result.
-    rows = live_us_rows()
-    problems: List[str] = []
-    session = FakeSession({"lookup_ind_keys": SHAPES["lookup_uri_too_long_error"]})
-    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, problems, enabled=True))
-    check(all(brokers.needs_ticker(h) for h in rows),
-          "an error payload yields no tickers, rather than bogus ones")
-    check(any("could not be resolved" in p for p in problems),
-          "the failure is reported in data quality rather than hidden")
-
-    rows = live_us_rows()
-    problems = []
-    session = FakeSession({"lookup_ind_keys": RuntimeError("tool unavailable")})
-    asyncio.run(IndmoneyProvider(session)._resolve_tickers(rows, problems, enabled=True))
-    check(all(brokers.needs_ticker(h) for h in rows)
-          and any("could not be resolved" in p for p in problems),
-          "an exception is handled the same way")
-
-
-def test_fx_derivation() -> None:
-    section("USD/INR derived from INDmoney's own rupee prices vs its USD quotes")
-
-    holdings, _ = brokers.normalise_indmoney_rows(rows_of("real_networth_holdings_us"))
-    brokers.resolve_by_code(holdings, brokers.build_code_index(SHAPES["real_us_stocks_details"]))
-    quotes = brokers.extract_us_quotes(SHAPES["real_us_stocks_details"])
-
-    rate, note = brokers.derive_usd_inr(holdings, quotes)
-    check(rate is not None and 90 < rate < 100,
-          f"a plausible rate is derived with no external source ({rate:.2f})")
-    check(abs(rate - 29476.19 / 308.91) < 1.0,
-          f"AAPL's rupee unit price over its USD quote gives {29476.19 / 308.91:.2f}")
-    check("derived from INDmoney" in note and "AAPL" in note,
-          f"the derivation is explained: {note[:60]}...")
-
-    check(brokers.derive_usd_inr([], quotes)[0] is None, "no holdings yields no rate")
-    check(brokers.derive_usd_inr(holdings, {})[0] is None, "no quotes yields no rate")
-
-    resolved, _ = resolve_fx(None, rate)
-    check(resolved is not None, "the derived rate passes the sanity band and is accepted")
 
 
 REAL_NAMES = [
@@ -547,53 +415,6 @@ def live_us_rows() -> List[dict]:
             for code, name in REAL_NAMES]
     holdings, _ = brokers.normalise_indmoney_rows(rows)
     return holdings
-
-
-def test_ticker_resolution_paths() -> None:
-    section("Three resolution paths, so one failure cannot hide a US holding")
-
-    check(brokers.shorten_for_lookup("Alphabet Inc. Class C Capital Stock") == "Alphabet",
-          "'Class C Capital Stock' is stripped for lookup")
-    check(brokers.derive_label("Alphabet Inc. Class C Capital Stock") == "ALPHABET",
-          f"and the derived label is readable "
-          f"({brokers.derive_label('Alphabet Inc. Class C Capital Stock')})")
-    check(brokers.shorten_for_lookup("Tesla, Inc. Common Stock") == "Tesla",
-          "a comma before Inc. is handled")
-
-    base = live_us_rows()
-    check(len(base) == 5 and all(brokers.needs_ticker(h) for h in base),
-          "all five live rows start with derived labels, as INDmoney sends no ticker")
-
-    # Path 1: the id join.
-    rows = live_us_rows()
-    by_code, _ = brokers.resolve_by_code(rows, brokers.build_code_index(LIVE_QUOTES))
-    check(by_code == 4, f"the instrument-id join resolves four ({by_code})")
-    check([h["symbol"] for h in rows][:4] == ["AAPL", "TSLA", "NVDA", "GOOG"],
-          f"to the right tickers ({[h['symbol'] for h in rows][:4]})")
-
-    # Path 2: the name join, which works even when the id join gets nothing.
-    rows = live_us_rows()
-    brokers.resolve_by_code(rows, {})          # simulate quotes lost
-    by_name, _ = brokers.resolve_by_name(rows, LIVE_QUOTES)
-    check(by_name == 4,
-          f"the name join independently resolves the same four ({by_name}), so a lost "
-          f"quote batch no longer hides Apple")
-    check("AAPL" in [h["symbol"] for h in rows], "Apple is present either way")
-
-    # Path 3: manual overrides for what no API knows.
-    rows = live_us_rows()
-    brokers.resolve_by_code(rows, brokers.build_code_index(LIVE_QUOTES))
-    spacex = next(h for h in rows if "Space" in h["name"])
-    check(brokers.needs_ticker(spacex),
-          "SpaceX is not in the US quote endpoint, so it stays unresolved")
-    filled = brokers.resolve_from_config(
-        rows, CFG.tracking.get("instrument_tickers") or {})
-    check(filled == 1 and spacex["symbol"] == "SPCX",
-          f"the config override pins it to SPCX ({spacex['symbol']})")
-    check(any("instrument_tickers" in f for f in spacex["flags"]),
-          "and records where the ticker came from")
-    check(not any(brokers.needs_ticker(h) for h in rows),
-          "with all three paths, every live holding has a real ticker")
 
 
 def test_batch_resilience() -> None:
@@ -899,11 +720,7 @@ def test_all():
     test_alternative_shapes()
     test_ticker_resolution_by_id()
     test_ticker_shape_guard()
-    test_lookup_is_an_indian_search()
-    test_lookup_fallback()
-    test_ticker_resolution_paths()
     test_batch_resilience()
-    test_fx_derivation()
     test_watchlist()
     test_us_quotes()
     test_us_news()

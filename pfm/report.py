@@ -199,6 +199,14 @@ def build_allowed_names(
     """Return (allowed_symbols, allowed_alias_tokens)."""
     symbols = {h.symbol.upper() for h in fs.holdings}
     symbols |= {s.symbol.upper() for s in scores}
+    # Holdings INDmoney gave no ticker for are referred to by its instrument name,
+    # so those words are legitimate vocabulary too.
+    for holding in fs.holdings:
+        if not holding.has_ticker:
+            symbols.add(holding.display.upper())
+            for part in re.split(r"[^A-Za-z0-9]+", holding.display.upper()):
+                if len(part) >= 3:
+                    symbols.add(part)
     aliases: Set[str] = set()
     for symbol in symbols:
         aliases.add(symbol)
@@ -343,10 +351,10 @@ Commentary:"""
 def deterministic_narrative(fs: FactSheet, scores: Sequence[StockScore], held: Set[str]) -> str:
     """Template prose built purely from computed facts. Always correct."""
     def listing(items) -> str:
-        return ", ".join(f"{h.symbol} ({h.pnl_pct:+.1f}%)" for h in items) or "none"
+        return ", ".join(f"{h.display} ({h.pnl_pct:+.1f}%)" for h in items) or "none"
 
     direction = "above" if fs.total_pnl >= 0 else "below"
-    top = fs.top_by_value[0].symbol if fs.top_by_value else "n/a"
+    top = fs.top_by_value[0].display if fs.top_by_value else "n/a"
 
     costed_count = sum(1 for h in fs.holdings if h.has_cost_basis)
     if costed_count == len(fs.holdings):
@@ -499,7 +507,7 @@ def render_report(
     lines += [
         f"| Holdings | {len(fs.holdings)} ({fs.profitable_count} in profit, "
         f"{fs.losing_count} in loss) |",
-        f"| Largest position | {fs.top_by_value[0].symbol if fs.top_by_value else 'n/a'} "
+        f"| Largest position | {fs.top_by_value[0].display if fs.top_by_value else 'n/a'} "
         f"({fs.concentration_pct:.1f}% of value) |",
     ]
     if fs.usd_inr:
@@ -562,7 +570,7 @@ def render_report(
         for h in rows:
             inr_cell = f" {_money(h.current_inr, 'Rs')} |" if show_inr_column else ""
             lines.append(
-                f"| {h.symbol} | {h.quantity:g} | {_plain(h.avg_price)} | {_plain(h.ltp)} | "
+                f"| {h.display} | {h.quantity:g} | {_plain(h.avg_price)} | {_plain(h.ltp)} | "
                 f"{_money(h.invested_native, unit)} | {unit}{h.current_native:,.0f} | "
                 f"{_money(h.pnl_native, unit, signed=True)} | {_pct(h.pnl_pct)} | "
                 f"{_pct(h.day_pct, decimals=2)} |{inr_cell}"
@@ -728,6 +736,8 @@ def build_payload(
         "holdings": [
             {
                 "symbol": h.symbol,
+                "display": h.display,
+                "has_ticker": h.has_ticker,
                 "name": h.name,
                 "exchange": h.exchange,
                 "book": h.book,

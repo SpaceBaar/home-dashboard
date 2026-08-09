@@ -83,14 +83,6 @@ class _Skipped:
         return True
 
 
-# Tickers treated as US names when they appear on the watchlist. Anything not
-# listed here is assumed Indian, since a wrong guess would send an Indian ticker
-# to a US quote endpoint.
-_US_LIKE = {"AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "GOOG", "META", "NFLX",
-            "AMD", "AVGO", "CRM", "ADBE", "UBER", "WMT", "NOW", "INTC", "MU", "QCOM",
-            "PLTR", "COIN", "SPY", "QQQ", "VOO"}
-
-
 def holdings_fingerprint(fact_sheet) -> str:
     """Hash of what is held and at what price.
 
@@ -103,13 +95,6 @@ def holdings_fingerprint(fact_sheet) -> str:
         for h in sorted(fact_sheet.holdings, key=lambda x: x.symbol)
     ]
     return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
-
-
-def load_last_run() -> dict:
-    try:
-        return json.loads(_LAST_RUN_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
 
 
 def save_last_run(fact_sheet, *, status: str, report: Optional[str] = None) -> None:
@@ -379,43 +364,29 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                 # quote lookup over the candidate pool identifies each holding
                 # without any name matching.
                 if us_rows:
-                    candidates = set(CFG.watchlist) | _US_LIKE
+                    # Candidates come only from places INDmoney or you declared:
+                    # your INDmoney watchlist, and tracking.watchlist in
+                    # config.json. Nothing is guessed.
+                    candidates = set(CFG.watchlist)
                     try:
                         candidates |= set(await provider.watchlist())
                     except Exception as exc:
                         log.info("INDmoney watchlist unavailable: %s", exc)
-                    candidates |= {h["symbol"] for h in us_rows if not brokers.needs_ticker(h)}
-                    # Never send a ticker we know to be Indian to the US quote
-                    # endpoint; the batch it lands in can fail as a whole.
-                    indian_symbols = ({h.get("symbol") for h in holdings_raw
-                                       if isinstance(h, dict)}
-                                      | set(CFG.keyword_map)) - _US_LIKE
-                    candidates -= {s for s in indian_symbols if s}
+                    # Anything Kite already reports is Indian; keep it away from a
+                    # US endpoint, where an unknown symbol can fail the batch.
+                    candidates -= {h.get("symbol") for h in holdings_raw
+                                   if isinstance(h, dict) and h.get("symbol")}
+                    candidates = {c for c in candidates if brokers.looks_like_us_ticker(c)}
 
                     details = await provider.us_details(sorted(candidates))
 
-                    # Three independent resolution paths, cheapest first.
+                    # The only ticker source: INDmoney's own entity_basic.symbol,
+                    # joined on its own investment_code == mycroft_id.
                     by_code, warnings = brokers.resolve_by_code(
                         us_rows, brokers.build_code_index(details))
                     us_problems.extend(warnings)
-                    by_name, _ = brokers.resolve_by_name(us_rows, details)
-                    log.info("Resolved US tickers: %d by instrument id, %d by name.",
-                             by_code, by_name)
-
-                    # lookup_ind_keys is an INDIAN instrument search - it answers
-                    # "Alphabet" with Mirae Nifty200Alpha30 - so it is off unless
-                    # explicitly enabled, and its results still have to pass the
-                    # US ticker shape check.
-                    if any(brokers.needs_ticker(h) for h in us_rows):
-                        await provider._resolve_tickers(
-                            us_rows, us_problems,
-                            enabled=bool(CFG.raw.get("indmoney", {})
-                                         .get("use_lookup_for_us", False)))
-                    by_config = brokers.resolve_from_config(
-                        us_rows, CFG.tracking.get("instrument_tickers") or {})
-                    if by_config:
-                        log.info("Resolved %d US ticker(s) from "
-                                 "tracking.instrument_tickers.", by_config)
+                    log.info("Resolved %d US ticker(s) from INDmoney's own quote data.",
+                             by_code)
 
                     # Fetch details for tickers discovered after the first call so
                     # their news and quotes are available too.
@@ -427,18 +398,19 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                     us_quotes = brokers.extract_us_quotes(details)
                     broker_sentiment = brokers.extract_us_news(details)
 
-                    # A holding still carrying a derived label means neither the id
-                    # join nor the name lookup identified it. Say so in the report:
-                    # a stand-in like APPLE instead of AAPL looks like a missing
-                    # holding to anyone scanning for the ticker.
-                    unresolved = [h.get("name") or h["symbol"]
+                    # INDmoney supplies no ticker for some holdings. Those are shown
+                    # under the instrument name it does supply, identified by its
+                    # instrument code. Nothing is invented to fill the gap; the
+                    # report just says so.
+                    unresolved = [f"{h.get('name') or h['symbol']} "
+                                  f"(INDmoney code {h.get('investment_code')})"
                                   for h in us_rows if brokers.needs_ticker(h)]
                     if unresolved:
                         us_problems.append(
-                            "These US holdings are shown under a label derived from "
-                            "their name rather than a real ticker, because INDmoney "
-                            "supplies no ticker and neither lookup resolved one: "
-                            + ", ".join(unresolved) + "."
+                            "INDmoney provides no ticker for " + "; ".join(unresolved)
+                            + ". They are shown under the instrument name INDmoney "
+                              "returned. Add them to a watchlist in the INDmoney app, "
+                              "or to tracking.keywords in config.json, for news matching."
                         )
 
                     # The rate INDmoney itself applied, read back out of the data.

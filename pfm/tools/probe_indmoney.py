@@ -184,9 +184,9 @@ def classification_table(payload: Any) -> List[str]:
     for problem in problems:
         lines.append(f"     ! {problem}")
     if normalised:
-        lines.append("  symbols after normalisation (before ticker resolution):")
+        lines.append("  identifiers after normalisation (before the id join):")
         for holding in normalised:
-            flag = " [derived label]" if brokers.needs_ticker(holding) else ""
+            flag = " [no ticker from INDmoney]" if brokers.needs_ticker(holding) else ""
             lines.append(f"     {holding['symbol']:<16} {holding.get('name', '')[:44]}{flag}")
     return lines
 
@@ -368,7 +368,9 @@ Already confirmed from the 2026-08-02 capture, and encoded in brokers.py:
     converted them (units x unit_price == market_value, and the implied average
     only makes sense as INR). get_us_stocks_details, by contrast, quotes in USD.
   * There is no ticker field - only `investment` (long name) and
-    `investment_code`. Tickers are resolved via lookup_ind_keys.
+    `investment_code`. The ONLY ticker source is INDmoney's own
+    entity_basic.symbol, joined on investment_code == mycroft_id. Where that
+    finds nothing, the holding keeps INDmoney's code and name. Nothing invented.
   * An unknown cost basis arrives as the string "unknown", and total_pnl is then
     filled with the market value while pnl_per is 0. Both are placeholders and
     are discarded.
@@ -389,9 +391,9 @@ Worth re-checking if something looks wrong:
 
   1. Whether a `segments` value still returns news (see the sweep above).
   2. Whether the classification table put every holding in the right book.
-  3. Whether any holding is still marked [derived label] - if so, add it to
-     tracking.instrument_tickers in config.json.
-  4. Whether filter_type has started restricting lookup_ind_keys to US names.
+  3. Whether any holding shows [no ticker from INDmoney] - that is reported, not
+     patched over. Adding it to a watchlist in the INDmoney app is the only fix
+     that uses official data.
 
 Paste the file contents back if the parser needs adjusting.
 """)

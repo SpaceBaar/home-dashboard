@@ -147,6 +147,10 @@ class Config:
         explicit = self.keyword_map.get(symbol.upper())
         if explicit:
             return explicit
+        # A purely numeric identifier is INDmoney's instrument code, not a name -
+        # searching news for "203532" would be meaningless.
+        if symbol.isdigit():
+            return []
         if len(symbol) >= 4:
             return [symbol.upper()]
         return []

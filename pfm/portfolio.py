@@ -78,8 +78,20 @@ class Holding:
         return self.pnl_inr
 
     @property
-    def symbol_display(self) -> str:
-        return f"{self.symbol} (US)" if self.book == BOOK_US else self.symbol
+    def has_ticker(self) -> bool:
+        """False when the identifier is INDmoney's instrument code, not a ticker."""
+        return bool(re.match(r"^[A-Z]{1,5}(?:\.[A-Z])?$", self.symbol or ""))
+
+    @property
+    def display(self) -> str:
+        """What to print. INDmoney's own name when it gave us no ticker.
+
+        Never a fabricated abbreviation: if INDmoney supplies no ticker, the
+        report shows the instrument name INDmoney actually returned.
+        """
+        if self.has_ticker:
+            return self.symbol
+        return (self.name or self.symbol or "").strip() or self.symbol
 
 
 @dataclass
@@ -428,7 +440,7 @@ def render_fact_block(fs: FactSheet) -> str:
     forbidden from doing any arithmetic of its own.
     """
     def names(items: List[Holding]) -> str:
-        return ", ".join(f"{h.symbol} ({h.pnl_pct:+.1f}%)" for h in items) or "none"
+        return ", ".join(f"{h.display} ({h.pnl_pct:+.1f}%)" for h in items) or "none"
 
     lines = [
         f"Total invested: Rs {fs.total_invested:,.0f}",
@@ -436,7 +448,7 @@ def render_fact_block(fs: FactSheet) -> str:
         f"Overall profit/loss: Rs {fs.total_pnl:+,.0f} ({fs.total_pnl_pct:+.1f}%)",
         f"Number of holdings: {len(fs.holdings)} "
         f"({fs.profitable_count} in profit, {fs.losing_count} in loss)",
-        f"Largest holding by value: {fs.top_by_value[0].symbol if fs.top_by_value else 'none'} "
+        f"Largest holding by value: {fs.top_by_value[0].display if fs.top_by_value else 'none'} "
         f"at {fs.concentration_pct:.0f}% of the portfolio",
         f"Best performers: {names(fs.winners)}",
         f"Worst performers: {names(fs.losers)}",

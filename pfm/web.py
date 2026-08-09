@@ -427,7 +427,7 @@ def render_holdings_table(rows: List[dict], book: str, totals: Optional[dict],
         inr_cell = (f'<td data-sort="{h.get("current_inr") or 0}">'
                     f'{amt(h.get("current_inr"), "INR")}</td>') if is_us else ""
         cells.append(f"""<tr>
-<td class="sym">{html.escape(h["symbol"])}{flags}</td>
+<td class="sym">{html.escape(h.get("display") or h["symbol"])}{flags}</td>
 <td data-sort="{h["quantity"]}">{h["quantity"]:g}</td>
 <td data-sort="{h.get("avg_price") or 0}">{amt(h.get("avg_price"), currency, decimals=2)}</td>
 <td data-sort="{h.get("ltp") or 0}">{amt(h.get("ltp"), currency, decimals=2)}</td>
