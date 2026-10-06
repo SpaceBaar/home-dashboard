@@ -53,6 +53,7 @@ import schedule
 import brokers
 import news as news_mod
 import report as report_mod
+import bridges
 from bridges import MCPBridge, clear_cached_credentials
 from brokers import BOOK_US, AuthRequired, IndmoneyProvider, KiteProvider, ProviderError
 from commands import HELP_TEXT, Command, CommandRouter, is_authorised
@@ -768,6 +769,72 @@ async def cmd_run(_: Command) -> str:
             "will arrive here when it is done.")
 
 
+async def cmd_code(command: Command) -> str:
+    """Finish a sign-in that was approved on another device.
+
+    The OAuth callback server only listens on the Pi's loopback interface, so
+    approving a link on a phone sends the browser to the *phone's* localhost
+    and it refuses to connect. The code is still in that failed page's address
+    bar, though, and this relays it from the machine that can actually use it.
+    """
+    pasted = command.arg.strip()
+    if not pasted:
+        return ("Send the address of the page that refused to connect, like:\n"
+                "/code http://localhost:3335/oauth/callback?code=...&state=...\n\n"
+                "Copy it from your browser's address bar — the sign-in did work, "
+                "only the final redirect could not reach the Pi.")
+
+    parsed = bridges.extract_code(pasted)
+    if not parsed:
+        return ("I could not find an authorisation code in that. Paste the whole "
+                "address of the failed page, including everything after the '?'.")
+
+    # Prefer the bridge whose sign-in this code belongs to. Matching on state
+    # means a code can never be delivered to the wrong broker's callback.
+    candidates = [(name, bridge) for name, bridge in
+                  (("Zerodha Kite", KITE_BRIDGE), ("INDmoney", IND_BRIDGE))
+                  if bridge is not None and bridge.pending_auth]
+    if not candidates:
+        return ("Neither bridge is waiting for a sign-in right now. Send /login "
+                "or /indmoney to start one, then send me the code.")
+
+    chosen = None
+    if parsed.get("state"):
+        chosen = next((c for c in candidates
+                       if c[1].pending_auth.get("state") == parsed["state"]), None)
+        if chosen is None and len(candidates) > 1:
+            return ("That code does not match either sign-in in progress. It may "
+                    "be from an older link — send /login or /indmoney for a fresh "
+                    "one.")
+    if chosen is None:
+        chosen = candidates[0]
+
+    name, bridge = chosen
+    pending = bridge.pending_auth
+    ok, detail = await asyncio.get_running_loop().run_in_executor(
+        None, bridges.deliver_auth_code,
+        pending["redirect_uri"], parsed["code"], parsed.get("state"))
+
+    if not ok:
+        return f"{name}: {detail}"
+
+    # The handshake completes asynchronously inside mcp-remote; give it a
+    # moment, then report what actually happened rather than assuming.
+    await asyncio.sleep(3)
+    if name == "Zerodha Kite":
+        globals()["_session"] = KITE_BRIDGE.session
+        live = await probe_session() is not None
+        return (f"{name}: {detail} The session is live — send /run for the "
+                f"analysis." if live else
+                f"{name}: {detail} The session is not live yet; give it a few "
+                f"seconds and send /status.")
+    globals()["_ind_session"] = IND_BRIDGE.session
+    return (f"{name}: {detail} Send /status to confirm the US book is back."
+            if IND_BRIDGE.connected else
+            f"{name}: {detail} The bridge is still connecting — send /status "
+            f"shortly, or /indmoney to retry.")
+
+
 async def cmd_help(_: Command) -> str:
     return HELP_TEXT
 
@@ -776,6 +843,7 @@ def build_router() -> CommandRouter:
     router = CommandRouter(CFG.telegram_chat_id)
     router.register("login", cmd_login, "kite", "zerodha")
     router.register("indmoney", cmd_indmoney, "us", "ind")
+    router.register("code", cmd_code, "callback", "auth")
     router.register("status", cmd_status, "state")
     router.register("run", cmd_run, "analyse", "analyze")
     router.register("help", cmd_help, "start", "commands")
@@ -1060,7 +1128,13 @@ def _forward_auth_url(label: str):
         log.info("%s needs authorisation; sending the link to Telegram.", label)
         if TG:
             TG.send(f"{label} needs you to sign in again.\n\n{url}\n\n"
-                    f"Open it, approve, then send /status to confirm.")
+                    f"Open it and approve. If you are on your phone, the page "
+                    f"afterwards will say it cannot connect to localhost — that "
+                    f"is expected, the callback server runs on the Pi. Copy that "
+                    f"failed address and send it back as:\n"
+                    f"/code <paste the address>\n\n"
+                    f"If you approved it in a browser on the Pi itself, just "
+                    f"send /status to confirm.")
     return handler
 
 

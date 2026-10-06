@@ -28,6 +28,9 @@ import threading
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Callable, List, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.request import urlopen
 
 log = logging.getLogger("pfm.bridges")
 
@@ -65,6 +68,9 @@ class _StderrTee:
         self._read_fd: Optional[int] = None
         self._write_file = None
         self._thread: Optional[threading.Thread] = None
+        # {"redirect_uri": ..., "state": ...} from the last sign-in URL seen,
+        # which is what lets a code approved on a phone be relayed back here.
+        self.pending_auth: Optional[dict] = None
 
     def open(self):
         """Create the pipe and start draining it. Returns the write end."""
@@ -133,6 +139,7 @@ class _StderrTee:
         if url in self._seen_urls:
             return
         self._seen_urls.add(url)
+        self.pending_auth = parse_auth_url(url)
         log.info("[%s] authorisation URL detected.", self.label)
         if self.on_auth_url:
             try:
@@ -158,6 +165,7 @@ class MCPBridge:
         self._lock: Optional[asyncio.Lock] = None
         self.last_error: Optional[str] = None
         self.last_log: List[str] = []       # survives the tee, for /status
+        self._last_auth: Optional[dict] = None
 
     # -- plumbing ----------------------------------------------------------
     def _get_lock(self) -> asyncio.Lock:
@@ -231,6 +239,10 @@ class MCPBridge:
         if self._tee is not None:
             self._tee.close()
             self.last_log = list(self._tee.lines)
+            # The callback server dies with the subprocess, so a stranded code
+            # is only worth relaying while the bridge is still waiting. Keeping
+            # the details lets /code explain that rather than fail silently.
+            self._last_auth = self._tee.pending_auth
             self._tee = None
 
     async def _stop_unlocked(self) -> None:
@@ -263,6 +275,105 @@ class MCPBridge:
         """The subprocess's last stderr lines, live or from the last attempt."""
         lines = self._tee.lines if self._tee is not None else self.last_log
         return list(lines[-limit:])
+
+    @property
+    def pending_auth(self) -> Optional[dict]:
+        """Callback details from the sign-in URL this bridge last printed."""
+        return self._tee.pending_auth if self._tee is not None else self._last_auth
+
+
+# ===========================================================================
+# Relaying an authorisation code approved on another device
+# ===========================================================================
+# mcp-remote runs the OAuth callback server on the Pi and binds it to
+# 127.0.0.1 — that is hard-coded, and its --host flag only rewrites the
+# redirect_uri it registers, so pointing the callback at the Pi's LAN address
+# would leave nothing listening there. The practical consequence: approving a
+# sign-in on a phone sends the browser to *the phone's* localhost, which
+# refuses the connection, and the code is stranded in the address bar.
+#
+# So the Pi replays it. The authorisation URL we already capture carries the
+# redirect_uri, so given the code from that dead page we can make the request
+# the browser could not, from the one machine where it works.
+
+def parse_auth_url(url: str) -> Optional[dict]:
+    """Pull the callback address and state out of an authorisation URL."""
+    try:
+        query = parse_qs(urlparse(url).query)
+    except ValueError:
+        return None
+    redirect = (query.get("redirect_uri") or [None])[0]
+    if not redirect:
+        return None
+    return {"redirect_uri": redirect, "state": (query.get("state") or [None])[0]}
+
+
+def extract_code(text: str) -> Optional[dict]:
+    """Read an authorisation code out of whatever the user pasted.
+
+    Accepts the whole failed callback URL copied from a phone's address bar —
+    the common case, and the one worth being forgiving about — or a bare code.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    if "?" in text or text.lower().startswith("http"):
+        try:
+            query = parse_qs(urlparse(text).query)
+        except ValueError:
+            return None
+        code = (query.get("code") or [None])[0]
+        if code:
+            return {"code": code, "state": (query.get("state") or [None])[0]}
+        return None
+    # A bare code: no whitespace, and long enough not to be a stray word.
+    if len(text.split()) == 1 and len(text) >= 8:
+        return {"code": text, "state": None}
+    return None
+
+
+def deliver_auth_code(redirect_uri: str, code: str, state: Optional[str] = None,
+                      timeout: float = 15.0) -> tuple:
+    """GET the callback the browser could not reach. Returns (ok, detail).
+
+    Only ever talks to loopback: the redirect_uri comes from a URL mcp-remote
+    itself printed, and this refuses anything that is not local, so a tampered
+    sign-in page cannot turn this into a request to an arbitrary host.
+    """
+    try:
+        parts = urlparse(redirect_uri)
+    except ValueError:
+        return False, "The callback address could not be parsed."
+    if parts.scheme not in ("http", "https"):
+        return False, f"Refusing a {parts.scheme or 'schemeless'} callback address."
+    if (parts.hostname or "").lower() not in ("localhost", "127.0.0.1", "::1"):
+        return False, (f"Refusing to send the code to {parts.hostname!r}: the "
+                       f"callback must be on this machine.")
+
+    query = dict(parse_qs(parts.query))
+    query["code"] = [code]
+    if state:
+        query["state"] = [state]
+    target = urlunparse(parts._replace(query=urlencode(query, doseq=True)))
+
+    try:
+        with urlopen(target, timeout=timeout) as response:
+            body = response.read(2000).decode("utf-8", "replace")
+            ok = 200 <= response.status < 300
+    except HTTPError as exc:
+        return False, f"The callback returned HTTP {exc.code}."
+    except URLError as exc:
+        return False, (f"Could not reach the callback server ({exc.reason}). "
+                       f"It only runs while a sign-in is in progress — if it "
+                       f"has timed out, start again with a fresh link.")
+    except OSError as exc:
+        return False, f"Could not reach the callback server ({exc})."
+
+    if not ok:
+        return False, "The callback server rejected the code."
+    if "successful" in body.lower():
+        return True, "Authorisation completed."
+    return True, "The code was delivered."
 
 
 # ===========================================================================

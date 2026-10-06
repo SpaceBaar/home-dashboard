@@ -24,6 +24,11 @@ HELP_TEXT = """Commands
    Reopens the INDmoney bridge. Any sign-in URL is forwarded here.
    /indmoney force — also clear the cached INDmoney credentials first.
 
+/code <address> — finish a sign-in approved on your phone
+   After approving, the browser is sent to localhost and refuses to connect.
+   That is expected: the callback server runs on the Pi, not your phone.
+   Copy the whole failed address and send it here, and the Pi completes it.
+
 /status — both broker sessions, the last run, and tonight's plan
 
 /run — run the analysis now, ignoring the weekend skip

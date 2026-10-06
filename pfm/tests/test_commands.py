@@ -14,12 +14,15 @@ Run with either:
 from __future__ import annotations
 
 import asyncio
+import http.server
 import os
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import List
 
@@ -301,7 +304,87 @@ def test_bridge_lifecycle() -> None:
 
 
 # ===========================================================================
-# 7. Unattended recovery
+# 7. Relaying a code approved on another device
+# ===========================================================================
+def test_auth_code_relay() -> None:
+    section("A sign-in approved on a phone is finished by the Pi")
+
+    auth = ("https://mcp.indmoney.com/authorize?response_type=code"
+            "&client_id=73cf84c9"
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A9696%2Foauth%2Fcallback"
+            "&code_challenge=BY6S0x&state=6038813d")
+    parsed = bridges.parse_auth_url(auth)
+    check(parsed and parsed["redirect_uri"] == "http://localhost:9696/oauth/callback",
+          "the callback address is read out of the sign-in URL")
+    check(parsed and parsed["state"] == "6038813d",
+          "along with the state, so a code reaches the right broker")
+    check(bridges.parse_auth_url("https://example.com/authorize?x=1") is None,
+          "a URL with no redirect_uri yields nothing rather than a half-answer")
+
+    full = bridges.extract_code(
+        "http://localhost:9696/oauth/callback?code=ABC123xyz&state=6038813d")
+    check(full == {"code": "ABC123xyz", "state": "6038813d"},
+          "a whole pasted address gives up its code and state")
+    check(bridges.extract_code("ABC123xyz456") == {"code": "ABC123xyz456", "state": None},
+          "a bare code is accepted too")
+    for junk in ("hello", "", "   ", "http://localhost/cb?error=access_denied"):
+        check(bridges.extract_code(junk) is None,
+              f"{junk[:28]!r} is not mistaken for a code")
+
+    # The relay must never be talked into calling out to an arbitrary host:
+    # the redirect_uri originates in a page we did not write.
+    for bad, why in (("http://evil.example/oauth/callback", "an external host"),
+                     ("https://169.254.169.254/latest/meta-data", "a metadata address"),
+                     ("file:///etc/passwd", "a file URL")):
+        ok, detail = bridges.deliver_auth_code(bad, "CODE")
+        check(not ok and "Refus" in detail, f"{why} is refused outright")
+
+    # A real callback server, which is what mcp-remote is running on the Pi.
+    received: dict = {}
+
+    class _Callback(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):                                   # noqa: N802
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query)
+            received.update({k: v[0] for k, v in query.items()})
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Authorization successful!")
+
+        def log_message(self, *args):                       # keep the suite quiet
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Callback)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        ok, detail = bridges.deliver_auth_code(
+            f"http://127.0.0.1:{server.server_address[1]}/oauth/callback",
+            "THE_CODE", "6038813d")
+        check(ok, f"the code reaches a live callback server ({detail})")
+        check(received.get("code") == "THE_CODE", "with the code intact")
+        check(received.get("state") == "6038813d", "and the state intact")
+    finally:
+        server.shutdown()
+
+    ok, detail = bridges.deliver_auth_code("http://127.0.0.1:1/oauth/callback", "X")
+    check(not ok and "fresh link" in detail,
+          "an expired sign-in says to start again rather than failing blankly")
+
+    # End to end: a bridge sees a sign-in URL, and the code can then be relayed.
+    tee = bridges._StderrTee("INDmoney")
+    _run_through_tee(tee, textwrap.dedent(f"""
+        import sys
+        sys.stderr.write("[9123] Please authorize this client by visiting:\\n")
+        sys.stderr.write("{auth}\\n")
+    """))
+    check(tee.pending_auth is not None
+          and tee.pending_auth["state"] == "6038813d",
+          "a bridge remembers where to deliver the code after printing the link")
+    tee.close()
+
+
+# ===========================================================================
+# 8. Unattended recovery
 # ===========================================================================
 class _FlakyBridge:
     def __init__(self, fail_times: int):
@@ -360,6 +443,7 @@ def test_all():
     test_auth_url_capture()
     test_credential_clearing()
     test_bridge_lifecycle()
+    test_auth_code_relay()
     test_unattended_recovery()
     assert not _failures, f"{len(_failures)} check(s) failed:\n" + "\n".join(_failures)
 

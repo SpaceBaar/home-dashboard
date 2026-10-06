@@ -128,6 +128,7 @@ messages, so a stranger cannot write lines into your expense file either.
 | `/login` | Probes the Kite session first. Sends a fresh link only if it has actually expired, so you never get a pointless one. Aliases: `/kite`, `/zerodha` |
 | `/indmoney` | Reconnects the US book. Aliases: `/us`, `/ind` |
 | `/indmoney force` | Also clears the cached INDmoney credentials first, forcing a full OAuth sign-in |
+| `/code <address>` | Finishes a sign-in you approved on another device. Aliases: `/callback`, `/auth` |
 | `/status` | Both broker sessions, the last run, and whether tonight's run will go ahead or be skipped |
 | `/run` | Runs the analysis now, ignoring the weekend skip. Returns immediately; the summary arrives when it finishes |
 | `/help` | The list above |
@@ -138,6 +139,32 @@ Anything that is not a command is still logged as an expense, as before.
 `Please authorize this client by visiting: <url>` to stderr, which on a headless
 Pi means journalctl — useless if nobody is tailing it. Both bridges tee that
 stream and forward any authorisation URL straight to Telegram.
+
+**Approving a sign-in on your phone: use `/code`.** The link arrives on
+Telegram, so you will usually open it on a phone — and then the browser is
+redirected to `http://localhost:<port>/oauth/callback`, which on a phone means
+*the phone itself*, and it refuses to connect. This is not a misconfiguration
+and it cannot be fixed by pointing the callback elsewhere: `mcp-remote` binds
+its callback server to `127.0.0.1`, hard-coded, and its `--host` flag only
+rewrites the `redirect_uri` it registers — so aiming it at the Pi's LAN address
+would leave nothing listening there.
+
+The sign-in itself did succeed, though, and the authorisation code is sitting
+in the failed page's address bar. Copy that whole address and send it back:
+
+```
+/code http://localhost:3335/oauth/callback?code=...&state=...
+```
+
+The Pi then makes the request the phone could not, from the one machine where
+the callback server exists. A bare code works too. The `state` is matched
+against the sign-in in progress, so a code cannot be delivered to the wrong
+broker, and the relay refuses any callback address that is not loopback — the
+`redirect_uri` comes from a page we did not write, and it is not going to
+become a way to make the Pi fetch arbitrary URLs.
+
+If you approve the link in a browser on the Pi itself, none of this applies:
+the callback reaches the server directly and `/status` will show the session.
 
 **Both bridges are restartable.** The MCP connections used to live inside nested
 `async with` blocks in the main loop, so reconnecting meant restarting the
