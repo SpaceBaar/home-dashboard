@@ -14,8 +14,12 @@ Run with either:
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 from pathlib import Path
 from typing import List
 
@@ -141,39 +145,65 @@ def test_routing() -> None:
 # ===========================================================================
 # 4. Auth URL capture
 # ===========================================================================
+def _run_through_tee(tee, script: str, timeout: float = 10.0) -> None:
+    """Run a real child process with its stderr wired to the tee's pipe.
+
+    Deliberately a subprocess rather than a direct call. The first version of
+    this test poked the tee's write() method, which passed happily while the
+    real thing was broken: stdio_client hands errlog to the OS as the child's
+    stderr, so it needs a genuine file descriptor and never calls write() at
+    all. Spawning a child is the only way to exercise what actually happens.
+    """
+    handle = tee.open()
+    proc = subprocess.Popen([sys.executable, "-u", "-c", script], stderr=handle)
+    proc.wait(timeout=timeout)
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not tee.lines:
+        time.sleep(0.01)
+    time.sleep(0.15)                      # let the reader thread drain the tail
+
+
 def test_auth_url_capture() -> None:
     section("mcp-remote's sign-in URL is forwarded, not buried in the log")
 
     captured: List[str] = []
     tee = bridges._StderrTee("INDmoney", captured.append)
 
-    # Verbatim shape of what mcp-remote prints.
-    tee.write("[21729] Connecting to remote server...\n")
-    tee.write("[21729] \nPlease authorize this client by visiting:\n")
-    tee.write("https://mcp.indmoney.com/authorize?response_type=code"
-              "&client_id=73cf84c9&code_challenge=BY6S0x&state=6038813d\n")
-    tee.write("[21729] Browser opened automatically.\n")
+    # Verbatim shape of what mcp-remote prints, from a real child process.
+    url = ("https://mcp.indmoney.com/authorize?response_type=code"
+           "&client_id=73cf84c9&code_challenge=BY6S0x&state=6038813d")
+    _run_through_tee(tee, textwrap.dedent(f"""
+        import sys
+        sys.stderr.write("[21729] Connecting to remote server...\\n")
+        sys.stderr.write("[21729] \\nPlease authorize this client by visiting:\\n")
+        sys.stderr.write("{url}\\n")
+        sys.stderr.write("[21729] Browser opened automatically.\\n")
+        sys.stderr.write("{url}\\n")
+    """))
 
+    check(tee.lines, "a real subprocess's stderr reaches the tee at all")
     check(len(captured) == 1, f"exactly one URL captured ({len(captured)})")
     check(captured and captured[0].startswith("https://mcp.indmoney.com/authorize?"),
           "and it is the authorisation URL")
     check(captured and "state=6038813d" in captured[0],
           "with the full query string intact — a truncated URL would not work")
-
-    tee.write("https://mcp.indmoney.com/authorize?response_type=code"
-              "&client_id=73cf84c9&code_challenge=BY6S0x&state=6038813d\n")
-    check(len(captured) == 1, "the same URL is not forwarded twice")
-
+    check(len(captured) == 1, "the same URL printed twice is forwarded once")
     check(any("Browser opened" in line for line in tee.lines),
           "ordinary output is still retained for diagnostics")
+    tee.close()
 
-    # A URL split across two writes must still be caught.
+    # A URL split across two unflushed writes must still be caught.
     captured.clear()
     tee2 = bridges._StderrTee("Kite", captured.append)
-    tee2.write("visit https://mcp.kite.trade/authorize?code_cha")
-    tee2.write("llenge=abc&state=xyz\n")
-    check(len(captured) == 1 and "state=xyz" in captured[0],
-          "a URL split across writes is reassembled")
+    _run_through_tee(tee2, textwrap.dedent("""
+        import sys, time
+        sys.stderr.write("visit https://mcp.kite.trade/authorize?code_cha")
+        sys.stderr.flush(); time.sleep(0.05)
+        sys.stderr.write("llenge=abc&state=xyz\\n")
+    """))
+    check(len(captured) == 1 and captured and "state=xyz" in captured[0],
+          "a URL split across two reads is reassembled")
+    tee2.close()
 
     # A notifier that throws must not break the bridge.
     def angry(_: str) -> None:
@@ -181,12 +211,26 @@ def test_auth_url_capture() -> None:
 
     tee3 = bridges._StderrTee("Kite", angry)
     try:
-        tee3.write("https://mcp.kite.trade/authorize?x=1\n")
+        _run_through_tee(tee3, 'import sys; sys.stderr.write('
+                               '"https://mcp.kite.trade/authorize?x=1\\n")')
         check(True, "a failing notifier is swallowed rather than killing the bridge")
     except Exception as exc:
         check(False, f"a failing notifier escaped: {exc}")
+    tee3.close()
 
-    check(bridges._StderrTee("x").write("") == 0, "an empty write is harmless")
+    # Closing must release both ends, or enough /login restarts exhaust the
+    # process's file descriptors and the bridge stops coming back.
+    before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+    for _ in range(25):
+        spare = bridges._StderrTee("churn")
+        spare.open()
+        spare.close()
+    if before is not None:
+        after = len(os.listdir("/proc/self/fd"))
+        check(after <= before + 2,
+              f"25 open/close cycles leak no descriptors ({before} -> {after})")
+    check(bridges._StderrTee("never-opened").close() is None,
+          "closing a tee that was never opened is harmless")
 
 
 # ===========================================================================
@@ -257,6 +301,58 @@ def test_bridge_lifecycle() -> None:
 
 
 # ===========================================================================
+# 7. Unattended recovery
+# ===========================================================================
+class _FlakyBridge:
+    def __init__(self, fail_times: int):
+        self.n = 0
+        self.fail = fail_times
+        self.session = None
+        self.last_error = "connection refused"
+
+    async def start(self) -> bool:
+        self.n += 1
+        if self.n <= self.fail:
+            return False
+        self.session = object()
+        return True
+
+
+def test_unattended_recovery() -> None:
+    section("A bridge that fails at startup comes back without a restart")
+
+    import agent                                            # noqa: E402
+
+    saved = (agent.KITE_BRIDGE, agent.IND_BRIDGE, agent._session, agent._ind_session)
+    try:
+        bridge = _FlakyBridge(fail_times=2)
+        agent.KITE_BRIDGE, agent.IND_BRIDGE = bridge, None
+        agent._session = agent._ind_session = None
+
+        clock = {"t": 0.0}
+
+        async def drive():
+            task = asyncio.create_task(
+                agent.mcp_keepalive(interval=0.01, max_backoff=0.32,
+                                    clock=lambda: clock["t"]))
+            for _ in range(200):
+                clock["t"] += 0.05
+                await asyncio.sleep(0.005)
+                if agent._session is not None:
+                    break
+            task.cancel()
+
+        asyncio.run(drive())
+        check(agent._session is not None,
+              "the Kite bridge reconnects itself after failing twice")
+        check(bridge.n == 3, f"taking exactly three attempts (got {bridge.n})")
+        check(agent.IND_BRIDGE is None,
+              "and a bridge that was never created is skipped, not crashed on")
+    finally:
+        agent.KITE_BRIDGE, agent.IND_BRIDGE, agent._session, agent._ind_session = saved
+
+
+# ===========================================================================
 def test_all():
     test_parsing()
     test_authorisation()
@@ -264,6 +360,7 @@ def test_all():
     test_auth_url_capture()
     test_credential_clearing()
     test_bridge_lifecycle()
+    test_unattended_recovery()
     assert not _failures, f"{len(_failures)} check(s) failed:\n" + "\n".join(_failures)
 
 

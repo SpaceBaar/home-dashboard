@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -39,11 +40,20 @@ MCP_AUTH_DIR = Path(os.path.expanduser("~")) / ".mcp-auth"
 
 
 class _StderrTee:
-    """File-like object: logs every line and reports authorisation URLs.
+    """Watches a subprocess's stderr: logs each line, reports sign-in URLs.
 
-    ``stdio_client`` takes an ``errlog`` file object for the subprocess's stderr.
-    Passing one of these keeps the normal diagnostics flowing to the log while
-    letting us notice the one line that actually needs a human.
+    This owns a **real OS pipe**, which is not an implementation detail we can
+    choose. ``stdio_client`` passes its ``errlog`` argument to
+    ``anyio.open_process(stderr=...)``, which hands it to the operating system
+    when spawning the child — so it must be something with a genuine file
+    descriptor. A Python file-like object with a ``write`` method is never
+    consulted and fails at ``fileno()``.
+
+    So: ``open()`` returns the write end for the child to inherit, and a reader
+    thread drains the read end. A thread rather than a task because the fd is a
+    blocking pipe, and because this must keep working while the event loop is
+    busy inside ``session.initialize()`` — which is exactly when the
+    authorisation URL appears.
     """
 
     def __init__(self, label: str, on_auth_url: Optional[Callable[[str], None]] = None):
@@ -52,20 +62,62 @@ class _StderrTee:
         self.lines: List[str] = []
         self._buffer = ""
         self._seen_urls: set = set()
+        self._read_fd: Optional[int] = None
+        self._write_file = None
+        self._thread: Optional[threading.Thread] = None
 
-    def write(self, chunk: str) -> int:
-        if not chunk:
-            return 0
-        self._buffer += chunk
+    def open(self):
+        """Create the pipe and start draining it. Returns the write end."""
+        read_fd, write_fd = os.pipe()
+        self._read_fd = read_fd
+        # Line buffered: the child's stderr reaches us as it is produced, so a
+        # sign-in URL is forwarded while it is still valid.
+        self._write_file = os.fdopen(write_fd, "w", buffering=1, errors="replace")
+        self._thread = threading.Thread(target=self._drain, name=f"{self.label}-stderr",
+                                        daemon=True)
+        self._thread.start()
+        return self._write_file
+
+    def _drain(self) -> None:
+        fd = self._read_fd
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break                       # the fd was closed under us: we are done
+            if not chunk:
+                break                       # EOF: the child exited
+            self._feed(chunk.decode("utf-8", "replace"))
+        self.flush()
+
+    def _feed(self, text: str) -> None:
+        self._buffer += text
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
             self._handle(line)
-        return len(chunk)
 
     def flush(self) -> None:
         if self._buffer:
             self._handle(self._buffer)
             self._buffer = ""
+
+    def close(self) -> None:
+        """Close both ends. Safe to call twice, and on a tee never opened."""
+        if self._write_file is not None:
+            try:
+                self._write_file.close()
+            except OSError:
+                pass
+            self._write_file = None
+        if self._read_fd is not None:
+            try:
+                os.close(self._read_fd)     # unblocks the reader thread
+            except OSError:
+                pass
+            self._read_fd = None
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
     def _handle(self, line: str) -> None:
         line = line.rstrip()
@@ -88,16 +140,6 @@ class _StderrTee:
             except Exception as exc:          # never let a notifier break the bridge
                 log.warning("Could not forward the %s auth URL: %s", self.label, exc)
 
-    # stdio_client only writes; these keep it duck-type complete.
-    def isatty(self) -> bool:
-        return False
-
-    def fileno(self) -> int:
-        raise OSError("not a real file")
-
-    def close(self) -> None:
-        self.flush()
-
 
 class MCPBridge:
     """One ``mcp-remote`` connection that can be stopped and restarted."""
@@ -115,6 +157,7 @@ class MCPBridge:
         self._tee: Optional[_StderrTee] = None
         self._lock: Optional[asyncio.Lock] = None
         self.last_error: Optional[str] = None
+        self.last_log: List[str] = []       # survives the tee, for /status
 
     # -- plumbing ----------------------------------------------------------
     def _get_lock(self) -> asyncio.Lock:
@@ -147,6 +190,7 @@ class MCPBridge:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
 
+            self._close_tee()
             self._tee = _StderrTee(self.name, self.on_auth_url)
             params = StdioServerParameters(
                 command=self.npx_path,
@@ -154,7 +198,7 @@ class MCPBridge:
                 env=dict(os.environ),
             )
             read, write = await stack.enter_async_context(
-                stdio_client(params, errlog=self._tee))
+                stdio_client(params, errlog=self._tee.open()))
             session = await stack.enter_async_context(ClientSession(read, write))
             await asyncio.wait_for(session.initialize(), timeout=self.init_timeout)
         except Exception as exc:
@@ -165,6 +209,7 @@ class MCPBridge:
             except Exception:
                 pass
             self.session, self._stack = None, None
+            self._close_tee()
             return False
 
         self._stack, self.session, self.last_error = stack, session, None
@@ -175,9 +220,23 @@ class MCPBridge:
         async with self._get_lock():
             await self._stop_unlocked()
 
+    def _close_tee(self) -> None:
+        """Release the stderr pipe. Leaking these would exhaust the fd table
+        after enough /login restarts, which is the whole point of this class.
+
+        The captured lines outlive the pipe, because the moment you most want
+        to read them is after a start that failed — and that is precisely when
+        the tee gets torn down.
+        """
+        if self._tee is not None:
+            self._tee.close()
+            self.last_log = list(self._tee.lines)
+            self._tee = None
+
     async def _stop_unlocked(self) -> None:
         self.session = None
         if self._stack is None:
+            self._close_tee()
             return
         try:
             await self._stack.aclose()
@@ -186,6 +245,7 @@ class MCPBridge:
             log.debug("%s bridge teardown raised: %s", self.name, exc)
         finally:
             self._stack = None
+            self._close_tee()
             log.info("%s MCP bridge stopped.", self.name)
 
     async def restart(self) -> bool:
@@ -200,7 +260,9 @@ class MCPBridge:
             return await self._start_unlocked()
 
     def recent_log(self, limit: int = 12) -> List[str]:
-        return list(self._tee.lines[-limit:]) if self._tee else []
+        """The subprocess's last stderr lines, live or from the last attempt."""
+        lines = self._tee.lines if self._tee is not None else self.last_log
+        return list(lines[-limit:])
 
 
 # ===========================================================================

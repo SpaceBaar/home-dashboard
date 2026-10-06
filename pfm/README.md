@@ -652,6 +652,9 @@ portfolio. Root causes and fixes:
 | Overlapping scheduled runs, swallowed exceptions | `asyncio.create_task` with no guard or error handling | Run lock, done-callbacks, Telegram alerts on failure |
 | Config read from the current working directory | Relative `open('config.json')` | All paths resolved from `__file__` |
 | A missing `mcp` install crashed the Telegram listener | `MCPBridge.start()` promised never to raise, but imported `mcp` outside its own try block | The import moved inside the guard, so a broken install is reported like any other start failure |
+| Every connection failing with `not a real file` | The stderr tee was a Python object with a `write()` method. `stdio_client` passes `errlog` to `anyio.open_process(stderr=...)`, which hands it to the OS when spawning the child — so it needs a genuine file descriptor and never calls `write()`. The unit test poked `write()` directly, so it passed while nothing worked | The tee owns a real `os.pipe()` and drains it on a thread. The test now runs an actual subprocess through it, and a separate check asserts repeated open/close cycles leak no descriptors |
+| The daemon crash-looping and spamming Telegram | A failed Kite connection returned `1` from the daemon. systemd restarted it every 15s, re-alerting each time — and each exit killed the Telegram listener, taking `/login` with it, so the documented recovery needed the process that had just died | In daemon mode the failure is reported once and the agent stays up; only the foreground modes still exit non-zero |
+| A bridge that failed at startup stayed down all night | The keepalive skipped any bridge with no session, so it only ever pinged healthy ones | It now reconnects a dead bridge with backoff from one minute to an hour, silently — an unattended agent should not need a human to notice |
 
 ## Verification
 

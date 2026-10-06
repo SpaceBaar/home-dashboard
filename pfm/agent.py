@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -847,17 +848,60 @@ async def listen_for_messages() -> None:
         await asyncio.sleep(1)
 
 
-async def mcp_keepalive() -> None:
-    """Keep the streams warm; Cloudflare drops idle streams after ~100s."""
+async def mcp_keepalive(interval: float = 60.0, max_backoff: float = 3600.0,
+                        clock=time.monotonic) -> None:
+    """Keep the streams warm, and bring a dead bridge back by itself.
+
+    Cloudflare drops idle streams after ~100s, hence the ping. The reconnect
+    half matters more: a bridge that failed at startup would otherwise stay
+    down until someone noticed and sent /login, which rather defeats the point
+    of an unattended overnight agent. Backoff doubles from one minute to an
+    hour so a broker that is genuinely down is not hammered, and a reconnect
+    needs no alert — nobody wants a Telegram message every retry.
+
+    ``interval``, ``max_backoff`` and ``clock`` are injectable so the recovery
+    can be tested in milliseconds rather than hours.
+    """
+    attempt = {"kite": 0, "indmoney": 0}
+    due = {"kite": 0.0, "indmoney": 0.0}
+
     while True:
-        await asyncio.sleep(60)
-        for label, session in (("kite", _session), ("indmoney", _ind_session)):
-            if session is None:
+        await asyncio.sleep(interval)
+        now = clock()
+
+        for label, bridge, global_name in (
+                ("kite", KITE_BRIDGE, "_session"),
+                ("indmoney", IND_BRIDGE, "_ind_session")):
+            session = globals()[global_name]
+
+            if session is not None:
+                try:
+                    await session.list_tools()
+                    attempt[label] = 0
+                    continue
+                except Exception as exc:
+                    log.debug("Keepalive ping to %s failed: %s", label, exc)
+                    continue      # a live-but-stalled stream is the ping's job,
+                                  # not the reconnector's; /login handles it
+
+            # No session at all: this bridge never started, or was stopped.
+            if bridge is None or now < due[label]:
                 continue
+            attempt[label] += 1
+            backoff = min(interval * 2 ** (attempt[label] - 1), max_backoff)
+            due[label] = now + backoff
+            log.info("Trying to reconnect the %s bridge (attempt %d)...",
+                     label, attempt[label])
             try:
-                await session.list_tools()
+                if await bridge.start():
+                    globals()[global_name] = bridge.session
+                    attempt[label] = 0
+                    log.info("The %s bridge is back.", label)
+                else:
+                    log.info("The %s bridge is still down (%s); next try in %.0fs.",
+                             label, bridge.last_error, backoff)
             except Exception as exc:
-                log.debug("Keepalive ping to %s failed: %s", label, exc)
+                log.warning("Reconnecting %s raised: %s", label, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1058,9 +1102,22 @@ async def main_loop(args: argparse.Namespace) -> int:
 
     if not await KITE_BRIDGE.start():
         log.error("Could not open the Kite bridge: %s", KITE_BRIDGE.last_error)
+        for line in KITE_BRIDGE.recent_log(8):
+            log.error("  [kite] %s", line)
+        # A daemon must not exit here. systemd would restart it on a loop, and
+        # each restart re-sends the alert and kills the Telegram listener —
+        # taking /login with it, which is the one thing that could fix this.
+        # So: say it once, carry on, and let the scheduled run or /login
+        # recover. Only the foreground modes, where someone is watching and a
+        # non-zero exit is useful, still fail hard.
+        if not args.daemon:
+            if TG:
+                TG.alert(f"Could not connect to Zerodha Kite: {KITE_BRIDGE.last_error}")
+            return 1
         if TG:
-            TG.alert(f"Could not connect to Zerodha Kite: {KITE_BRIDGE.last_error}")
-        return 1
+            TG.alert(f"Could not connect to Zerodha Kite: {KITE_BRIDGE.last_error}\n"
+                     f"The agent is still running. Send /login for a fresh sign-in "
+                     f"link, or /status to see where it stands.")
     _session = KITE_BRIDGE.session
 
     try:
