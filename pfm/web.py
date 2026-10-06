@@ -37,11 +37,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-from pfm_config import BASE_DIR, REPORT_DIR, load_config, setup_logging
+import goals as goals_mod
+from pfm_config import BASE_DIR, REPORT_DIR, STATE_DIR, load_config, setup_logging
 
 log = logging.getLogger("pfm.web")
 
 STATIC_DIR = BASE_DIR / "static"
+GOALS_FILE = BASE_DIR / "goals.json"                      # written by POST /api/goals
+SNAPSHOT_FILE = STATE_DIR / "networth_snapshot.json"      # written by the agent
+
+# Writing goals is the only non-GET route. Off here would make the page
+# read-only; see web.goals_writable in config.json.
+ALLOW_GOAL_WRITES = True
 
 # Privacy defaults, overridden from config.json in main(). Held module-level so
 # the request handler can reach them without a per-request config read.
@@ -318,7 +325,8 @@ def render_chart(index: List[dict], width: int = 720, height: int = 190) -> str:
 # Page rendering
 # ===========================================================================
 def page(title: str, body: str, *, active_date: Optional[str], index: List[dict],
-         privacy: Optional[dict] = None) -> str:
+         privacy: Optional[dict] = None, goals_active: bool = False,
+         sidebar: bool = True) -> str:
     items = []
     for entry in index:
         classes = ["archive-item"]
@@ -360,20 +368,23 @@ def page(title: str, body: str, *, active_date: Optional[str], index: List[dict]
 <header class="topbar">
   <a class="brand" href="/">Portfolio reports</a>
   <span class="brand-sub">{len(index)} report{"s" if len(index) != 1 else ""} archived</span>
+  <nav class="topnav">
+    <a href="/" class="{'is-here' if not goals_active else ''}">Reports</a>
+    <a href="/goals" class="{'is-here' if goals_active else ''}">Goals</a>
+  </nav>
   <button type="button" id="privacy-toggle" class="privacy-btn"
           aria-pressed="false" title="Hide amounts (p). Hold Shift to peek.">
     <span class="privacy-label">Hide amounts</span>
   </button>
 </header>
 <div id="privacy-flash" class="privacy-flash" role="status" aria-live="polite" hidden></div>
-<div class="layout">
-  <aside class="sidebar">
-    <h2 class="sidebar-title">Archive</h2>
-    <ul class="archive">{archive}</ul>
-  </aside>
+<div class="layout{'' if sidebar else ' layout-wide'}">
+  {'<aside class="sidebar"><h2 class="sidebar-title">Archive</h2>'
+   '<ul class="archive">' + archive + '</ul></aside>' if sidebar else ''}
   <main class="content">{body}</main>
 </div>
 <script src="/static/app.js" defer></script>
+{'<script src="/static/goals.js" defer></script>' if goals_active else ''}
 </body>
 </html>"""
 
@@ -692,6 +703,120 @@ so no restart is needed.</p></section>""", None)
 
 
 # ===========================================================================
+# Goals
+# ===========================================================================
+def load_networth_snapshot() -> dict:
+    """The cross-asset snapshot the agent cached on its last run."""
+    try:
+        return json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def goals_state() -> dict:
+    """Everything the goals page needs, in one object for the browser.
+
+    The page recalculates entirely client-side as you drag a slider, so the
+    server's job is only to hand over the starting figures once.
+    """
+    snapshot = load_networth_snapshot()
+    investments = snapshot.get("investments") or []
+    tiers = goals_mod.build_liquidity(investments)
+
+    loans = []
+    for row in ((snapshot.get("liabilities") or {}).get("loans") or []):
+        if not isinstance(row, dict):
+            continue
+        balance = row.get("current_balance")
+        try:
+            balance = float(balance)
+        except (TypeError, ValueError):
+            continue
+        loans.append({"lender": str(row.get("lender") or "unknown"),
+                      "loan_type": str(row.get("loan_type") or ""),
+                      "current_balance": round(balance, 2)})
+
+    return {
+        "goals": goals_mod.load_goals(GOALS_FILE),
+        "captured_at": snapshot.get("captured_at"),
+        "net_worth": snapshot.get("total_networth"),
+        "liabilities": loans,
+        "tiers": {key: {"label": tier.label, "note": tier.note,
+                        "total": tier.total, "items": tier.items}
+                  for key, tier in tiers.items()},
+    }
+
+
+def json_block(data: object) -> str:
+    """JSON safe to drop inside a ``<script type="application/json">`` element.
+
+    A script element is raw text: the browser does *not* decode HTML entities
+    inside it, so html.escape() would corrupt the payload rather than protect
+    it. The only sequence that can end the element early is ``</``, and the
+    only one some embedders mishandle is ``<!--``. Escaping ``<`` as the JSON
+    escape ``\\u003c`` closes both, and parses back to exactly the same string.
+    """
+    return json.dumps(data).replace("<", "\\u003c")
+
+
+def render_goals_page(state: dict) -> str:
+    """Shell for the goals page. The interesting part is built by goals.js."""
+    captured = state.get("captured_at")
+    freshness = (f"Balances from the run on {html.escape(str(captured)[:16])}"
+                 if captured else
+                 "No net-worth snapshot yet — run the agent once and the "
+                 "affordability figures will fill in.")
+
+    tier_cards = []
+    for key in ("ready", "sellable", "locked"):
+        tier = state["tiers"].get(key) or {}
+        rows = "".join(
+            f'<li><span>{html.escape(str(item["asset_type"]).title())}</span>'
+            f'{amt_text(rupees(item["current_value"]))}</li>'
+            for item in tier.get("items", [])
+        ) or '<li class="empty">Nothing in this band.</li>'
+        tier_cards.append(f"""<div class="tier-card tier-{key}">
+<div class="tier-head"><h3>{html.escape(tier.get("label", key))}</h3>
+{amt_text(rupees(tier.get("total")))}</div>
+<p class="tier-note">{html.escape(tier.get("note", ""))}</p>
+<ul class="tier-items">{rows}</ul></div>""")
+
+    return f"""<div class="page-head">
+<div><h1>Goals</h1><p class="subtle">{freshness}</p></div>
+<button type="button" class="btn" id="goal-new">New goal</button>
+</div>
+
+<section class="card" id="goal-list-card">
+  <h2>Your goals</h2>
+  <div id="goal-list" class="goal-list"></div>
+</section>
+
+<section class="card" id="goal-editor" hidden>
+  <div class="page-head">
+    <h2 id="goal-editor-title">Goal</h2>
+    <div class="editor-actions">
+      <button type="button" class="btn" id="goal-save">Save</button>
+      <button type="button" class="btn" id="goal-delete">Delete</button>
+      <button type="button" class="btn" id="goal-close">Close</button>
+    </div>
+  </div>
+  <p class="subtle" id="goal-saved-note" hidden></p>
+  <div id="goal-form"></div>
+  <div id="goal-result"></div>
+</section>
+
+<section class="card">
+  <h2>What a downpayment could come from</h2>
+  <p class="hint">Grouped by how reachable each holding actually is. Figures are
+  gross: they ignore capital gains tax, exit loads and the price you would
+  actually get on the day.</p>
+  <div class="tier-grid">{"".join(tier_cards)}</div>
+</section>
+
+<script id="goals-state" type="application/json">{json_block(state)}</script>"""
+
+
+# ===========================================================================
 # HTTP handler
 # ===========================================================================
 class Handler(BaseHTTPRequestHandler):
@@ -735,6 +860,113 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self.do_GET()
 
+    # -- the only write route ---------------------------------------------
+    def do_POST(self) -> None:
+        try:
+            self.post_route(unquote(urlparse(self.path).path))
+        except BrokenPipeError:
+            pass
+        except Exception:
+            log.exception("Error handling POST %s", self.path)
+            try:
+                self._json({"error": "internal error"},
+                           HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:
+                pass
+
+    def cross_site_post(self) -> bool:
+        """True if this looks like a POST from some other site's page.
+
+        The server has no login, because it is meant to sit behind the home
+        LAN or the VPN. That makes it worth refusing writes that a page on the
+        open web could trigger in a browser that can reach the Pi. Requiring a
+        JSON content type already forces a CORS preflight, which is never
+        answered here; these two checks close the simple-request loopholes.
+        """
+        site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+        if site and site not in ("same-origin", "same-site", "none"):
+            return True
+        origin = self.headers.get("Origin")
+        if origin:
+            host = self.headers.get("Host") or ""
+            if urlparse(origin).netloc != host:
+                return True
+        return False
+
+    def post_route(self, path: str) -> None:
+        """Save the goal list. Deliberately the one non-GET route here.
+
+        Everything is validated server-side: this endpoint is reachable by
+        anything on the network, not only by the page's own form.
+        """
+        if path != "/api/goals":
+            self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            return
+        if not ALLOW_GOAL_WRITES:
+            self._json({"error": "goal writing is disabled (web.goals_writable)"},
+                       HTTPStatus.FORBIDDEN)
+            return
+        if self.cross_site_post():
+            self._json({"error": "cross-site requests are not accepted"},
+                       HTTPStatus.FORBIDDEN)
+            return
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        if content_type.lower() != "application/json":
+            self._json({"error": "expected Content-Type: application/json"},
+                       HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 512_000:          # a goal list is tiny
+            self._json({"error": "bad or oversized request body"},
+                       HTTPStatus.BAD_REQUEST)
+            return
+
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._json({"error": f"invalid JSON: {exc}"}, HTTPStatus.BAD_REQUEST)
+            return
+
+        incoming = body.get("goals") if isinstance(body, dict) else body
+        if not isinstance(incoming, list):
+            self._json({"error": "expected an object with a 'goals' array"},
+                       HTTPStatus.BAD_REQUEST)
+            return
+        if len(incoming) > 100:
+            self._json({"error": "too many goals"}, HTTPStatus.BAD_REQUEST)
+            return
+
+        cleaned: List[dict] = []
+        errors: List[str] = []
+        for index, raw in enumerate(incoming):
+            goal, problems = goals_mod.validate_goal(raw)
+            if problems:
+                errors.extend(f"goal {index + 1}: {p}" for p in problems)
+                continue
+            if not goal.get("id"):
+                goal["id"] = goals_mod.next_goal_id(cleaned)
+            cleaned.append(goal)
+
+        if errors:
+            self._json({"error": "validation failed", "details": errors},
+                       HTTPStatus.BAD_REQUEST)
+            return
+
+        try:
+            goals_mod.save_goals(GOALS_FILE, cleaned)
+        except OSError as exc:
+            log.error("Could not write %s: %s", GOALS_FILE, exc)
+            self._json({"error": f"could not save: {exc}"},
+                       HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        log.info("Saved %d goal(s) to %s", len(cleaned), GOALS_FILE)
+        self._json({"ok": True, "saved": len(cleaned), "goals": cleaned})
+
     def do_GET(self) -> None:
         path = unquote(urlparse(self.path).path)
         try:
@@ -763,6 +995,16 @@ class Handler(BaseHTTPRequestHandler):
             index = build_index()
             body, active = render_home(index)
             self._html(page("Portfolio reports", body, active_date=active, index=index, privacy=PRIVACY))
+            return
+
+        if path in ("/goals", "/goals/"):
+            self._html(page("Goals", render_goals_page(goals_state()),
+                            active_date=None, index=build_index(),
+                            privacy=PRIVACY, goals_active=True, sidebar=False))
+            return
+
+        if path == "/api/goals":
+            self._json(goals_state())
             return
 
         if path == "/api/reports":
@@ -864,6 +1106,11 @@ def main() -> int:
     web_cfg = cfg.raw.get("web", {}) or {}
     host = args.host or web_cfg.get("host", "0.0.0.0")
     port = args.port or int(web_cfg.get("port", 7373))
+
+    global ALLOW_GOAL_WRITES
+    ALLOW_GOAL_WRITES = bool(web_cfg.get("goals_writable", True))
+    if not ALLOW_GOAL_WRITES:
+        log.info("Goal editing is read-only (web.goals_writable is false).")
 
     configured_privacy = web_cfg.get("privacy") or {}
     PRIVACY.update({k: v for k, v in configured_privacy.items()

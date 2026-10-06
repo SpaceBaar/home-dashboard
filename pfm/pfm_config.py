@@ -68,6 +68,7 @@ DEFAULTS: Dict[str, Any] = {
     "web": {
         "host": "0.0.0.0",
         "port": 7373,
+        "goals_writable": True,
         "privacy": {
             "blur_by_default": False,
             "blur_on_focus_loss": True,

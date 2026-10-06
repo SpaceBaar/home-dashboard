@@ -900,6 +900,21 @@ class IndmoneyProvider(BrokerProvider):
                 return _num(row.get("current_value"))
         return None
 
+    async def networth_snapshot(self) -> Optional[dict]:
+        """The whole cross-asset snapshot, for the goals view.
+
+        Captured once per run and cached to disk, so modelling a purchase does
+        not need a live broker session - the figures only move daily anyway.
+        """
+        try:
+            payload = await self.call("networth_snapshot", {})
+        except AuthRequired:
+            raise
+        except Exception as exc:
+            log.info("networth_snapshot unavailable: %s", exc)
+            return None
+        return payload if isinstance(payload, dict) else None
+
     async def watchlist(self) -> List[str]:
         """Tickers from the user's INDmoney watchlists.
 

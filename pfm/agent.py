@@ -43,7 +43,6 @@ import json
 import logging
 import os
 import sys
-from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -53,7 +52,9 @@ import schedule
 import brokers
 import news as news_mod
 import report as report_mod
+from bridges import MCPBridge, clear_cached_credentials
 from brokers import BOOK_US, AuthRequired, IndmoneyProvider, KiteProvider, ProviderError
+from commands import HELP_TEXT, Command, CommandRouter, is_authorised
 from llm import LLMClient, LLMUnavailable
 from notify import Telegram
 from pfm_config import BASE_DIR, CACHE_DIR, REPORT_DIR, STATE_DIR, load_config, setup_logging
@@ -66,11 +67,14 @@ TG: Optional[Telegram] = None
 LLM: Optional[LLMClient] = None
 _session = None       # Kite mcp.ClientSession; imported lazily so --dry-run needs no MCP install
 _ind_session = None   # INDmoney mcp.ClientSession, or None when the US book is off
+KITE_BRIDGE: Optional[MCPBridge] = None    # restartable, so /login can reconnect
+IND_BRIDGE: Optional[MCPBridge] = None     # restartable, so /indmoney can re-auth
 # Created lazily inside the running loop; a module-level asyncio.Lock() binds to
 # the wrong event loop on Python 3.9 and then fails at the first await.
 _run_lock: Optional[asyncio.Lock] = None
 _OFFSET_FILE = STATE_DIR / "telegram_offset.json"
 _LAST_RUN_FILE = STATE_DIR / "last_run.json"
+_SNAPSHOT_FILE = STATE_DIR / "networth_snapshot.json"   # feeds the goals view
 
 
 class _Skipped:
@@ -418,10 +422,22 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                     if snapshot_fx:
                         log.info("Implied USD/INR %.2f (%s)", snapshot_fx, fx_note)
 
-                    # Cross-check the row sum against INDmoney's own asset-class
-                    # total. The two have been seen to differ by about 1%.
+                    # One snapshot call serves two purposes: cross-checking the US
+                    # total, and giving the goals view something to work from
+                    # without needing a live broker session.
+                    snapshot = await provider.networth_snapshot()
+                    if snapshot:
+                        save_networth_snapshot(snapshot)
+
+                    snapshot_total = None
+                    for entry in (snapshot or {}).get("investments") or []:
+                        if isinstance(entry, dict) and \
+                                str(entry.get("asset_type", "")).upper() == "US_STOCK":
+                            snapshot_total = brokers._num(entry.get("current_value"))
+                            break
+
+                    # The two have been seen to differ by about 1%.
                     row_sum = sum(h.get("current_native") or 0.0 for h in us_rows)
-                    snapshot_total = await provider.snapshot_asset_total("US_STOCK")
                     if snapshot_total and row_sum:
                         gap = snapshot_total - row_sum
                         if abs(gap) > max(1.0, row_sum * 0.005):
@@ -617,25 +633,174 @@ def _save_offset(offset: int) -> None:
         log.warning("Could not persist the Telegram offset: %s", exc)
 
 
-async def listen_for_expenses() -> None:
-    """Log inbound Telegram messages as expenses.
+# ---------------------------------------------------------------------------
+# Telegram commands
+# ---------------------------------------------------------------------------
+async def cmd_login(_: Command) -> str:
+    """Fresh Zerodha login link, but only when one is actually needed."""
+    if KITE_BRIDGE is None or not KITE_BRIDGE.connected:
+        if KITE_BRIDGE is not None:
+            await KITE_BRIDGE.restart()
+            globals()["_session"] = KITE_BRIDGE.session
+        if KITE_BRIDGE is None or not KITE_BRIDGE.connected:
+            return ("The Kite bridge is not connected and could not be restarted.\n"
+                    f"Last error: {getattr(KITE_BRIDGE, 'last_error', 'unknown')}")
+
+    if await probe_session() is not None:
+        return ("Your Zerodha session is still valid — no new link needed.\n"
+                "Send /run if you want the analysis now.")
+
+    try:
+        result = await _session.call_tool("login", arguments={})
+        url = result.content[0].text if result.content else None
+    except Exception as exc:
+        return f"Could not generate a login URL: {exc}"
+
+    if not url:
+        return "Kite returned no login URL. Try /login again in a moment."
+    return (f"Zerodha login link:\n\n{url}\n\n"
+            f"These expire quickly, so open it now. Send /status afterwards to "
+            f"confirm, or /run to start the analysis.")
+
+
+async def cmd_indmoney(command: Command) -> str:
+    """Reconnect the US book, optionally clearing cached credentials first."""
+    if IND_BRIDGE is None:
+        return "The US book is disabled for this run (--no-us or indmoney.enabled=false)."
+
+    force = command.arg in {"force", "-f", "--force", "reauth"}
+    notes: List[str] = []
+
+    if force:
+        removed = clear_cached_credentials(CFG.indmoney_mcp_url)
+        if removed:
+            notes.append(f"Cleared {len(removed)} cached credential file(s): "
+                         + ", ".join(removed))
+        else:
+            notes.append("No cached INDmoney credentials were found to clear.")
+
+    ok = await IND_BRIDGE.restart()
+    globals()["_ind_session"] = IND_BRIDGE.session
+
+    if not ok:
+        notes.append(f"Reconnect failed: {IND_BRIDGE.last_error}")
+        tail = IND_BRIDGE.recent_log(4)
+        if tail:
+            notes.append("Last lines:\n" + "\n".join(tail))
+        if not force:
+            notes.append("If it keeps failing, send: /indmoney force")
+        return "\n\n".join(notes)
+
+    # Connected, but the token may still be stale - prove it with a real call.
+    try:
+        rows, _ = await IndmoneyProvider(IND_BRIDGE.session).holdings()
+        notes.append(f"INDmoney reconnected. {len(rows)} US holding(s) visible.")
+    except AuthRequired:
+        notes.append("INDmoney reconnected but still reports you are not signed in.")
+        if not force:
+            notes.append("Send /indmoney force to clear the cached credentials and "
+                         "start a fresh sign-in.")
+    except Exception as exc:
+        notes.append(f"INDmoney reconnected, but reading holdings failed: {exc}")
+
+    return "\n\n".join(notes)
+
+
+async def cmd_status(_: Command) -> str:
+    """Both broker sessions, the last run, and tonight's plan."""
+    lines = ["Status", ""]
+
+    kite_live = KITE_BRIDGE is not None and KITE_BRIDGE.connected
+    session_ok = await probe_session() is not None if kite_live else False
+    lines.append(f"Zerodha Kite: {'bridge up' if kite_live else 'bridge DOWN'}, "
+                 f"{'session valid' if session_ok else 'needs login (/login)'}")
+
+    if IND_BRIDGE is None:
+        lines.append("INDmoney: disabled for this run")
+    elif IND_BRIDGE.connected:
+        lines.append("INDmoney: bridge up")
+    else:
+        lines.append(f"INDmoney: bridge DOWN ({IND_BRIDGE.last_error}) — /indmoney")
+
+    state = load_state()
+    last, baseline = state.get("last_run") or {}, state.get("baseline") or {}
+    if last:
+        lines += ["", f"Last run: {last.get('status')} on {last.get('date')} "
+                      f"({last.get('weekday')})"]
+    if baseline.get("total_current") is not None:
+        lines.append(f"Baseline value: Rs {float(baseline['total_current']):,.0f} "
+                     f"from {baseline.get('date')}")
+        if baseline.get("report"):
+            lines.append(f"Latest report: {baseline['report']}")
+
+    today = datetime.now().strftime("%A")
+    non_trading = {str(d).lower() for d in (CFG.agent.get("weekend_days") or [])}
+    analysis_time = CFG.agent.get("analysis_time", "23:00")
+    if today.lower() in non_trading:
+        lines += ["", f"Today is {today}: tonight's {analysis_time} run will be "
+                      f"skipped if the portfolio is unchanged. /run overrides."]
+    else:
+        lines += ["", f"Today is {today}: the {analysis_time} run will go ahead."]
+    return "\n".join(lines)
+
+
+async def cmd_run(_: Command) -> str:
+    """Run the analysis now, ignoring the weekend skip."""
+    if _get_run_lock().locked():
+        return "An analysis is already running. I will send the summary when it finishes."
+
+    holdings = await probe_session()
+    if holdings is None:
+        return ("Your Zerodha session has expired, so the run cannot start.\n"
+                "Send /login, complete it, then /run again.")
+
+    async def _go() -> None:
+        try:
+            await run_analysis(holdings, use_llm=True, force=True)
+        except Exception as exc:
+            log.exception("Commanded run failed")
+            if TG:
+                TG.alert(f"The run you requested failed: {exc}")
+
+    asyncio.create_task(_go())
+    return ("Analysis started. This takes around 15 minutes on the Pi; the summary "
+            "will arrive here when it is done.")
+
+
+async def cmd_help(_: Command) -> str:
+    return HELP_TEXT
+
+
+def build_router() -> CommandRouter:
+    router = CommandRouter(CFG.telegram_chat_id)
+    router.register("login", cmd_login, "kite", "zerodha")
+    router.register("indmoney", cmd_indmoney, "us", "ind")
+    router.register("status", cmd_status, "state")
+    router.register("run", cmd_run, "analyse", "analyze")
+    router.register("help", cmd_help, "start", "commands")
+    return router
+
+
+async def listen_for_messages() -> None:
+    """Handle Telegram commands, and log anything else as an expense.
 
     The offset is persisted so a restart does not replay or lose messages, and
-    failures back off instead of spinning silently as the old bare
-    ``except: pass`` loop did.
+    failures back off instead of spinning silently.
     """
     import requests
 
     if not TG or not TG.enabled:
-        log.info("Expense listener disabled (no Telegram credentials).")
+        log.info("Telegram listener disabled (no credentials).")
         return
 
+    router = build_router()
     offset = _load_offset()
     csv_path = BASE_DIR / "daily_expenses.csv"
     if not csv_path.exists():
         csv_path.write_text("timestamp,message\n", encoding="utf-8")
 
-    log.info("Expense listener active (offset %d).", offset)
+    log.info("Telegram listener active (offset %d). Commands: %s",
+             offset, ", ".join("/" + c for c in router.known()))
     backoff = 1
     url = f"https://api.telegram.org/bot{TG.token}/getUpdates"
 
@@ -647,19 +812,35 @@ async def listen_for_expenses() -> None:
             data = resp.json()
             if not data.get("ok"):
                 raise RuntimeError(data.get("description", "getUpdates not ok"))
+
             for result in data.get("result", []):
                 offset = result["update_id"]
                 _save_offset(offset)
-                text = (result.get("message") or {}).get("text", "").strip()
-                if not text or text.startswith("/"):
+                message = result.get("message") or {}
+                text = (message.get("text") or "").strip()
+                chat_id = (message.get("chat") or {}).get("id")
+                if not text:
                     continue
+
+                if text.startswith("/"):
+                    reply = await router.dispatch(text, chat_id)
+                    if reply:
+                        TG.send(reply)
+                    continue
+
+                # Expense logging is restricted to the configured chat too, so a
+                # stranger cannot write lines into your expense file.
+                if not is_authorised(chat_id, CFG.telegram_chat_id):
+                    log.warning("Ignoring a message from unauthorised chat %s.", chat_id)
+                    continue
+
                 with open(csv_path, "a", encoding="utf-8") as fh:
                     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     fh.write(f'{stamp},"{text.replace(chr(34), chr(39))}"\n')
                 TG.send(f"Logged: {text}")
             backoff = 1
         except Exception as exc:
-            log.warning("Expense listener error (%s); retrying in %ds.", exc, backoff)
+            log.warning("Telegram listener error (%s); retrying in %ds.", exc, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
@@ -803,43 +984,40 @@ def _schedule_jobs(loop: asyncio.AbstractEventLoop) -> None:
              f", extra morning link at {morning_time}" if morning_time else "")
 
 
-@asynccontextmanager
-async def _indmoney_session(enabled: bool):
-    """Open the INDmoney MCP session, yielding None if it cannot be established.
+def save_networth_snapshot(snapshot: dict) -> None:
+    """Cache the cross-asset snapshot for the goals view.
 
-    Wrapped in its own context manager so that a failure here - an expired OAuth
-    token, npx trouble, INDmoney down - degrades to an India-only report instead
-    of taking the whole run with it.
+    Only the parts the goals page needs are kept, so a file of personal balances
+    stays as small as it can be.
     """
-    global _ind_session
-    if not enabled:
-        yield None
-        return
-
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-
-    url = CFG.indmoney_mcp_url
-    log.info("Starting the INDmoney MCP bridge (%s)...", url)
-    params = StdioServerParameters(
-        command=CFG.npx_path, args=["-y", "mcp-remote", url], env=dict(os.environ),
-    )
+    record = {
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "total_invested": snapshot.get("total_invested"),
+        "total_current_value": snapshot.get("total_current_value"),
+        "total_networth": snapshot.get("total_networth"),
+        "investments": [row for row in (snapshot.get("investments") or [])
+                        if isinstance(row, dict)],
+        "liabilities": snapshot.get("liabilities") or {},
+    }
     try:
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await asyncio.wait_for(session.initialize(), timeout=180)
-                _ind_session = session
-                log.info("INDmoney MCP connection established.")
-                try:
-                    yield session
-                finally:
-                    _ind_session = None
-    except Exception as exc:
-        log.warning("INDmoney MCP unavailable (%s). Continuing with the India book only. "
-                    "If this is an auth failure, run: python tools/probe_indmoney.py "
-                    "--list-only", exc)
-        _ind_session = None
-        yield None
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _SNAPSHOT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        tmp.replace(_SNAPSHOT_FILE)
+        log.info("Net-worth snapshot cached for the goals view (%d asset classes).",
+                 len(record["investments"]))
+    except OSError as exc:
+        log.warning("Could not cache the net-worth snapshot: %s", exc)
+
+
+def _forward_auth_url(label: str):
+    """Push an OAuth sign-in URL to Telegram instead of burying it in the log."""
+    def handler(url: str) -> None:
+        log.info("%s needs authorisation; sending the link to Telegram.", label)
+        if TG:
+            TG.send(f"{label} needs you to sign in again.\n\n{url}\n\n"
+                    f"Open it, approve, then send /status to confirm.")
+    return handler
 
 
 async def main_loop(args: argparse.Namespace) -> int:
@@ -866,69 +1044,77 @@ async def main_loop(args: argparse.Namespace) -> int:
     if args.dry_run:
         return await dry_run(args.fixture, use_llm, force=args.force)
 
-    # Imported here so that --dry-run works on a machine without the MCP client.
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-
-    log.info("Starting the Zerodha Kite MCP bridge...")
-    # mcp-remote needs the inherited PATH/HOME to find node and its token cache.
-    server_params = StdioServerParameters(
-        command=CFG.npx_path,
-        args=["-y", "mcp-remote", CFG.kite_mcp_url],
-        env=dict(os.environ),
-    )
+    global KITE_BRIDGE, IND_BRIDGE
 
     us_enabled = bool(CFG.raw.get("indmoney", {}).get("enabled", True)) and not args.no_us
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            _session = session
-            log.info("MCP connection established.")
+    # Both bridges are restartable, so a re-login never needs a service restart.
+    KITE_BRIDGE = MCPBridge("Zerodha Kite", CFG.kite_mcp_url,
+                            npx_path=CFG.npx_path,
+                            on_auth_url=_forward_auth_url("Zerodha Kite"))
+    IND_BRIDGE = MCPBridge("INDmoney", CFG.indmoney_mcp_url,
+                           npx_path=CFG.npx_path,
+                           on_auth_url=_forward_auth_url("INDmoney"))
 
-            healthy = await preflight(use_llm=use_llm)
-            if args.preflight:
-                return 0 if healthy else 1
-            if not healthy and use_llm:
-                log.warning("Preflight failed; continuing with the LLM disabled so the "
-                            "deterministic report is still produced.")
-                use_llm = False
+    if not await KITE_BRIDGE.start():
+        log.error("Could not open the Kite bridge: %s", KITE_BRIDGE.last_error)
+        if TG:
+            TG.alert(f"Could not connect to Zerodha Kite: {KITE_BRIDGE.last_error}")
+        return 1
+    _session = KITE_BRIDGE.session
 
-            # The US book rides alongside the India book. If this session cannot
-            # be opened the context manager yields None and the run continues.
-            async with _indmoney_session(us_enabled):
-                if args.once:
+    try:
+        healthy = await preflight(use_llm=use_llm)
+        if args.preflight:
+            return 0 if healthy else 1
+        if not healthy and use_llm:
+            log.warning("Preflight failed; continuing with the LLM disabled so the "
+                        "deterministic report is still produced.")
+            use_llm = False
+
+        # The US book rides alongside the India book. A failure here degrades to
+        # an India-only report rather than taking the run with it.
+        if us_enabled and not await IND_BRIDGE.start():
+            log.warning("INDmoney unavailable (%s); continuing with the India book "
+                        "only. Send /indmoney to retry.", IND_BRIDGE.last_error)
+        _ind_session = IND_BRIDGE.session if us_enabled else None
+
+        if args.once:
+            holdings = await probe_session()
+            if holdings is None:
+                await send_login_link()
+                log.error("No valid session. Log in via the Telegram link and re-run.")
+                return 1
+            result = await run_analysis(holdings, use_llm=use_llm, force=args.force)
+            return 0 if result else 1
+
+        if not args.daemon:
+            answer = input("Run an on-demand analysis now? (y/n): ").strip().lower()
+            if answer == "y":
+                holdings = await probe_session()
+                if holdings is None:
+                    log.info("Session expired — sending a fresh login link.")
+                    await send_login_link()
+                    input("Press Enter here once you have completed the Telegram login... ")
                     holdings = await probe_session()
-                    if holdings is None:
-                        await send_login_link()
-                        log.error("No valid session. Log in via the Telegram link and re-run.")
-                        return 1
-                    result = await run_analysis(holdings, use_llm=use_llm,
-                                                force=args.force)
-                    return 0 if result else 1
+                if holdings is None:
+                    log.error("Still no valid session; skipping the on-demand run.")
+                else:
+                    await run_analysis(holdings, use_llm=use_llm, force=True)
 
-                if not args.daemon:
-                    answer = input("Run an on-demand analysis now? (y/n): ").strip().lower()
-                    if answer == "y":
-                        holdings = await probe_session()
-                        if holdings is None:
-                            log.info("Session expired — sending a fresh login link.")
-                            await send_login_link()
-                            input("Press Enter here once you have completed the Telegram login... ")
-                            holdings = await probe_session()
-                        if holdings is None:
-                            log.error("Still no valid session; skipping the on-demand run.")
-                        else:
-                            await run_analysis(holdings, use_llm=use_llm, force=True)
+        _schedule_jobs(asyncio.get_running_loop())
+        asyncio.create_task(listen_for_messages())
+        asyncio.create_task(mcp_keepalive())
 
-                _schedule_jobs(asyncio.get_running_loop())
-                asyncio.create_task(listen_for_expenses())
-                asyncio.create_task(mcp_keepalive())
-
-                log.info("Agent running. Ctrl+C to exit.")
-                while True:
-                    schedule.run_pending()
-                    await asyncio.sleep(1)
+        log.info("Agent running. Ctrl+C to exit. Send /help on Telegram for commands.")
+        if TG:
+            TG.send("Agent started. Send /help for commands.")
+        while True:
+            schedule.run_pending()
+            await asyncio.sleep(1)
+    finally:
+        await IND_BRIDGE.stop()
+        await KITE_BRIDGE.stop()
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:

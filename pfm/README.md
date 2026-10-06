@@ -67,11 +67,16 @@ so the browser and the report can never disagree.
 | `llm.py` | hailo-ollama client, preflight, tiered score parser, score cache |
 | `report.py` | Fact sheet → markdown, narrative validation, fallback template |
 | `notify.py` | Telegram with chunking, retries and token redaction |
-| `web.py` | Standalone read-only report browser (own process, own port) |
-| `static/` | Stylesheet and table-sorting script for the web view |
+| `bridges.py` | Restartable MCP connections; forwards OAuth sign-in URLs to Telegram |
+| `commands.py` | Telegram command parsing, chat-ID authorisation and routing |
+| `goals.py` | Amortisation, prepayment modelling, liquidity tiers, goal storage |
+| `web.py` | Standalone report browser and the goals page (own process, own port) |
+| `static/` | Stylesheet, table sorting, and the browser-side goals calculator |
 | `tests/test_pipeline.py` | Full offline harness — no Pi, no model, no network |
 | `tests/test_web.py` | Offline tests for the web view, including live HTTP routes |
 | `tests/test_us_book.py` | INDmoney normalisation, multi-currency math, US news |
+| `tests/test_commands.py` | Telegram commands, authorisation, auth-URL capture |
+| `tests/test_goals.py` | Amortisation against the spreadsheet, affordability, browser parity |
 | `tools/probe_indmoney.py` | Capture INDmoney's real response shapes |
 | `tools/probe_llm.py` | On-Pi diagnosis of the runtime and the scoring prompt |
 | `tools/check_telegram.py` | Credential check |
@@ -108,6 +113,43 @@ Controlled by `agent_settings`:
 
 `login_lead_minutes` is subtracted from `analysis_time` and wraps correctly over
 midnight, so an analysis at `00:10` prompts at `23:55` the previous evening.
+
+### Telegram commands
+
+The login link expires faster than you can always get to it, so the bot takes
+commands. **Only the chat in `TELEGRAM_CHAT_ID` is obeyed** — the bot token is a
+bearer credential, and these commands start real work and hand out sign-in links.
+Anything from another chat is logged and silently ignored, including expense
+messages, so a stranger cannot write lines into your expense file either.
+
+| Command | What it does |
+| --- | --- |
+| `/login` | Probes the Kite session first. Sends a fresh link only if it has actually expired, so you never get a pointless one. Aliases: `/kite`, `/zerodha` |
+| `/indmoney` | Reconnects the US book. Aliases: `/us`, `/ind` |
+| `/indmoney force` | Also clears the cached INDmoney credentials first, forcing a full OAuth sign-in |
+| `/status` | Both broker sessions, the last run, and whether tonight's run will go ahead or be skipped |
+| `/run` | Runs the analysis now, ignoring the weekend skip. Returns immediately; the summary arrives when it finishes |
+| `/help` | The list above |
+
+Anything that is not a command is still logged as an expense, as before.
+
+**Sign-in URLs now reach you.** `mcp-remote` prints
+`Please authorize this client by visiting: <url>` to stderr, which on a headless
+Pi means journalctl — useless if nobody is tailing it. Both bridges tee that
+stream and forward any authorisation URL straight to Telegram.
+
+**Both bridges are restartable.** The MCP connections used to live inside nested
+`async with` blocks in the main loop, so reconnecting meant restarting the
+service. They now sit in an `AsyncExitStack` that can be unwound and rebuilt,
+which is what makes an on-request re-login possible at all. A restart takes the
+bridge's lock, so a scheduled run cannot catch a half-open session.
+
+**`/indmoney force` is deliberately cautious.** `mcp-remote` names its cached
+files by a hash of the server URL, which is not reproducible from here, so the
+files are identified by their *contents* mentioning the host — your Kite token
+can never be caught in the sweep. They are moved to `~/.mcp-auth/_pfm_cleared/`
+rather than deleted, so a wrong match is recoverable, and the reply names every
+file that moved.
 
 ### Non-trading days
 
@@ -172,6 +214,7 @@ python agent.py --daemon           # service mode (systemd)
 python tests/test_pipeline.py      # full offline test harness
 python tests/test_web.py           # offline tests for the web view
 python tests/test_us_book.py       # INDmoney normalisation and multi-currency math
+python tests/test_commands.py      # Telegram commands and bridge restart
 python tools/probe_llm.py          # why is the model not scoring?
 python tools/probe_indmoney.py     # what does INDmoney actually return?
 ```
@@ -414,7 +457,87 @@ python web.py --once /        # render one route to stdout, for debugging
 | `/raw/<date>.md` | The markdown source |
 | `/api/reports` | JSON index of every report |
 | `/api/reports/<date>` | The full structured payload |
+| `/goals` | Loan payoff and purchase planning (see below) |
+| `/api/goals` | `GET` the goals and liquidity tiers; `POST` saves the goal list |
 | `/healthz` | Liveness probe |
+
+## Goals
+
+Two questions, one page at `/goals`:
+
+- **Pay something off.** What does four extra EMIs a year, or a 10% annual EMI
+  hike, or a lump sum actually buy you in months and rupees?
+- **Buy something.** What could you put down today without borrowing, and how
+  much is left to finance?
+
+### The loan model
+
+`goals.py` builds the amortisation schedule month by month, and the rule is
+small enough to state in full:
+
+```
+interest  = balance × rate ÷ 12
+principal = EMI − interest
+every 12th month:  balance −= EMI × extra_emis;  EMI ×= 1 + hike
+```
+
+This was modelled on an EMI prepayment spreadsheet, and reproduces it exactly —
+`tests/test_goals.py` asserts the figures against it. One divergence is
+deliberate and documented in `goals.py`: the sheet's `E14` subtracts the
+month-12 prepayment back in month 2, while every later row correctly uses the
+previous row's. That is a copy error in the sheet rather than a rule, so the
+code does the intended thing and the test encodes the corrected totals.
+
+Guard rails, because a loan calculator that silently lies is worse than none:
+
+- An EMI that does not cover the first month's interest produces a warning and
+  no schedule, rather than a balance that quietly never falls.
+- The schedule stops at 600 months and says so, rather than looping.
+- A lump sum larger than the balance only counts the balance as prepaid.
+- Rates are decimal fractions throughout (`0.074`, not `7.4`), validated
+  server-side, so an EMI slider cannot be made to model a 740% loan.
+
+The page recalculates in the browser as you drag a slider, so there is no
+round trip and no spinner. That means the model exists twice — `goals.py` and
+`static/goals.js` — which is a real risk, so `test_js_parity()` runs the
+JavaScript copy under `node` across six scenarios and fails if the two disagree
+by a single month or a single rupee. If `node` is not installed the check skips
+rather than passing silently.
+
+### What a downpayment could come from
+
+Holdings from the last agent run are grouped by how reachable they actually
+are, taken from `state/networth_snapshot.json`:
+
+| Tier | Contains | Meaning |
+| --- | --- | --- |
+| Ready | Savings, US wallet cash | Spendable now |
+| Sellable | Stocks, mutual funds, gold | Reachable in days, at a price and a tax cost |
+| Locked | PPF, EPF, NPS | Lock-ins and withdrawal rules apply |
+
+Classification is by `asset_type` alone and **fails closed**: an asset type
+nobody has taught it about lands in Locked, never in spendable money. A new
+INDmoney instrument category can therefore never silently inflate what the page
+says you can afford.
+
+The figures are gross. They ignore capital gains tax, exit loads and whatever
+price the market offers on the day — the page says so on screen rather than
+only here.
+
+### Writing
+
+`/goals` is the only part of the web view that writes anything, and it writes
+one file, `goals.json`. Everything posted is re-validated server-side with the
+same rules as the page, because the endpoint is reachable by anything on the
+network, not only by the form. Cross-site POSTs are refused, and a JSON content
+type is required so a plain HTML form cannot reach it either. Set
+`web.goals_writable` to `false` in `config.json` to make the whole site
+read-only again.
+
+The snapshot the tiers are built from is written by the agent at the end of each
+run. Before the first run the page still works — you can model any loan by
+typing the numbers in — the affordability figures are simply zero, and the page
+tells you why.
 
 ### Hiding amounts
 
@@ -520,6 +643,7 @@ portfolio. Root causes and fixes:
 | Bot token written to `journalctl` | Exception text contains the request URL | Redacted before logging |
 | Overlapping scheduled runs, swallowed exceptions | `asyncio.create_task` with no guard or error handling | Run lock, done-callbacks, Telegram alerts on failure |
 | Config read from the current working directory | Relative `open('config.json')` | All paths resolved from `__file__` |
+| A missing `mcp` install crashed the Telegram listener | `MCPBridge.start()` promised never to raise, but imported `mcp` outside its own try block | The import moved inside the guard, so a broken install is reported like any other start failure |
 
 ## Verification
 
@@ -539,8 +663,19 @@ strings and unknown cost bases; USD/INR sanity rejection; the guarantee that a
 dollar figure is never added to a rupee total; and sentiment-disagreement
 flagging.
 
-All three suites need no Pi, no model, no broker and no network:
+`tests/test_commands.py` covers Telegram command parsing, chat-ID
+authorisation (fail-closed when no chat is configured), and the capture of an
+OAuth sign-in URL out of `mcp-remote`'s stderr.
+
+`tests/test_goals.py` checks the amortisation against the spreadsheet figures
+above, the edges (an EMI below the first month's interest, a loan that never
+clears, an interest-free loan, a lump sum larger than the balance), liquidity
+classification failing closed, goal validation and atomic storage, the script
+escaping of the state the page embeds, and finally that the browser's copy of
+the model agrees with the Python one.
+
+Every suite needs no Pi, no model, no broker and no network:
 
 ```bash
-python tests/test_pipeline.py && python tests/test_web.py && python tests/test_us_book.py
+for t in tests/test_*.py; do python "$t" || break; done
 ```

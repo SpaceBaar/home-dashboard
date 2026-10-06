@@ -51,6 +51,8 @@
   "web": {
     "host": "0.0.0.0",
     "port": 7373,
+    "goals_writable": true,
+    "_goals_note": "The goals page is the one place the web view writes anything (goals.json). Set this to false to make the whole site read-only.",
     "_note": "Read-only report browser (pfm/web.py). Its own process and port, entirely separate from the Node home-dashboard app. Bind to 0.0.0.0 so it is reachable over the LAN and VPN; do not expose it to the public internet.",
     "privacy": {
       "blur_by_default": false,
