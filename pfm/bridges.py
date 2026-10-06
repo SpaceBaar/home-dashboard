@@ -153,10 +153,16 @@ class MCPBridge:
 
     def __init__(self, name: str, url: str, *, npx_path: str = "npx",
                  on_auth_url: Optional[Callable[[str], None]] = None,
-                 init_timeout: float = 180.0):
+                 init_timeout: float = 180.0, auth_timeout: int = 300):
         self.name = name
         self.url = url
         self.npx_path = npx_path
+        # mcp-remote gives you 30 seconds to complete a sign-in by default.
+        # That assumes a browser on the same machine. Here the link goes to
+        # Telegram, you approve it on a phone, and then paste the callback
+        # address back — 30 seconds is not survivable, so the window is
+        # widened to something a human can actually meet.
+        self.auth_timeout = auth_timeout
         self.on_auth_url = on_auth_url
         self.init_timeout = init_timeout
         self.session = None
@@ -202,7 +208,8 @@ class MCPBridge:
             self._tee = _StderrTee(self.name, self.on_auth_url)
             params = StdioServerParameters(
                 command=self.npx_path,
-                args=["-y", "mcp-remote", self.url],
+                args=["-y", "mcp-remote", self.url,
+                      "--auth-timeout", str(int(self.auth_timeout))],
                 env=dict(os.environ),
             )
             read, write = await stack.enter_async_context(

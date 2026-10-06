@@ -166,6 +166,14 @@ become a way to make the Pi fetch arbitrary URLs.
 If you approve the link in a browser on the Pi itself, none of this applies:
 the callback reaches the server directly and `/status` will show the session.
 
+Two things had to change before `/code` could work at all. `mcp-remote` allows
+30 seconds for a sign-in, which is fine for a browser on the same machine and
+hopeless for a phone round-trip — `agent_settings.mcp_auth_timeout_seconds`
+(default 300) is passed as `--auth-timeout`. And commands used to be awaited
+inline in the polling loop, so a reconnect blocked the poller for up to three
+minutes and `/code` was queued behind the sign-in it was meant to rescue. They
+now run as tasks, one instance of each at a time.
+
 **Both bridges are restartable.** The MCP connections used to live inside nested
 `async with` blocks in the main loop, so reconnecting meant restarting the
 service. They now sit in an `AsyncExitStack` that can be unwound and rebuilt,
@@ -682,6 +690,8 @@ portfolio. Root causes and fixes:
 | Every connection failing with `not a real file` | The stderr tee was a Python object with a `write()` method. `stdio_client` passes `errlog` to `anyio.open_process(stderr=...)`, which hands it to the OS when spawning the child — so it needs a genuine file descriptor and never calls `write()`. The unit test poked `write()` directly, so it passed while nothing worked | The tee owns a real `os.pipe()` and drains it on a thread. The test now runs an actual subprocess through it, and a separate check asserts repeated open/close cycles leak no descriptors |
 | The daemon crash-looping and spamming Telegram | A failed Kite connection returned `1` from the daemon. systemd restarted it every 15s, re-alerting each time — and each exit killed the Telegram listener, taking `/login` with it, so the documented recovery needed the process that had just died | In daemon mode the failure is reported once and the agent stays up; only the foreground modes still exit non-zero |
 | A bridge that failed at startup stayed down all night | The keepalive skipped any bridge with no session, so it only ever pinged healthy ones | It now reconnects a dead bridge with backoff from one minute to an hour, silently — an unattended agent should not need a human to notice |
+| `/code` could never arrive in time | Commands were awaited inline in the polling loop, so a reconnect — up to three minutes — stopped the poller fetching anything. The `/code` that would have rescued the pending sign-in sat undelivered on Telegram's servers until the reconnect had already given up: the rescue was queued behind the thing it was rescuing | Commands run as tasks. One instance of each at a time, so an impatient second `/indmoney` cannot race the first |
+| A sign-in expiring before you could finish it | `mcp-remote` allows 30 seconds, which assumes a browser on the same machine. Opening the link on a phone, approving, copying the address and pasting it back does not fit in 30 seconds | `--auth-timeout` is set from `agent_settings.mcp_auth_timeout_seconds`, default 300 |
 
 ## Verification
 

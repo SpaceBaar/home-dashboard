@@ -850,6 +850,47 @@ def build_router() -> CommandRouter:
     return router
 
 
+def _spawn_command(router: CommandRouter, text: str, chat_id, in_flight: dict) -> None:
+    """Run one command without blocking the message poller.
+
+    This used to be awaited inline, which deadlocked the thing it was built
+    for: reconnecting a bridge takes up to three minutes, and while it ran the
+    poller never fetched another message — so the /code that would have
+    rescued the pending sign-in sat undelivered on Telegram's servers until
+    the reconnect had already given up. Commands now run as tasks, so a slow
+    one cannot gag the rest.
+
+    One instance of each command at a time, because the slow ones spawn npx
+    subprocesses and an impatient second /indmoney should not start a race
+    with the first.
+    """
+    name = text.lstrip("/").split()[0].split("@")[0].lower() if text.strip("/ ") else ""
+    existing = in_flight.get(name)
+    if existing is not None and not existing.done():
+        if TG:
+            TG.send(f"/{name} is already running. Give it a moment.")
+        return
+
+    async def run() -> None:
+        try:
+            reply = await router.dispatch(text, chat_id)
+        except Exception as exc:
+            log.exception("Command %r failed", text)
+            reply = f"That command failed: {exc}"
+        if reply and TG:
+            # Sending is blocking I/O; off the loop so a slow Telegram call
+            # cannot stall the poller either.
+            try:
+                await asyncio.to_thread(TG.send, reply)
+            except Exception as exc:
+                log.warning("Could not send the reply to %r: %s", text, exc)
+
+    task = asyncio.create_task(run())
+    in_flight[name] = task
+    task.add_done_callback(lambda t: in_flight.pop(name, None)
+                           if in_flight.get(name) is t else None)
+
+
 async def listen_for_messages() -> None:
     """Handle Telegram commands, and log anything else as an expense.
 
@@ -864,6 +905,7 @@ async def listen_for_messages() -> None:
 
     router = build_router()
     offset = _load_offset()
+    in_flight: dict = {}
     csv_path = BASE_DIR / "daily_expenses.csv"
     if not csv_path.exists():
         csv_path.write_text("timestamp,message\n", encoding="utf-8")
@@ -892,9 +934,7 @@ async def listen_for_messages() -> None:
                     continue
 
                 if text.startswith("/"):
-                    reply = await router.dispatch(text, chat_id)
-                    if reply:
-                        TG.send(reply)
+                    _spawn_command(router, text, chat_id, in_flight)
                     continue
 
                 # Expense logging is restricted to the configured chat too, so a
@@ -1169,9 +1209,11 @@ async def main_loop(args: argparse.Namespace) -> int:
     # Both bridges are restartable, so a re-login never needs a service restart.
     KITE_BRIDGE = MCPBridge("Zerodha Kite", CFG.kite_mcp_url,
                             npx_path=CFG.npx_path,
+                            auth_timeout=CFG.mcp_auth_timeout,
                             on_auth_url=_forward_auth_url("Zerodha Kite"))
     IND_BRIDGE = MCPBridge("INDmoney", CFG.indmoney_mcp_url,
                            npx_path=CFG.npx_path,
+                           auth_timeout=CFG.mcp_auth_timeout,
                            on_auth_url=_forward_auth_url("INDmoney"))
 
     if not await KITE_BRIDGE.start():

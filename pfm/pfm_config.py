@@ -48,6 +48,10 @@ DEFAULTS: Dict[str, Any] = {
         "notify_on_skip": True,
         "storage_backend": "markdown",
         "cloud_api_endpoint": None,
+        # How long mcp-remote waits for you to finish an OAuth sign-in. Its own
+        # default is 30 seconds, which assumes a browser on the same machine;
+        # here the link goes to Telegram and the callback comes back via /code.
+        "mcp_auth_timeout_seconds": 300,
     },
     "llm": {
         "host": "http://127.0.0.1:8000",
@@ -174,6 +178,16 @@ class Config:
     @property
     def npx_path(self) -> str:
         return os.getenv("NPX_PATH", "npx")
+
+    @property
+    def mcp_auth_timeout(self) -> int:
+        raw = (self.raw.get("agent_settings", {}) or {}).get(
+            "mcp_auth_timeout_seconds", 300)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 300
+        return value if value > 0 else 300
 
     @property
     def kite_mcp_url(self) -> str:

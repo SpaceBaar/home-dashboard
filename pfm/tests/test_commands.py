@@ -384,7 +384,71 @@ def test_auth_code_relay() -> None:
 
 
 # ===========================================================================
-# 8. Unattended recovery
+# 8. A slow command must not gag the rest
+# ===========================================================================
+def test_commands_do_not_block_each_other() -> None:
+    section("A slow command cannot hold up the one that would rescue it")
+
+    import agent                                            # noqa: E402
+
+    sent: List[tuple] = []
+    start = time.time()
+
+    class _FakeTG:
+        enabled = True
+
+        def send(self, message):
+            sent.append((time.time() - start, message))
+
+    saved_tg = agent.TG
+    agent.TG = _FakeTG()
+    try:
+        router = cmd.CommandRouter("1")
+
+        async def slow(_):
+            await asyncio.sleep(1.0)     # stands in for a bridge restart
+            return "indmoney: finished"
+
+        async def quick(_):
+            return "code: delivered"
+
+        async def broken(_):
+            raise RuntimeError("npx vanished")
+
+        router.register("indmoney", slow)
+        router.register("code", quick)
+        router.register("boom", broken)
+
+        async def drive():
+            in_flight: dict = {}
+            agent._spawn_command(router, "/indmoney", "1", in_flight)
+            await asyncio.sleep(0.05)
+            agent._spawn_command(router, "/code http://localhost:1/cb?code=X",
+                                 "1", in_flight)
+            await asyncio.sleep(0.05)
+            agent._spawn_command(router, "/indmoney", "1", in_flight)   # duplicate
+            agent._spawn_command(router, "/boom", "1", in_flight)
+            await asyncio.sleep(2.0)
+            return in_flight
+
+        in_flight = asyncio.run(drive())
+
+        replies = {m.split(":")[0]: t for t, m in sent}
+        check("code" in replies, "/code ran at all while the slow one was going")
+        check("code" in replies and "indmoney" in replies
+              and replies["code"] < replies["indmoney"],
+              "and answered first — it is not queued behind the reconnect")
+        check(any("already running" in m for _, m in sent),
+              "a duplicate of a running command is refused, not raced")
+        check(any("npx vanished" in m for _, m in sent),
+              "a handler that raises reports the error instead of dying silently")
+        check(not in_flight, "finished commands are not left in the in-flight map")
+    finally:
+        agent.TG = saved_tg
+
+
+# ===========================================================================
+# 9. Unattended recovery
 # ===========================================================================
 class _FlakyBridge:
     def __init__(self, fail_times: int):
@@ -444,6 +508,7 @@ def test_all():
     test_credential_clearing()
     test_bridge_lifecycle()
     test_auth_code_relay()
+    test_commands_do_not_block_each_other()
     test_unattended_recovery()
     assert not _failures, f"{len(_failures)} check(s) failed:\n" + "\n".join(_failures)
 
