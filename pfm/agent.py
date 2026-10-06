@@ -714,13 +714,22 @@ async def cmd_status(_: Command) -> str:
 
     kite_live = KITE_BRIDGE is not None and KITE_BRIDGE.connected
     session_ok = await probe_session() is not None if kite_live else False
-    lines.append(f"Zerodha Kite: {'bridge up' if kite_live else 'bridge DOWN'}, "
-                 f"{'session valid' if session_ok else 'needs login (/login)'}")
+    if kite_live:
+        lines.append(f"Zerodha Kite: bridge up, "
+                     f"{'session valid' if session_ok else 'needs login (/login)'}")
+    elif KITE_BRIDGE is not None and KITE_BRIDGE.awaiting_auth:
+        lines.append("Zerodha Kite: waiting for you to finish the sign-in. "
+                     "Approve the link, then send /code with the address.")
+    else:
+        lines.append("Zerodha Kite: bridge DOWN — /login")
 
     if IND_BRIDGE is None:
         lines.append("INDmoney: disabled for this run")
     elif IND_BRIDGE.connected:
         lines.append("INDmoney: bridge up")
+    elif IND_BRIDGE.awaiting_auth:
+        lines.append("INDmoney: waiting for you to finish the sign-in. "
+                     "Approve the link, then send /code with the address.")
     else:
         lines.append(f"INDmoney: bridge DOWN ({IND_BRIDGE.last_error}) — /indmoney")
 
@@ -777,7 +786,7 @@ async def cmd_code(command: Command) -> str:
     and it refuses to connect. The code is still in that failed page's address
     bar, though, and this relays it from the machine that can actually use it.
     """
-    pasted = command.arg.strip()
+    pasted = command.text.strip()
     if not pasted:
         return ("Send the address of the page that refused to connect, like:\n"
                 "/code http://localhost:3335/oauth/callback?code=...&state=...\n\n"
@@ -798,18 +807,25 @@ async def cmd_code(command: Command) -> str:
         return ("Neither bridge is waiting for a sign-in right now. Send /login "
                 "or /indmoney to start one, then send me the code.")
 
-    chosen = None
-    if parsed.get("state"):
-        chosen = next((c for c in candidates
-                       if c[1].pending_auth.get("state") == parsed["state"]), None)
-        if chosen is None and len(candidates) > 1:
-            return ("That code does not match either sign-in in progress. It may "
-                    "be from an older link — send /login or /indmoney for a fresh "
-                    "one.")
-    if chosen is None:
-        chosen = candidates[0]
+    # The state must match the sign-in that is actually waiting. This is not a
+    # nicety: mcp-remote picks its callback port deterministically, so when one
+    # attempt dies and another starts, the new process listens on the very port
+    # the old link pointed at. Delivering a stale code there hands it to a
+    # process expecting a different sign-in, which discards it and requests a
+    # fresh one — while the callback server, which answers any GET with
+    # "Authorization successful!", makes it look as though it worked.
+    matches = [c for c in candidates
+               if c[1].pending_auth.get("state") == parsed.get("state")]
+    if not matches:
+        waiting = ", ".join(name for name, _ in candidates)
+        return (f"That code belongs to an older sign-in, so I have not sent it — "
+                f"delivering it would have been handed to the wrong attempt and "
+                f"silently discarded.\n\n"
+                f"Waiting now: {waiting}. Use the most recent link, approve it, "
+                f"and send that address. If in doubt, start again with /indmoney "
+                f"or /login.")
 
-    name, bridge = chosen
+    name, bridge = matches[0]
     pending = bridge.pending_auth
     ok, detail = await asyncio.get_running_loop().run_in_executor(
         None, bridges.deliver_auth_code,
@@ -818,21 +834,32 @@ async def cmd_code(command: Command) -> str:
     if not ok:
         return f"{name}: {detail}"
 
-    # The handshake completes asynchronously inside mcp-remote; give it a
-    # moment, then report what actually happened rather than assuming.
-    await asyncio.sleep(3)
+    # Delivery only means the callback accepted the GET. Whether the handshake
+    # actually succeeded is a separate question, and the honest answer takes a
+    # few seconds — so wait for a real signal rather than guessing.
+    connected = await _await_bridge(bridge, timeout=60.0)
     if name == "Zerodha Kite":
         globals()["_session"] = KITE_BRIDGE.session
-        live = await probe_session() is not None
-        return (f"{name}: {detail} The session is live — send /run for the "
-                f"analysis." if live else
-                f"{name}: {detail} The session is not live yet; give it a few "
-                f"seconds and send /status.")
+        if connected and await probe_session() is not None:
+            return f"{name} is signed in. Send /run for the analysis."
+        return (f"{name}: the code was delivered but the session has not come up. "
+                f"Send /status in a minute, or /login for a fresh link.")
+
     globals()["_ind_session"] = IND_BRIDGE.session
-    return (f"{name}: {detail} Send /status to confirm the US book is back."
-            if IND_BRIDGE.connected else
-            f"{name}: {detail} The bridge is still connecting — send /status "
-            f"shortly, or /indmoney to retry.")
+    if connected:
+        return f"{name} is signed in. The US book is back."
+    return (f"{name}: the code was delivered but the bridge has not come up. "
+            f"Send /status in a minute, or /indmoney force for a clean sign-in.")
+
+
+async def _await_bridge(bridge, timeout: float = 60.0) -> bool:
+    """Wait for a bridge to finish connecting, rather than assuming it did."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if bridge.connected:
+            return True
+        await asyncio.sleep(1.0)
+    return bridge.connected
 
 
 async def cmd_help(_: Command) -> str:
@@ -980,36 +1007,59 @@ async def mcp_keepalive(interval: float = 60.0, max_backoff: float = 3600.0,
         for label, bridge, global_name in (
                 ("kite", KITE_BRIDGE, "_session"),
                 ("indmoney", IND_BRIDGE, "_ind_session")):
-            session = globals()[global_name]
-
-            if session is not None:
-                try:
-                    await session.list_tools()
-                    attempt[label] = 0
-                    continue
-                except Exception as exc:
-                    log.debug("Keepalive ping to %s failed: %s", label, exc)
-                    continue      # a live-but-stalled stream is the ping's job,
-                                  # not the reconnector's; /login handles it
-
-            # No session at all: this bridge never started, or was stopped.
-            if bridge is None or now < due[label]:
-                continue
-            attempt[label] += 1
-            backoff = min(interval * 2 ** (attempt[label] - 1), max_backoff)
-            due[label] = now + backoff
-            log.info("Trying to reconnect the %s bridge (attempt %d)...",
-                     label, attempt[label])
+            # One bridge misbehaving must not kill the loop. This task is the
+            # only thing that brings a dead connection back on its own, so if
+            # it dies the agent looks healthy while quietly never recovering.
             try:
-                if await bridge.start():
-                    globals()[global_name] = bridge.session
-                    attempt[label] = 0
-                    log.info("The %s bridge is back.", label)
-                else:
-                    log.info("The %s bridge is still down (%s); next try in %.0fs.",
-                             label, bridge.last_error, backoff)
-            except Exception as exc:
-                log.warning("Reconnecting %s raised: %s", label, exc)
+                await _keepalive_once(label, bridge, global_name,
+                                      attempt, due, now, interval, max_backoff)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Keepalive for %s raised; continuing.", label)
+
+
+async def _keepalive_once(label, bridge, global_name, attempt, due, now,
+                          interval, max_backoff) -> None:
+    """One bridge's turn: ping it if it is up, reconnect it if it is not."""
+    session = globals()[global_name]
+
+    if session is not None:
+        try:
+            await session.list_tools()
+            attempt[label] = 0
+        except Exception as exc:
+            # A live-but-stalled stream is the ping's problem, not the
+            # reconnector's; /login and /indmoney handle that case.
+            log.debug("Keepalive ping to %s failed: %s", label, exc)
+        return
+
+    # No session at all: this bridge never started, or was stopped.
+    if bridge is None or now < due[label]:
+        return
+
+    # A sign-in waiting on a human is not a dead bridge. Reconnecting now would
+    # kill the attempt whose link was already sent, start another, and send a
+    # second link — and because mcp-remote derives its callback port from the
+    # server URL, the replacement listens on the very port the first link
+    # pointed at, so the code from that link would be delivered to an attempt
+    # that never issued it and silently discarded. Leave it alone.
+    if getattr(bridge, "awaiting_auth", False):
+        log.debug("%s is waiting for a sign-in; not reconnecting over it.", label)
+        return
+
+    attempt[label] += 1
+    backoff = min(interval * 2 ** (attempt[label] - 1), max_backoff)
+    due[label] = now + backoff
+    log.info("Trying to reconnect the %s bridge (attempt %d)...",
+             label, attempt[label])
+    if await bridge.start():
+        globals()[global_name] = bridge.session
+        attempt[label] = 0
+        log.info("The %s bridge is back.", label)
+    else:
+        log.info("The %s bridge is still down (%s); next try in %.0fs.",
+                 label, bridge.last_error, backoff)
 
 
 # ---------------------------------------------------------------------------

@@ -288,6 +288,15 @@ class MCPBridge:
         """Callback details from the sign-in URL this bridge last printed."""
         return self._tee.pending_auth if self._tee is not None else self._last_auth
 
+    @property
+    def awaiting_auth(self) -> bool:
+        """True while a sign-in link is live and nobody has completed it.
+
+        Distinguishes "waiting for you" from "dead", which matters because the
+        two want opposite responses: leave the first alone, restart the second.
+        """
+        return self._tee is not None and self._tee.pending_auth is not None
+
 
 # ===========================================================================
 # Relaying an authorisation code approved on another device

@@ -46,7 +46,19 @@ class Command:
 
     @property
     def arg(self) -> str:
+        """First argument, lowercased — for keywords like ``force``."""
         return self.args[0].lower() if self.args else ""
+
+    @property
+    def text(self) -> str:
+        """Everything after the command name, exactly as it was typed.
+
+        Anything case-sensitive must use this rather than ``arg``. An OAuth
+        authorisation code lowercased is simply a different, invalid code —
+        and the failure is silent, because the callback server accepts it and
+        only the later token exchange rejects it.
+        """
+        return " ".join(self.args)
 
 
 def parse_command(text: str) -> Optional[Command]:

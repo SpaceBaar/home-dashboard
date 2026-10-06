@@ -370,6 +370,22 @@ def test_auth_code_relay() -> None:
     check(not ok and "fresh link" in detail,
           "an expired sign-in says to start again rather than failing blankly")
 
+    # An authorisation code is case-sensitive. Command.arg lowercases, because
+    # it exists for keywords like "force" — using it here silently produced a
+    # different, invalid code, and the failure only surfaced much later as a
+    # fresh sign-in request. Anything case-sensitive must use .text.
+    typed = "/code http://localhost:9696/oauth/callback?code=AbC123xYz_MiXeD&state=StAtE1"
+    command = cmd.parse_command(typed)
+    check(command is not None and command.text.endswith("state=StAtE1"),
+          "Command.text preserves the case of what was typed")
+    check(command is not None and command.arg != command.text.lower().strip()
+          or command.arg == command.args[0].lower(),
+          "Command.arg still lowercases, for keyword arguments")
+    relayed = bridges.extract_code(command.text)
+    check(relayed and relayed["code"] == "AbC123xYz_MiXeD",
+          "so the code survives the round trip exactly as issued")
+    check(relayed and relayed["state"] == "StAtE1", "and so does the state")
+
     # End to end: a bridge sees a sign-in URL, and the code can then be relayed.
     tee = bridges._StderrTee("INDmoney")
     _run_through_tee(tee, textwrap.dedent(f"""
@@ -384,7 +400,79 @@ def test_auth_code_relay() -> None:
 
 
 # ===========================================================================
-# 8. A slow command must not gag the rest
+# 8. A code from a superseded sign-in must not be delivered
+# ===========================================================================
+def test_stale_code_is_refused() -> None:
+    section("A code from an older link is refused, not delivered blind")
+
+    import agent                                            # noqa: E402
+
+    received: dict = {}
+
+    class _Callback(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):                                   # noqa: N802
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query)
+            received.update({k: v[0] for k, v in query.items()})
+            self.send_response(200)
+            self.end_headers()
+            # Note: it answers *any* code with success. That is why matching
+            # the state here matters — delivery proves nothing.
+            self.wfile.write(b"Authorization successful!")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Callback)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+
+    class _Bridge:
+        last_error = None
+        session = None
+
+        def __init__(self, state):
+            self.connected = False
+            self.awaiting_auth = True
+            self.pending_auth = {
+                "redirect_uri": f"http://127.0.0.1:{port}/oauth/callback",
+                "state": state}
+
+    saved = (agent.KITE_BRIDGE, agent.IND_BRIDGE)
+    try:
+        agent.KITE_BRIDGE = None
+        agent.IND_BRIDGE = _Bridge("StAtE_LiNk2")
+        code = "AbC123xYz_MiXeD-CaSe"
+
+        stale = (f"/code http://localhost:{port}/oauth/callback"
+                 f"?code={code}&state=StAtE_LiNk1")
+        reply = asyncio.run(agent.cmd_code(cmd.parse_command(stale)))
+        check(not received, "a code from a superseded link is never sent")
+        check("older sign-in" in reply, "and the reply says why, rather than failing oddly")
+
+        async def current():
+            async def connect():
+                await asyncio.sleep(0.5)
+                agent.IND_BRIDGE.connected = True
+                agent.IND_BRIDGE.session = object()
+            asyncio.create_task(connect())
+            return await agent.cmd_code(cmd.parse_command(
+                f"/code http://localhost:{port}/oauth/callback"
+                f"?code={code}&state=StAtE_LiNk2"))
+
+        reply = asyncio.run(asyncio.wait_for(current(), timeout=70))
+        check(received.get("code") == code,
+              "the code from the current link is delivered byte for byte")
+        check(received.get("state") == "StAtE_LiNk2", "with its state intact")
+        check("signed in" in reply,
+              "and success is reported only once the bridge is actually up")
+    finally:
+        server.shutdown()
+        agent.KITE_BRIDGE, agent.IND_BRIDGE = saved
+
+
+# ===========================================================================
+# 9. A slow command must not gag the rest
 # ===========================================================================
 def test_commands_do_not_block_each_other() -> None:
     section("A slow command cannot hold up the one that would rescue it")
@@ -451,11 +539,14 @@ def test_commands_do_not_block_each_other() -> None:
 # 9. Unattended recovery
 # ===========================================================================
 class _FlakyBridge:
-    def __init__(self, fail_times: int):
+    def __init__(self, fail_times: int, awaiting_auth: bool = False):
         self.n = 0
         self.fail = fail_times
         self.session = None
         self.last_error = "connection refused"
+        self.awaiting_auth = awaiting_auth
+        self.pending_auth = {"redirect_uri": "http://localhost:1/cb",
+                             "state": "s"} if awaiting_auth else None
 
     async def start(self) -> bool:
         self.n += 1
@@ -495,6 +586,57 @@ def test_unattended_recovery() -> None:
         check(bridge.n == 3, f"taking exactly three attempts (got {bridge.n})")
         check(agent.IND_BRIDGE is None,
               "and a bridge that was never created is skipped, not crashed on")
+
+        # A sign-in waiting on a human must be left alone. Reconnecting over it
+        # sends a second link and strands the code from the first.
+        waiting = _FlakyBridge(fail_times=0, awaiting_auth=True)
+        agent.KITE_BRIDGE = waiting
+        agent._session = None
+        clock2 = {"t": 0.0}
+
+        async def leave_alone():
+            task = asyncio.create_task(
+                agent.mcp_keepalive(interval=0.01, max_backoff=0.32,
+                                    clock=lambda: clock2["t"]))
+            for _ in range(40):
+                clock2["t"] += 0.05
+                await asyncio.sleep(0.005)
+            task.cancel()
+
+        asyncio.run(leave_alone())
+        check(waiting.n == 0,
+              "a bridge awaiting a sign-in is never reconnected over")
+
+        # And a bridge that raises must not kill the loop for the other one.
+        class _Exploding:
+            awaiting_auth = False
+            pending_auth = None
+            session = None
+            last_error = None
+
+            async def start(self):
+                raise RuntimeError("npx exploded")
+
+        agent.KITE_BRIDGE = _Exploding()
+        healthy = _FlakyBridge(fail_times=0)
+        agent.IND_BRIDGE = healthy
+        agent._session = agent._ind_session = None
+        clock3 = {"t": 0.0}
+
+        async def survive():
+            task = asyncio.create_task(
+                agent.mcp_keepalive(interval=0.01, max_backoff=0.32,
+                                    clock=lambda: clock3["t"]))
+            for _ in range(40):
+                clock3["t"] += 0.05
+                await asyncio.sleep(0.005)
+                if agent._ind_session is not None:
+                    break
+            task.cancel()
+
+        asyncio.run(survive())
+        check(agent._ind_session is not None,
+              "one bridge raising does not stop the other being recovered")
     finally:
         agent.KITE_BRIDGE, agent.IND_BRIDGE, agent._session, agent._ind_session = saved
 
@@ -508,6 +650,7 @@ def test_all():
     test_credential_clearing()
     test_bridge_lifecycle()
     test_auth_code_relay()
+    test_stale_code_is_refused()
     test_commands_do_not_block_each_other()
     test_unattended_recovery()
     assert not _failures, f"{len(_failures)} check(s) failed:\n" + "\n".join(_failures)
