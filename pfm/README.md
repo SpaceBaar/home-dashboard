@@ -78,6 +78,7 @@ so the browser and the report can never disagree.
 | `tests/test_us_book.py` | INDmoney normalisation, multi-currency math, US news |
 | `tests/test_commands.py` | Telegram commands, authorisation, auth-URL capture |
 | `tests/test_goals.py` | Amortisation against the spreadsheet, affordability, browser parity |
+| `tests/test_sync.py` | /sync: the figures, the goals refresh, and that it never looks like a run |
 | `tools/probe_indmoney.py` | Capture INDmoney's real response shapes |
 | `tools/probe_llm.py` | On-Pi diagnosis of the runtime and the scoring prompt |
 | `tools/check_telegram.py` | Credential check |
@@ -129,6 +130,7 @@ messages, so a stranger cannot write lines into your expense file either.
 | `/indmoney` | Reconnects the US book. Aliases: `/us`, `/ind` |
 | `/indmoney force` | Also clears the cached INDmoney credentials first, forcing a full OAuth sign-in |
 | `/code <address>` | Finishes a sign-in you approved on another device. Aliases: `/callback`, `/auth` |
+| `/sync` | Current values for both books, and a refresh of the balances `/goals` uses. No news, no commentary, no report. Aliases: `/refresh`, `/portfolio` |
 | `/status` | Both broker sessions, the last run, and whether tonight's run will go ahead or be skipped |
 | `/run` | Runs the analysis now, ignoring the weekend skip. Returns immediately; the summary arrives when it finishes |
 | `/help` | The list above |
@@ -139,6 +141,26 @@ Anything that is not a command is still logged as an expense, as before.
 `Please authorize this client by visiting: <url>` to stderr, which on a headless
 Pi means journalctl — useless if nobody is tailing it. Both bridges tee that
 stream and forward any authorisation URL straight to Telegram.
+
+**`/sync` is deliberately not a run.** It reads both books, prices them, replies
+with the figures, and refreshes `state/networth_snapshot.json` — which is what
+the goals page builds its liquidity tiers from, so this is how you make `/goals`
+current without waiting for 23:00. It takes seconds rather than minutes, because
+it stops before the news scan and the per-stock model calls.
+
+What it does *not* do matters as much. Nothing is written to `reports/`, and
+neither `last_run` nor the weekend baseline is touched. If a midday sync updated
+the baseline, the weekend rule would see an unchanged portfolio that night and
+skip the real report — so a sync can never cancel a run.
+
+Both commands share one code path: `gather_portfolio()` does the holdings, the
+US book, the FX and the arithmetic, and the nightly pipeline carries on from
+there. The on-demand figures and the nightly figures therefore cannot drift.
+
+If no USD/INR rate is available the US book cannot be added to a rupee total, so
+the reply labels the headline "Total value (India only)" and the note says how
+to fix it. Listing both books and then quietly totalling one is the failure mode
+worth avoiding.
 
 **Approving a sign-in on your phone: use `/code`.** The link arrives on
 Telegram, so you will usually open it on a phone — and then the browser is
@@ -725,6 +747,13 @@ clears, an interest-free loan, a lump sum larger than the balance), liquidity
 classification failing closed, goal validation and atomic storage, the script
 escaping of the state the page embeds, and finally that the browser's copy of
 the model agrees with the Python one.
+
+`tests/test_sync.py` covers the on-demand refresh: that it reports both books,
+that it writes the snapshot `/goals` then reads, that a missing USD/INR rate
+produces an honestly-labelled total rather than a silently short one, that a
+missing INDmoney session costs the US book and not the sync — and above all that
+it writes nothing to `reports/` and leaves the weekend baseline alone, since a
+sync that looked like a run would cancel that night's report.
 
 Every suite needs no Pi, no model, no broker and no network:
 

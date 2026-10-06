@@ -44,6 +44,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -55,7 +56,8 @@ import news as news_mod
 import report as report_mod
 import bridges
 from bridges import MCPBridge, clear_cached_credentials
-from brokers import BOOK_US, AuthRequired, IndmoneyProvider, KiteProvider, ProviderError
+from brokers import (BOOK_IND, BOOK_US, AuthRequired, IndmoneyProvider,
+                     KiteProvider, ProviderError)
 from commands import HELP_TEXT, Command, CommandRouter, is_authorised
 from llm import LLMClient, LLMUnavailable
 from notify import Telegram
@@ -307,6 +309,188 @@ async def send_login_link() -> None:
 # ---------------------------------------------------------------------------
 # The analysis run
 # ---------------------------------------------------------------------------
+
+@dataclass
+class GatheredPortfolio:
+    """Everything the deterministic half of the pipeline produces.
+
+    Separated out because two callers need exactly this and nothing more: the
+    nightly run, which goes on to score news over it, and /sync, which just
+    reports the figures. Keeping it in one place is what stops the on-demand
+    numbers and the nightly numbers quietly diverging.
+    """
+    fact_sheet: object
+    us_quotes: dict
+    broker_sentiment: dict
+    us_problems: List[str]
+    snapshot: Optional[dict]
+
+
+async def gather_portfolio(holdings_raw: List[dict], *,
+                           context: str = "tonight's report") -> GatheredPortfolio:
+    """Both books, priced and reconciled. No news, no model, no files written.
+
+    ``context`` only shapes the wording when INDmoney needs re-authorising,
+    since "tonight's report" is wrong for an on-demand sync.
+    """
+    # 1a. US book from INDmoney. Never fatal: a stale OAuth token costs the
+    #     US section, not the whole night's report.
+    us_rows: List[dict] = []
+    us_problems: List[str] = []
+    broker_sentiment: dict = {}
+    snapshot_fx: Optional[float] = None
+    snapshot_cached: Optional[dict] = None   # INDmoney's cross-asset net worth
+
+    us_quotes: dict = {}
+    if _ind_session is not None:
+        provider = IndmoneyProvider(_ind_session)
+        try:
+            us_rows, us_problems = await provider.holdings()
+            log.info("INDmoney: %d holding(s) kept for the US book%s.",
+                     len(us_rows),
+                     f", {len(us_problems)} excluded" if us_problems else "")
+            if not us_rows:
+                us_problems.append(
+                    "INDmoney returned no usable US holdings. Run "
+                    "tools/probe_indmoney.py to see how each row was classified."
+                )
+
+            # Resolve tickers by exact id join before anything else uses the
+            # symbols. investment_code equals entity_basic.mycroft_id, so a
+            # quote lookup over the candidate pool identifies each holding
+            # without any name matching.
+            if us_rows:
+                # Candidates come only from places INDmoney or you declared:
+                # your INDmoney watchlist, and tracking.watchlist in
+                # config.json. Nothing is guessed.
+                candidates = set(CFG.watchlist)
+                try:
+                    candidates |= set(await provider.watchlist())
+                except Exception as exc:
+                    log.info("INDmoney watchlist unavailable: %s", exc)
+                # Anything Kite already reports is Indian; keep it away from a
+                # US endpoint, where an unknown symbol can fail the batch.
+                candidates -= {h.get("symbol") for h in holdings_raw
+                               if isinstance(h, dict) and h.get("symbol")}
+                candidates = {c for c in candidates if brokers.looks_like_us_ticker(c)}
+
+                details = await provider.us_details(sorted(candidates))
+
+                # The only ticker source: INDmoney's own entity_basic.symbol,
+                # joined on its own investment_code == mycroft_id.
+                by_code, warnings = brokers.resolve_by_code(
+                    us_rows, brokers.build_code_index(details))
+                us_problems.extend(warnings)
+                log.info("Resolved %d US ticker(s) from INDmoney's own quote data.",
+                         by_code)
+
+                # Fetch details for tickers discovered after the first call so
+                # their news and quotes are available too.
+                resolved = {h["symbol"] for h in us_rows if not brokers.needs_ticker(h)}
+                missing = sorted(resolved - set(details))
+                if missing:
+                    details.update(await provider.us_details(missing))
+
+                us_quotes = brokers.extract_us_quotes(details)
+                broker_sentiment = brokers.extract_us_news(details)
+
+                # INDmoney supplies no ticker for some holdings. Those are shown
+                # under the instrument name it does supply, identified by its
+                # instrument code. Nothing is invented to fill the gap; the
+                # report just says so.
+                unresolved = [f"{h.get('name') or h['symbol']} "
+                              f"(INDmoney code {h.get('investment_code')})"
+                              for h in us_rows if brokers.needs_ticker(h)]
+                if unresolved:
+                    us_problems.append(
+                        "INDmoney provides no ticker for " + "; ".join(unresolved)
+                        + ". They are shown under the instrument name INDmoney "
+                          "returned. Add them to a watchlist in the INDmoney app, "
+                          "or to tracking.keywords in config.json, for news matching."
+                    )
+
+                # The rate INDmoney itself applied, read back out of the data.
+                snapshot_fx, fx_note = brokers.derive_usd_inr(us_rows, us_quotes)
+                if snapshot_fx:
+                    log.info("Implied USD/INR %.2f (%s)", snapshot_fx, fx_note)
+
+                # One snapshot call serves two purposes: cross-checking the US
+                # total, and giving the goals view something to work from
+                # without needing a live broker session.
+                snapshot = snapshot_cached = await provider.networth_snapshot()
+                if snapshot:
+                    save_networth_snapshot(snapshot)
+
+                snapshot_total = None
+                for entry in (snapshot or {}).get("investments") or []:
+                    if isinstance(entry, dict) and \
+                            str(entry.get("asset_type", "")).upper() == "US_STOCK":
+                        snapshot_total = brokers._num(entry.get("current_value"))
+                        break
+
+                # The two have been seen to differ by about 1%.
+                row_sum = sum(h.get("current_native") or 0.0 for h in us_rows)
+                if snapshot_total and row_sum:
+                    gap = snapshot_total - row_sum
+                    if abs(gap) > max(1.0, row_sum * 0.005):
+                        us_problems.append(
+                            f"INDmoney's US holdings add up to Rs {row_sum:,.0f}, "
+                            f"but its own portfolio summary reports "
+                            f"Rs {snapshot_total:,.0f} for the same asset class "
+                            f"(a difference of Rs {gap:+,.0f}). The row-level sum "
+                            f"is used, because that is what the holdings table "
+                            f"adds up to. The gap is usually cache freshness or "
+                            f"an idle USD cash balance."
+                        )
+                        log.warning("US total mismatch: rows Rs %s vs snapshot Rs %s",
+                                    f"{row_sum:,.0f}", f"{snapshot_total:,.0f}")
+        except AuthRequired as exc:
+            log.warning("INDmoney needs re-authentication: %s", exc)
+            us_problems.append(
+                "The US book was unavailable because the INDmoney session has expired. "
+                "Send /indmoney to reconnect."
+            )
+            if TG:
+                TG.send(f"INDmoney session expired, so {context} covers the India "
+                        f"book only.\n\nSend /indmoney to reconnect, or re-authorise "
+                        f"on the Pi:\n"
+                        "cd ~/Projects/home-dashboard/pfm && "
+                        "python tools/probe_indmoney.py --list-only\n\n"
+                        "That opens the INDmoney sign-in page; the token is then cached "
+                        "for the daemon.")
+        except ProviderError as exc:
+            log.error("INDmoney holdings failed: %s", exc)
+            us_problems.append(f"The US book could not be read from INDmoney: {exc}")
+
+    # 1b. Deterministic portfolio mathematics over both books.
+    usd_inr, fx_source = resolve_fx(
+        _num_or_none(CFG.portfolio.get("usd_inr_rate")), snapshot_fx)
+
+    fact_sheet = build_fact_sheet(
+        list(holdings_raw) + us_rows,
+        mismatch_tolerance_pct=float(CFG.portfolio.get("pnl_mismatch_tolerance_pct", 1.0)),
+        usd_inr=usd_inr,
+        fx_source=fx_source,
+    )
+    fact_sheet.data_quality.extend(us_problems)
+
+    # networth_holdings has no day-change field for US rows, so take it from
+    # the live quote. A percentage move needs no currency conversion.
+    filled = 0
+    for holding in fact_sheet.holdings:
+        quote = us_quotes.get(holding.symbol)
+        if holding.book == BOOK_US and holding.day_pct is None and quote:
+            if quote.get("day_pct") is not None:
+                holding.day_pct = quote["day_pct"]
+                holding.flags.append("day change from the INDmoney live quote")
+                filled += 1
+    if filled:
+        log.info("Filled the day change for %d US holding(s) from live quotes.", filled)
+
+    return GatheredPortfolio(fact_sheet=fact_sheet, us_quotes=us_quotes,
+                             broker_sentiment=broker_sentiment,
+                             us_problems=us_problems, snapshot=snapshot_cached)
+
 async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = True,
                        force: bool = False):
     """Run the nightly pipeline.
@@ -344,158 +528,13 @@ async def run_analysis(holdings_text: Optional[str] = None, *, use_llm: bool = T
                 TG.alert("Nightly analysis aborted: the holdings payload could not be parsed.")
             return None
 
-        # 1a. US book from INDmoney. Never fatal: a stale OAuth token costs the
-        #     US section, not the whole night's report.
-        us_rows: List[dict] = []
-        us_problems: List[str] = []
-        broker_sentiment: dict = {}
-        snapshot_fx: Optional[float] = None
-
-        us_quotes: dict = {}
-        if _ind_session is not None:
-            provider = IndmoneyProvider(_ind_session)
-            try:
-                us_rows, us_problems = await provider.holdings()
-                log.info("INDmoney: %d holding(s) kept for the US book%s.",
-                         len(us_rows),
-                         f", {len(us_problems)} excluded" if us_problems else "")
-                if not us_rows:
-                    us_problems.append(
-                        "INDmoney returned no usable US holdings. Run "
-                        "tools/probe_indmoney.py to see how each row was classified."
-                    )
-
-                # Resolve tickers by exact id join before anything else uses the
-                # symbols. investment_code equals entity_basic.mycroft_id, so a
-                # quote lookup over the candidate pool identifies each holding
-                # without any name matching.
-                if us_rows:
-                    # Candidates come only from places INDmoney or you declared:
-                    # your INDmoney watchlist, and tracking.watchlist in
-                    # config.json. Nothing is guessed.
-                    candidates = set(CFG.watchlist)
-                    try:
-                        candidates |= set(await provider.watchlist())
-                    except Exception as exc:
-                        log.info("INDmoney watchlist unavailable: %s", exc)
-                    # Anything Kite already reports is Indian; keep it away from a
-                    # US endpoint, where an unknown symbol can fail the batch.
-                    candidates -= {h.get("symbol") for h in holdings_raw
-                                   if isinstance(h, dict) and h.get("symbol")}
-                    candidates = {c for c in candidates if brokers.looks_like_us_ticker(c)}
-
-                    details = await provider.us_details(sorted(candidates))
-
-                    # The only ticker source: INDmoney's own entity_basic.symbol,
-                    # joined on its own investment_code == mycroft_id.
-                    by_code, warnings = brokers.resolve_by_code(
-                        us_rows, brokers.build_code_index(details))
-                    us_problems.extend(warnings)
-                    log.info("Resolved %d US ticker(s) from INDmoney's own quote data.",
-                             by_code)
-
-                    # Fetch details for tickers discovered after the first call so
-                    # their news and quotes are available too.
-                    resolved = {h["symbol"] for h in us_rows if not brokers.needs_ticker(h)}
-                    missing = sorted(resolved - set(details))
-                    if missing:
-                        details.update(await provider.us_details(missing))
-
-                    us_quotes = brokers.extract_us_quotes(details)
-                    broker_sentiment = brokers.extract_us_news(details)
-
-                    # INDmoney supplies no ticker for some holdings. Those are shown
-                    # under the instrument name it does supply, identified by its
-                    # instrument code. Nothing is invented to fill the gap; the
-                    # report just says so.
-                    unresolved = [f"{h.get('name') or h['symbol']} "
-                                  f"(INDmoney code {h.get('investment_code')})"
-                                  for h in us_rows if brokers.needs_ticker(h)]
-                    if unresolved:
-                        us_problems.append(
-                            "INDmoney provides no ticker for " + "; ".join(unresolved)
-                            + ". They are shown under the instrument name INDmoney "
-                              "returned. Add them to a watchlist in the INDmoney app, "
-                              "or to tracking.keywords in config.json, for news matching."
-                        )
-
-                    # The rate INDmoney itself applied, read back out of the data.
-                    snapshot_fx, fx_note = brokers.derive_usd_inr(us_rows, us_quotes)
-                    if snapshot_fx:
-                        log.info("Implied USD/INR %.2f (%s)", snapshot_fx, fx_note)
-
-                    # One snapshot call serves two purposes: cross-checking the US
-                    # total, and giving the goals view something to work from
-                    # without needing a live broker session.
-                    snapshot = await provider.networth_snapshot()
-                    if snapshot:
-                        save_networth_snapshot(snapshot)
-
-                    snapshot_total = None
-                    for entry in (snapshot or {}).get("investments") or []:
-                        if isinstance(entry, dict) and \
-                                str(entry.get("asset_type", "")).upper() == "US_STOCK":
-                            snapshot_total = brokers._num(entry.get("current_value"))
-                            break
-
-                    # The two have been seen to differ by about 1%.
-                    row_sum = sum(h.get("current_native") or 0.0 for h in us_rows)
-                    if snapshot_total and row_sum:
-                        gap = snapshot_total - row_sum
-                        if abs(gap) > max(1.0, row_sum * 0.005):
-                            us_problems.append(
-                                f"INDmoney's US holdings add up to Rs {row_sum:,.0f}, "
-                                f"but its own portfolio summary reports "
-                                f"Rs {snapshot_total:,.0f} for the same asset class "
-                                f"(a difference of Rs {gap:+,.0f}). The row-level sum "
-                                f"is used, because that is what the holdings table "
-                                f"adds up to. The gap is usually cache freshness or "
-                                f"an idle USD cash balance."
-                            )
-                            log.warning("US total mismatch: rows Rs %s vs snapshot Rs %s",
-                                        f"{row_sum:,.0f}", f"{snapshot_total:,.0f}")
-            except AuthRequired as exc:
-                log.warning("INDmoney needs re-authentication: %s", exc)
-                us_problems.append(
-                    "The US book was unavailable because the INDmoney session has expired. "
-                    "Re-authorise with: python tools/probe_indmoney.py --list-only"
-                )
-                if TG:
-                    TG.send("INDmoney session expired, so tonight's report covers the India "
-                            "book only.\n\nRe-authorise on the Pi:\n"
-                            "cd ~/Projects/home-dashboard/pfm && "
-                            "python tools/probe_indmoney.py --list-only\n\n"
-                            "That opens the INDmoney sign-in page; the token is then cached "
-                            "for the daemon.")
-            except ProviderError as exc:
-                log.error("INDmoney holdings failed: %s", exc)
-                us_problems.append(f"The US book could not be read from INDmoney: {exc}")
-
-        # 1b. Deterministic portfolio mathematics over both books.
-        usd_inr, fx_source = resolve_fx(
-            _num_or_none(CFG.portfolio.get("usd_inr_rate")), snapshot_fx)
-
-        fact_sheet = build_fact_sheet(
-            list(holdings_raw) + us_rows,
-            mismatch_tolerance_pct=float(CFG.portfolio.get("pnl_mismatch_tolerance_pct", 1.0)),
-            usd_inr=usd_inr,
-            fx_source=fx_source,
-        )
-        fact_sheet.data_quality.extend(us_problems)
+        # 1a-1b. Both books, priced. Shared with /sync so the on-demand
+        #        figures and the nightly figures cannot drift apart.
+        gathered = await gather_portfolio(holdings_raw)
+        fact_sheet = gathered.fact_sheet
+        us_quotes = gathered.us_quotes
+        broker_sentiment = gathered.broker_sentiment
         held = {h.symbol for h in fact_sheet.holdings}
-
-        # networth_holdings has no day-change field for US rows, so take it from
-        # the live quote. A percentage move needs no currency conversion.
-        filled = 0
-        for holding in fact_sheet.holdings:
-            quote = us_quotes.get(holding.symbol)
-            if holding.book == BOOK_US and holding.day_pct is None and quote:
-                if quote.get("day_pct") is not None:
-                    holding.day_pct = quote["day_pct"]
-                    holding.flags.append("day change from the INDmoney live quote")
-                    filled += 1
-        if filled:
-            log.info("Filled the day change for %d US holding(s) from live quotes.", filled)
 
         # 1c. Weekend short-circuit. Placed here deliberately: holdings are cheap
         #     to fetch, whereas the news scan and the per-stock LLM calls are the
@@ -862,6 +901,91 @@ async def _await_bridge(bridge, timeout: float = 60.0) -> bool:
     return bridge.connected
 
 
+async def cmd_sync(_: Command) -> str:
+    """Refresh both books now, without running the nightly analysis.
+
+    Deliberately stops short of a report: no news, no model, nothing written to
+    reports/, and crucially neither ``last_run`` nor the weekend baseline is
+    touched. A midday sync must never be mistaken for a completed run, or
+    tonight's real one would skip itself as unchanged.
+
+    What it does write is the net-worth snapshot, which is what the goals page
+    builds its liquidity tiers from — so this is also the way to make /goals
+    current without waiting until 23:00.
+    """
+    if _get_run_lock().locked():
+        return "An analysis is already running; its figures will be fresher. Hold on."
+
+    holdings_text = await probe_session()
+    if holdings_text is None:
+        return ("Your Zerodha session has expired, so the India book cannot be "
+                "read.\nSend /login, complete it, then /sync again.")
+
+    holdings_raw = extract_holdings_json(holdings_text)
+    if not holdings_raw:
+        return "Kite replied, but the holdings could not be parsed. Try /sync again."
+
+    try:
+        gathered = await gather_portfolio(holdings_raw, context="this sync")
+    except Exception as exc:
+        log.exception("/sync failed")
+        return f"The sync failed: {exc}"
+
+    fact_sheet = gathered.fact_sheet
+    lines = [f"Portfolio synced — {datetime.now().strftime('%H:%M')}", ""]
+
+    for book in (BOOK_IND, BOOK_US):
+        totals = fact_sheet.books.get(book)
+        if not totals:
+            continue
+        label = "India (Kite)" if book == BOOK_IND else "US (INDmoney)"
+        value = totals.current_inr if totals.current_inr is not None else totals.current
+        row = f"{label}: Rs {value:,.0f}"
+        if totals.pnl_pct is not None:
+            row += f"  ({totals.pnl_pct:+.1f}%)"
+        lines.append(f"{row}  [{totals.count} holding(s)]")
+
+    # A total that silently drops a book is worse than no total. Without a
+    # USD/INR rate the US holdings cannot be added to a rupee figure, so say
+    # which books the number actually covers rather than letting the per-book
+    # lines above imply it is all of them.
+    counted = [b for b in (BOOK_IND, BOOK_US)
+               if fact_sheet.books.get(b)
+               and fact_sheet.books[b].current_inr is not None]
+    total_label = "Total value"
+    if len(counted) == 1 and len(fact_sheet.books) > 1:
+        total_label = "Total value (India only)" if counted[0] == BOOK_IND \
+            else "Total value (US only)"
+
+    lines += ["",
+              f"{total_label}: Rs {fact_sheet.total_current:,.0f}",
+              f"P&L: Rs {fact_sheet.total_pnl:+,.0f} ({fact_sheet.total_pnl_pct:+.1f}%)"]
+    if fact_sheet.usd_inr:
+        lines.append(f"USD/INR {fact_sheet.usd_inr:,.2f} ({fact_sheet.fx_source})")
+
+    if gathered.snapshot:
+        networth = brokers._num(gathered.snapshot.get("total_networth"))
+        if networth:
+            lines.append(f"Net worth (INDmoney): Rs {networth:,.0f}")
+        lines.append("The goals page now reflects these balances.")
+    else:
+        lines.append("No INDmoney net-worth snapshot, so /goals keeps its last figures.")
+
+    # Surface problems rather than quietly reporting a short portfolio. Taken
+    # from the fact sheet, not from us_problems, because it also carries things
+    # the maths itself found — a missing FX rate above all, which is exactly
+    # the case where the headline total needs explaining.
+    notes = fact_sheet.data_quality
+    if notes:
+        lines += ["", "Notes:"] + [f"- {n}" for n in notes[:3]]
+        if len(notes) > 3:
+            lines.append(f"- ...and {len(notes) - 3} more "
+                         f"(the next report lists them all)")
+
+    lines += ["", "No report was written and tonight's run is unaffected."]
+    return "\n".join(lines)
+
+
 async def cmd_help(_: Command) -> str:
     return HELP_TEXT
 
@@ -871,6 +995,7 @@ def build_router() -> CommandRouter:
     router.register("login", cmd_login, "kite", "zerodha")
     router.register("indmoney", cmd_indmoney, "us", "ind")
     router.register("code", cmd_code, "callback", "auth")
+    router.register("sync", cmd_sync, "refresh", "portfolio")
     router.register("status", cmd_status, "state")
     router.register("run", cmd_run, "analyse", "analyze")
     router.register("help", cmd_help, "start", "commands")

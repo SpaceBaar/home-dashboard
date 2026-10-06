@@ -29,6 +29,11 @@ HELP_TEXT = """Commands
    That is expected: the callback server runs on the Pi, not your phone.
    Copy the whole failed address and send it here, and the Pi completes it.
 
+/sync — refresh both books now
+   Current values for the India and US books, and the balances the goals page
+   uses. No news, no commentary, no report: seconds rather than minutes, and
+   tonight's scheduled run is left completely alone.
+
 /status — both broker sessions, the last run, and tonight's plan
 
 /run — run the analysis now, ignoring the weekend skip
