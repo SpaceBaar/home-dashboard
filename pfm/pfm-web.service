@@ -15,11 +15,22 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# Read-only view - it never needs to write anything.
+# Everything is read-only except the one directory the goals page writes to.
+# Without the ReadWritePaths line below, saving a goal fails with EACCES.
 ProtectSystem=strict
 ProtectHome=read-only
+ReadWritePaths=/home/spacebaar/Projects/home-dashboard/pfm/data
 PrivateTmp=true
 NoNewPrivileges=true
+# Nothing here needs to escalate, map memory writable-and-executable, or reach
+# anything other than TCP. Cheap to assert on a service with no authentication.
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

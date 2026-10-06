@@ -14,5 +14,9 @@ __pycache__/
 /pfm/reports/
 /pfm/cache/
 /pfm/state/
+# Goals you typed, including loan balances. The directory is tracked so the
+# web service — which runs read-only apart from this one path — finds it there.
+/pfm/data/*
+!/pfm/data/.gitkeep
 /pfm/daily_expenses.csv
 /pfm/portfolio_analysis_*.md

@@ -38,12 +38,16 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 import goals as goals_mod
-from pfm_config import BASE_DIR, REPORT_DIR, STATE_DIR, load_config, setup_logging
+from pfm_config import (BASE_DIR, DATA_DIR, REPORT_DIR, STATE_DIR,
+                        load_config, setup_logging)
 
 log = logging.getLogger("pfm.web")
 
 STATIC_DIR = BASE_DIR / "static"
-GOALS_FILE = BASE_DIR / "goals.json"                      # written by POST /api/goals
+# The only path this process writes to, and the only one the systemd unit
+# grants it. Keeping it out of the source tree means a bug here cannot touch
+# the code the service runs.
+GOALS_FILE = DATA_DIR / "goals.json"                      # written by POST /api/goals
 SNAPSHOT_FILE = STATE_DIR / "networth_snapshot.json"      # written by the agent
 
 # Writing goals is the only non-GET route. Off here would make the page

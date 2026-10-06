@@ -72,6 +72,7 @@ so the browser and the report can never disagree.
 | `goals.py` | Amortisation, prepayment modelling, liquidity tiers, goal storage |
 | `web.py` | Standalone report browser and the goals page (own process, own port) |
 | `static/` | Stylesheet, table sorting, and the browser-side goals calculator |
+| `data/` | Goals you typed. The only directory here that is not regenerable |
 | `tests/test_pipeline.py` | Full offline harness — no Pi, no model, no network |
 | `tests/test_web.py` | Offline tests for the web view, including live HTTP routes |
 | `tests/test_us_book.py` | INDmoney normalisation, multi-currency math, US news |
@@ -527,7 +528,14 @@ only here.
 ### Writing
 
 `/goals` is the only part of the web view that writes anything, and it writes
-one file, `goals.json`. Everything posted is re-validated server-side with the
+one file, `data/goals.json`. That directory exists so the systemd unit can
+grant write access to exactly one path — `ProtectHome=read-only` plus a single
+`ReadWritePaths` line — leaving the source tree the service runs from
+read-only. It is also the one directory here whose contents cannot be
+regenerated: `cache/`, `reports/` and `state/` all come back on the next run,
+your goals do not. Back it up.
+
+Everything posted is re-validated server-side with the
 same rules as the page, because the endpoint is reachable by anything on the
 network, not only by the form. Cross-site POSTs are refused, and a JSON content
 type is required so a plain HTML form cannot reach it either. Set
