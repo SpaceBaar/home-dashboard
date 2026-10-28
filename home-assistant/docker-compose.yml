@@ -50,8 +50,11 @@ services:
     restart: unless-stopped
     environment:
       - RUVIEW_ALLOW_UNAUTHENTICATED=1
+      - RUVIEW_BIND_ADDR=0.0.0.0
+      - RUVIEW_UDP_BIND=0.0.0.0
+      - RUVIEW_ALLOWED_HOSTS=*
       - SENSING_ALLOWED_HOSTS=*
-    command: 
+    command:
       - "--allowed-host"
       - "*"
     ports:
