@@ -56,6 +56,8 @@ services:
       - RUVIEW_ALLOWED_HOSTS=*
       - SENSING_ALLOWED_HOSTS=*
     command:
+      - "--bind"
+      - "0.0.0.0:3000"
       - "--allowed-host"
       - "*"
       - "--udp-allow"
