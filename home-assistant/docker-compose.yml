@@ -43,3 +43,13 @@ services:
     restart: unless-stopped
     # Since HA is using 'host' network mode, exposing Mosquitto's ports 
     # to the host allows HA to reach it via the host's IP address.
+
+  ruview-densepose:
+    container_name: ruview-densepose
+    image: ruvnet/wifi-densepose:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+      - "5005:5005/udp"
+    volumes:
+      - ./ruview-densepose_data:/data
