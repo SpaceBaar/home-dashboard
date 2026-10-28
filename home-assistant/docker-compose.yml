@@ -52,14 +52,14 @@ services:
       - RUVIEW_ALLOW_UNAUTHENTICATED=1
       - RUVIEW_BIND_ADDR=0.0.0.0
       - RUVIEW_UDP_BIND=0.0.0.0
-      - RUVIEW_UDP_ALLOW=198.162.1.0/24
+      - RUVIEW_UDP_ALLOW=192.168.1.0/24
       - RUVIEW_ALLOWED_HOSTS=*
       - SENSING_ALLOWED_HOSTS=*
     command:
       - "--allowed-host"
       - "*"
       - "--udp-allow"
-      - "198.162.1.0/24"
+      - "192.168.1.0/24"
     ports:
       - "3001:3000"
       - "5005:5005/udp"
