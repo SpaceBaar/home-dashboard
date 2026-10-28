@@ -52,10 +52,13 @@ services:
       - RUVIEW_ALLOW_UNAUTHENTICATED=1
       - RUVIEW_BIND_ADDR=0.0.0.0
       - RUVIEW_UDP_BIND=0.0.0.0
+      - RUVIEW_UDP_ALLOW=*
       - RUVIEW_ALLOWED_HOSTS=*
       - SENSING_ALLOWED_HOSTS=*
     command:
       - "--allowed-host"
+      - "*"
+      - "--udp-allow"
       - "*"
     ports:
       - "3001:3000"
