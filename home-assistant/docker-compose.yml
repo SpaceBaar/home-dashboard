@@ -50,7 +50,10 @@ services:
     restart: unless-stopped
     environment:
       - RUVIEW_ALLOW_UNAUTHENTICATED=1
-      - SENSING_ALLOWED_HOSTS=*,localhost,127.0.0.1
+      - SENSING_ALLOWED_HOSTS=*
+    command: 
+      - "--allowed-host"
+      - "*"
     ports:
       - "3001:3000"
       - "5005:5005/udp"
